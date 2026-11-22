@@ -265,8 +265,26 @@ def build_parser() -> argparse.ArgumentParser:
     imp_p.add_argument("--out", required=True, help="output path for new mode-0600 vfi_burn plan JSON")
     imp_p.add_argument("--stock-mv", type=float, default=787.5)
     imp_p.add_argument("--tolerance-mv", type=float, default=25.0)
-    imp_p.add_argument("--base-sm", type=int, default=128)
+    imp_p.add_argument(
+        "--base-sm",
+        type=int,
+        required=True,
+        help="REQUIRED operator-supplied non-defective SM ceiling for this SKU (e.g. 122); "
+        "the card cannot tell you this (BURN_SPEC §4)",
+    )
     imp_p.add_argument("--override-sm", type=int, default=None)
+    imp_p.add_argument(
+        "--link-cap2-before",
+        type=lambda s: int(s, 0),
+        default=0x06,
+        help="reviewed current PCIe LnkCap2 (read it with 'manual read-field LnkCap2'; default 0x06)",
+    )
+    imp_p.add_argument(
+        "--link-cap2-after",
+        type=lambda s: int(s, 0),
+        default=0x1E,
+        help="expected LnkCap2 after PCIe records burn (default 0x1E); ignored if no PCIe records",
+    )
     imp_p.add_argument(
         "--prepend-noop-test",
         action="store_true",
@@ -530,6 +548,8 @@ def main(argv=None) -> int:
                 base_sm_ceiling=args.base_sm,
                 override_sm_ceiling=args.override_sm,
                 prepend_noop_test=args.prepend_noop_test,
+                link_cap2_before=args.link_cap2_before,
+                link_cap2_after=args.link_cap2_after,
             )
             write_private_json(args.out, plan_dict)
             # Validate the written plan immediately with Plan.load + check_plan!

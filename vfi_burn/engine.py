@@ -10,16 +10,51 @@ import math
 import os
 import stat
 
+from contextlib import contextmanager
+import signal
+
 from .backend import Health, Host, MissingWriter
+from .ffrecord import (
+    FFCALC_KEY_TO_FIELD,
+    TOTAL_GPC,
+    apply_ff_word_to_masks,
+    compute_sm_count,
+    decode_ff,
+    ff_word_defect_audit,
+    fields_in_block,
+)
 from .model import (
     BurnError,
     Plan,
+    PreTriggerRefusal,
     Record,
     is_debugctrl_target,
     is_poison,
     require_private_file,
     u32,
 )
+
+_CRITICAL_SIGNALS = tuple(
+    s for s in (getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")) if s is not None
+)
+
+
+@contextmanager
+def deferred_signals():
+    """Block SIGINT/SIGTERM/SIGHUP/SIGQUIT for the duration of an irreversible step.
+
+    Ctrl-C or an SSH drop (SIGHUP) must not land between FUSEWDATA=word and the
+    post-write journal entry. Pending signals are delivered when the block exits,
+    after the outcome is fsynced. All hardware waits inside have bounded timeouts.
+    """
+    if not hasattr(signal, "pthread_sigmask") or not _CRITICAL_SIGNALS:
+        yield
+        return
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, _CRITICAL_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 FUSECTRL_IDLE = 0xE0040000
 GOLDILOCKS_CRC = 0x55
@@ -369,6 +404,35 @@ def reconcile(
     if is_debugctrl_target(record.target) and not allow_manual_debugctrl:
         raise BurnError("DEBUGCTRL must never be included in an automatic plan")
 
+    # Word-derived checks: computed from the 32-bit FF word itself, so they cannot be
+    # bypassed by missing/incorrect plan metadata (multi-field shared blocks, manual
+    # console one-liners, hand-edited plans). Non-FF words (synthetic fixtures) skip
+    # this; live hardware refuses them separately in process_records/program_row.
+    word_masks: dict[str, int] = {}
+    word_mapped_fields: set[str] = set()
+    prior_masks = dict(assumed_masks)
+    try:
+        ff = decode_ff(record.word)
+        is_ff = True
+    except BurnError:
+        ff = None
+        is_ff = False
+    if is_ff and ff is not None:
+        violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
+        if violations:
+            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
+        if unknown and not allow_undetermined_ceiling:
+            raise BurnError(
+                f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
+                "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
+            )
+        word_mapped_fields = {
+            FFCALC_KEY_TO_FIELD[f.key]
+            for f in fields_in_block(ff.chain, ff.block)
+            if f.key in FFCALC_KEY_TO_FIELD
+        }
+        word_masks = apply_ff_word_to_masks(record.word, assumed_masks)
+
     if record.mask_field is not None:
         field = record.mask_field
         if field not in assumed_masks or field not in plan.defect_masks:
@@ -386,6 +450,22 @@ def reconcile(
                 f"{record.name}: REFUSED; reenables genuinely defective {field} "
                 f"bits {hex32(removed & genuine)}"
             )
+        # Independent of from_disable: the declared end state must keep every defect disabled.
+        if genuine & ~record.to_disable & 0xFFFFFFFF:
+            raise BurnError(
+                f"{record.name}: REFUSED; declared {field} end state {hex32(record.to_disable)} "
+                f"leaves genuinely defective bits {hex32(genuine & ~record.to_disable)} enabled"
+            )
+        if is_ff and field not in word_mapped_fields:
+            raise BurnError(
+                f"{record.name}: mask_update targets {field} but the FF word writes "
+                f"{', '.join(sorted(word_mapped_fields)) or 'no known option field'}"
+            )
+        if field in word_masks and word_masks[field] != record.to_disable:
+            raise BurnError(
+                f"{record.name}: mask_update.to={hex32(record.to_disable)} for {field} disagrees with "
+                f"what the FF word actually writes ({hex32(word_masks[field])})"
+            )
         if _is_compute_mask_field(field) and record.resulting_sm_count is None:
             if not allow_undetermined_ceiling:
                 raise BurnError(
@@ -394,6 +474,36 @@ def reconcile(
         assumed_masks[field] = record.to_disable
     elif record.defect_sensitive:
         raise BurnError(f"{record.name}: defect-sensitive change without mask map")
+
+    # Propagate every word-derived mask (covers shared blocks touching several fields).
+    untracked_compute = any(
+        _is_compute_mask_field(k) and k not in prior_masks for k in word_mapped_fields
+    )
+    compute_changed = untracked_compute or any(
+        _is_compute_mask_field(k) and prior_masks.get(k) != v for k, v in word_masks.items()
+    )
+    assumed_masks.update(word_masks)
+    if compute_changed and not allow_undetermined_ceiling:
+        tpc_keys = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
+        if "GPC_DISABLE" in assumed_masks and all(k in assumed_masks for k in tpc_keys):
+            derived_sm = compute_sm_count(
+                assumed_masks["GPC_DISABLE"], [assumed_masks[k] for k in tpc_keys]
+            )
+            if record.resulting_sm_count is not None and record.resulting_sm_count != derived_sm:
+                raise BurnError(
+                    f"{record.name}: declared resulting_sm_count={record.resulting_sm_count} but the "
+                    f"FF word yields {derived_sm} SM"
+                )
+            ceiling = plan.override_sm_ceiling if record.kind == "reconfig" else plan.base_sm_ceiling
+            if ceiling is None or derived_sm > ceiling:
+                raise BurnError(
+                    f"{record.name}: FF word yields {derived_sm} SM, beyond supplied ceiling {ceiling}"
+                )
+        elif record.resulting_sm_count is None:
+            raise BurnError(
+                f"{record.name}: changes GPC/TPC masks but the plan lacks GPC_DISABLE + all eight "
+                "TPC_GPCi_DISABLE expected masks; resulting SM count undetermined"
+            )
 
     if record.kind == "reconfig":
         if plan.override_sm_ceiling is None or not plan.reconfig_semantics_verified:
@@ -578,6 +688,110 @@ def _confirm_active_sense(confirm, journal: Journal, show, *, stage: str, phase:
     journal.append(event="active_sense_confirmed", stage=stage, phase=phase)
 
 
+def _write_verify_or_halt(
+    plan: Plan,
+    reader,
+    writer,
+    journal: Journal,
+    *,
+    pointer: int,
+    record: Record,
+    ov: Overrides,
+    manual_record_sha256: str | None,
+) -> tuple[int, Health, Host]:
+    """Issue ONE record write, then read-back + full post-write gate. Never retries."""
+    readback: int | None = None
+    health: Health | None = None
+    host_after: Host | None = None
+    try:
+        writer.write_one_record(pointer, record.word)
+    except PreTriggerRefusal as exc:
+        # The writer guarantees CMD_PROGRAM was never issued: nothing can have burned.
+        journal.append(
+            event="aborted_pre_trigger",
+            row=pointer,
+            record=record.name,
+            error=str(exc),
+            write_issued=False,
+            pointer_advanced=False,
+            manual_record_sha256=manual_record_sha256,
+        )
+        raise BurnError(f"ABORTED before CMD_PROGRAM (NO write issued): {exc}") from exc
+    except BaseException as exc:
+        _journal_halt(journal, reader, pointer, record, exc, manual_record_sha256)
+        if not isinstance(exc, Exception):
+            raise
+        raise BurnError(f"HALT: row {pointer} may be partially programmed; do NOT retry: {exc}") from exc
+    try:
+        readback = reader.fuse_row(pointer)
+        _poison(f"row {pointer} readback", readback)
+        if readback != record.word:
+            raise BurnError(
+                f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
+            )
+        health = reader.health()
+        check_health(health, plan, allow_vout_override=ov.vout_range)
+        host_after = reader.host()
+        check_host(host_after)
+        # Extra slot check: no pointer advance before every post-write gate passes.
+        second_readback = reader.fuse_row(pointer)
+        if second_readback != record.word:
+            raise BurnError(
+                f"row {pointer} changed after post-write gate: {hex32(second_readback)}"
+            )
+    except BaseException as exc:
+        _journal_halt(
+            journal, reader, pointer, record, exc, manual_record_sha256,
+            readback=readback, health=health, host_after=host_after,
+        )
+        if not isinstance(exc, Exception):
+            raise
+        raise BurnError(f"HALT: row {pointer} may be partially programmed; do NOT retry: {exc}") from exc
+    return readback, health, host_after
+
+
+def _journal_halt(
+    journal: Journal,
+    reader,
+    pointer: int,
+    record: Record,
+    exc: BaseException,
+    manual_record_sha256: str | None,
+    *,
+    readback: int | None = None,
+    health: Health | None = None,
+    host_after: Host | None = None,
+) -> None:
+    # Failure may be partial. Never re-issue the programming operation.
+    if health is None:
+        try:
+            health = reader.health()
+        except Exception:
+            pass
+    if host_after is None:
+        try:
+            host_after = reader.host()
+        except Exception:
+            pass
+    if readback is None:
+        try:
+            readback = reader.fuse_row(pointer)
+        except Exception:
+            pass
+    journal.append(
+        event="HALT_UNVERIFIED",
+        row=pointer,
+        record=record.name,
+        intended=hex32(record.word),
+        readback=hex32(readback) if readback is not None else None,
+        full_post_write_gate=health.serializable() if health else None,
+        host_after=host_after.serializable() if host_after else None,
+        error=f"{type(exc).__name__}: {exc}",
+        pointer_advanced=False,
+        manual_record_sha256=manual_record_sha256,
+    )
+
+
 def process_records(
     plan: Plan,
     reader,
@@ -620,6 +834,13 @@ def process_records(
         allow_manual_debugctrl=effective_debugctrl,
         allow_undetermined_ceiling=ov.undetermined_ceiling,
     )
+    if not getattr(reader, "simulation", False):
+        # Refuse non-FF payloads before preflight/SENSE_CTRL, not inside the write block.
+        for r in plan.records:
+            try:
+                decode_ff(r.word)
+            except BurnError as exc:
+                raise BurnError(f"{r.name}: not a valid GA100 FF record word ({exc})") from exc
 
     receipt: dict | None = None
     if stage == "real":
@@ -1007,92 +1228,50 @@ def process_records(
                 f"ABORTED before write (card state changed during confirmation; NO write issued): {exc}"
             ) from exc
 
-        journal.append(
-            event="attempt",
-            stage=stage,
-            plan_sha256=plan.content_hash,
-            manual_record_sha256=manual_record_sha256,
-            card=plan.pci_id,
-            row=pointer,
-            record=record.name,
-            target=record.target,
-            intended=hex32(record.word),
-            previous=hex32(previous),
-            confirmation=confirm_word,
-            boot_id=boot_id,
-            overrides=ov.active_names(),
-        )
-
-        readback: int | None = None
-        health: Health | None = None
-        host_after: Host | None = None
-        try:
-            writer.write_one_record(pointer, record.word)
-            readback = reader.fuse_row(pointer)
-            _poison(f"row {pointer} readback", readback)
-            if readback != record.word:
-                raise BurnError(
-                    f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
-                )
-            health = reader.health()
-            check_health(health, plan, allow_vout_override=ov.vout_range)
-            host_after = reader.host()
-            check_host(host_after)
-            # Extra slot check: no pointer advance before every post-write gate passes.
-            second_readback = reader.fuse_row(pointer)
-            if second_readback != record.word:
-                raise BurnError(
-                    f"row {pointer} changed after post-write gate: {hex32(second_readback)}"
-                )
-        except Exception as exc:
-            # Failure may be partial. Never re-issue the programming operation.
-            if health is None:
-                try:
-                    health = reader.health()
-                except Exception:
-                    pass
-            if host_after is None:
-                try:
-                    host_after = reader.host()
-                except Exception:
-                    pass
-            if readback is None:
-                try:
-                    readback = reader.fuse_row(pointer)
-                except Exception:
-                    pass
+        # Irreversible section: Ctrl-C / SSH hang-up are held back until the outcome of
+        # this record (verified, aborted pre-trigger, or HALT) is fsynced to the journal.
+        with deferred_signals():
             journal.append(
-                event="HALT_UNVERIFIED",
+                event="attempt",
+                stage=stage,
+                plan_sha256=plan.content_hash,
+                manual_record_sha256=manual_record_sha256,
+                card=plan.pci_id,
                 row=pointer,
                 record=record.name,
+                target=record.target,
                 intended=hex32(record.word),
-                readback=hex32(readback) if readback is not None else None,
-                full_post_write_gate=health.serializable() if health else None,
-                host_after=host_after.serializable() if host_after else None,
-                error=str(exc),
-                pointer_advanced=False,
+                previous=hex32(previous),
+                confirmation=confirm_word,
+                boot_id=boot_id,
+                overrides=ov.active_names(),
+            )
+            readback, health, host_after = _write_verify_or_halt(
+                plan,
+                reader,
+                writer,
+                journal,
+                pointer=pointer,
+                record=record,
+                ov=ov,
                 manual_record_sha256=manual_record_sha256,
             )
-            raise BurnError(
-                f"HALT: row {pointer} may be partially programmed; do NOT retry: {exc}"
-            ) from exc
-
-        journal.append(
-            event="verified_readback_only",
-            row=pointer,
-            record=record.name,
-            target=record.target,
-            intended=hex32(record.word),
-            readback=hex32(readback),
-            result="MATCH",
-            full_post_write_gate=health.serializable(),
-            host_after=host_after.serializable(),
-            pointer_advanced=True,
-            cold_boot_verified=False,
-            boot_id=boot_id,
-            plan_sha256=plan.content_hash,
-            manual_record_sha256=manual_record_sha256,
-        )
+            journal.append(
+                event="verified_readback_only",
+                row=pointer,
+                record=record.name,
+                target=record.target,
+                intended=hex32(record.word),
+                readback=hex32(readback),
+                result="MATCH",
+                full_post_write_gate=health.serializable(),
+                host_after=host_after.serializable(),
+                pointer_advanced=True,
+                cold_boot_verified=False,
+                boot_id=boot_id,
+                plan_sha256=plan.content_hash,
+                manual_record_sha256=manual_record_sha256,
+            )
         pointer += 1  # The ONLY advance, after read-back AND healthy gate.
 
         if stage == "all" and record.kind == "test" and idx + 1 < len(pending):
@@ -1201,26 +1380,35 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
             if u32(raw_rows[str(test_row)], f"cold.fpf_rows.{test_row}") != plan.records[0].word:
                 raise BurnError("cold test FPF row does not persist")
         else:
-            # If fpf_rows are supplied in real cold snapshot, verify every journaled write persisted.
+            # Every journaled write for this plan must persist across the cold boot.
+            # Snapshots store only NON-ZERO rows, so an absent row means it reads 0x00000000
+            # (did not persist) -- it must fail, not be skipped.
             raw_rows = cold.get("fpf_rows")
-            if isinstance(raw_rows, dict) and raw_rows:
-                written = [
-                    item
-                    for item in prior
-                    if item.get("event") == "verified_readback_only"
-                    and item.get("plan_sha256") == plan.content_hash
-                    and item.get("manual_record_sha256") is None
-                ]
-                for item in written:
-                    row_key = str(item["row"])
-                    if row_key in raw_rows:
-                        observed_word = u32(raw_rows[row_key], f"cold.fpf_rows.{row_key}")
-                        expected_word = u32(item["intended"], "journal.intended")
-                        if observed_word != expected_word:
-                            raise BurnError(
-                                f"cold FPF row {row_key} ({hex32(observed_word)}) "
-                                f"does not match written record {item['record']!r} ({hex32(expected_word)})"
-                            )
+            if not isinstance(raw_rows, dict) or not raw_rows:
+                raise BurnError(
+                    "real-stage cold snapshot has no fpf_rows (captured with --no-rows?); "
+                    "cannot prove the burned FF rows persisted"
+                )
+            written = [
+                item
+                for item in prior
+                if item.get("event") == "verified_readback_only"
+                and item.get("plan_sha256") == plan.content_hash
+                and item.get("manual_record_sha256") is None
+            ]
+            if not written:
+                raise BurnError("no journaled verified writes for this plan to cold-verify")
+            for item in written:
+                row_key = str(item["row"])
+                expected_word = u32(item["intended"], "journal.intended")
+                observed_word = (
+                    u32(raw_rows[row_key], f"cold.fpf_rows.{row_key}") if row_key in raw_rows else 0
+                )
+                if observed_word != expected_word:
+                    raise BurnError(
+                        f"cold FPF row {row_key} ({hex32(observed_word)}) "
+                        f"does not match written record {item['record']!r} ({hex32(expected_word)})"
+                    )
 
         expected: dict[str, int] = {}
         records = plan.records[:1] if stage == "test" else plan.records

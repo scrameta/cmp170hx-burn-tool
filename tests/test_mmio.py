@@ -24,9 +24,9 @@ class TestMMIO(unittest.TestCase):
     def test_aligned_mmio_single_32bit_store_and_read(self):
         buf = bytearray(0x100)
         mmio = AlignedMMIO(buf)
-        mmio.write32(0x10, 0x13572468)
-        self.assertEqual(mmio.read32(0x10), 0x13572468)
-        self.assertEqual(int.from_bytes(buf[0x10:0x14], "little"), 0x13572468)
+        mmio.write32(0x10, 0x13572448)
+        self.assertEqual(mmio.read32(0x10), 0x13572448)
+        self.assertEqual(int.from_bytes(buf[0x10:0x14], "little"), 0x13572448)
 
     def test_alignment_bounds_and_value_checks(self):
         buf = bytearray(16)

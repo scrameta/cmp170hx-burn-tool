@@ -99,9 +99,9 @@ class TestBurnMenu(unittest.TestCase):
             journal_path=str(self.journal_path),
         )
         # examples/plan.example.json has 2 records:
-        # 0: FAKE_TEST (0x13572468) at row 223 -> YES
+        # 0: FAKE_TEST (0x13572448) at row 223 -> YES
         # -> CONTINUE SAME WINDOW checkpoint
-        # 1: FAKE_COMPUTE (0x24681357) at row 224 -> YES
+        # 1: FAKE_COMPUTE (0x04200201) at row 224 -> YES
         rc, out, menu = self._run_menu(
             session,
             [
@@ -114,8 +114,8 @@ class TestBurnMenu(unittest.TestCase):
         )
         self.assertEqual(rc, 0, out)
         self.assertIn("SIMULATION COMPLETE", out)
-        self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572468)
-        self.assertEqual(menu._cached_fake.fuse_row(224), 0x24681357)
+        self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572448)
+        self.assertEqual(menu._cached_fake.fuse_row(224), 0x04200201)
 
         events = [e["event"] for e in self._journal_events()]
         self.assertIn("same_window_continue_confirmed", events)
@@ -140,8 +140,8 @@ class TestBurnMenu(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(session.receipt_path, str(receipt_out))
         self.assertTrue(receipt_out.exists())
-        self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572468)
-        self.assertEqual(menu._cached_fake.fuse_row(224), 0x24681357)
+        self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572448)
+        self.assertEqual(menu._cached_fake.fuse_row(224), 0x04200201)
 
     def test_overrides_and_manual_console_submenus(self):
         session = MenuSession(
@@ -250,7 +250,7 @@ class TestBurnMenu(unittest.TestCase):
                 "pci_id": "10de:20c2",
                 "die_rows": {str(i): f"0x100{i:x}" for i in range(8, 16)},
                 "expected_masks": {"GPC_DISABLE": "0x85"},
-                "defect_masks": {"GPC_DISABLE": "0x04"},
+                "defect_masks": {"GPC_DISABLE": "0x04", "FBPA_DISABLE": "0x0", "NVLINK_DISABLE": "0x0", "SYS_PIPE_DISABLE": "0x0"},
             },
             "fpf": {"first_row": 222, "last_row": 486, "empty_word": "0x00000000"},
             "environment": {"stock_mv": 787.5, "tolerance_mv": 25},

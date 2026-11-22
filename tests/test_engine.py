@@ -48,13 +48,16 @@ class Harness(unittest.TestCase):
         with self.assertRaisesRegex(BurnError, 'disabled|DISABLED'):
             self.run_test(writer=MissingWriter())
         self.assertEqual(self.controller.rows[223],0)
-        self.assertTrue(any(e['event']=='HALT_UNVERIFIED' and not e['pointer_advanced']
-                            for e in self.logged()))
+        # MissingWriter refuses before any program command: journaled as a pre-trigger
+        # abort (write_issued=False), not as a possibly-partial HALT_UNVERIFIED.
+        self.assertTrue(any(e['event']=='aborted_pre_trigger' and e['write_issued'] is False
+                            and not e['pointer_advanced'] for e in self.logged()))
+        self.assertFalse(any(e['event']=='HALT_UNVERIFIED' for e in self.logged()))
 
     def test_test_record_one_at_a_time(self):
         ptr = self.run_test()
         self.assertEqual(ptr,224)
-        self.assertEqual(self.controller.rows[223],0x13572468)
+        self.assertEqual(self.controller.rows[223],0x13572448)
         self.assertEqual(self.controller.rows[224],0)
         self.assertEqual(len([e for e in self.controller.events if e[0]=='write']),1)
         self.assertEqual(len([e for e in self.logged() if e['event']=='verified_readback_only']),1)
@@ -207,7 +210,7 @@ class Harness(unittest.TestCase):
 
     def test_cold_snapshot_comparison_and_fake_receipt(self):
         self.run_test()
-        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223": "0x13572468"}, die_rows={str(k):v for k,v in self.plan.die_rows.items()},
+        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223": "0x13572448"}, die_rows={str(k):v for k,v in self.plan.die_rows.items()},
                   fields={'SYNTHETIC_TEST_EFFECT':'0x1'}, cold_boot=True,
                   boot_id='synthetic-cold-boot-2',previous_boot_id='fake-boot-1')
         with self.journal() as j:
@@ -224,7 +227,7 @@ class Harness(unittest.TestCase):
 
     def test_real_requires_persistent_test_row_and_can_complete_simulated_record(self):
         self.run_test()
-        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223":"0x13572468"},
+        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223":"0x13572448"},
                   die_rows={str(k):v for k,v in self.plan.die_rows.items()},
                   fields={"SYNTHETIC_TEST_EFFECT":"0x1"}, cold_boot=True,
                   boot_id="synthetic-boot-2", previous_boot_id="fake-boot-1")
@@ -258,7 +261,7 @@ class Harness(unittest.TestCase):
         self.controller.fields["LnkCap2"]=2
         receipt_file=self.work / "receipt"
         receipt_file.write_text(json.dumps({"status":"PASS","stage":"test",
-             "plan_sha256":self.plan.content_hash,"test_word":"0x13572468","test_row":223}))
+             "plan_sha256":self.plan.content_hash,"test_word":"0x13572448","test_row":223}))
         receipt_file.chmod(0o600)
         prompts=[]
         def confirm(p,token):
@@ -283,7 +286,7 @@ class Harness(unittest.TestCase):
         self.run_test()
         receipt_file=self.work / "receipt"
         receipt_file.write_text(json.dumps({"status":"PASS","stage":"test",
-             "plan_sha256":self.plan.content_hash,"test_word":"0x13572468","test_row":223}))
+             "plan_sha256":self.plan.content_hash,"test_word":"0x13572448","test_row":223}))
         receipt_file.chmod(0o600)
         with self.journal() as j:
             with self.assertRaisesRegex(BurnError,"DEBUGCTRL"):
@@ -312,7 +315,7 @@ class Harness(unittest.TestCase):
         self.run_test()
         r=self.work / "receipt"
         r.write_text(json.dumps({"status":"PASS","stage":"test",
-            "plan_sha256":self.plan.content_hash,"test_word":"0x13572468","test_row":223}))
+            "plan_sha256":self.plan.content_hash,"test_word":"0x13572448","test_row":223}))
         r.chmod(0o644)
         with self.journal() as j:
             with self.assertRaisesRegex(BurnError,"mode 0600"):
@@ -322,7 +325,7 @@ class Harness(unittest.TestCase):
 
     def test_cold_test_row_mismatch_refuses(self):
         self.run_test()
-        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223":"0x13572469"},
+        cold=dict(pci_id=self.plan.pci_id, fpf_rows={"223":"0x13572449"},
                   die_rows={str(k):v for k,v in self.plan.die_rows.items()},
                   fields={"SYNTHETIC_TEST_EFFECT":"0x1"}, cold_boot=True,
                   boot_id="fake-boot-2",previous_boot_id="fake-boot-1")
@@ -360,13 +363,13 @@ class Harness(unittest.TestCase):
                 process_records(self.plan, self.controller, self.controller, j,
                                 stage='test', confirm=bad_confirm, strict_confirm=True,
                                 show=lambda *_: None)
-        self.assertEqual(seen, ['YES 223 0x13572468'])
+        self.assertEqual(seen, ['YES 223 0x13572448'])
         self.assertEqual(self.controller.rows[223], 0)
 
     def test_multi_record_stepping_and_resume_across_sessions(self):
         r2 = Record.parse(dict(
             name='FAKE_COMPUTE_2', kind='regular', target='GPC_DISABLE',
-            word='0x35792468', decode='second real record', defect_sensitive=True,
+            word='0x00200201', decode='second real record', defect_sensitive=True,
             mask_update=dict(field='GPC_DISABLE', from_='0x84', to='0x80') if False else {'field': 'GPC_DISABLE', 'from': '0x84', 'to': '0x80'},
             resulting_sm_count=90, expected_cold={'GPC_DISABLE': '0x80'},
         ))
@@ -379,7 +382,7 @@ class Harness(unittest.TestCase):
         receipt_file = self.work / 'test.receipt'
         receipt_file.write_text(json.dumps({
             'status': 'PASS', 'stage': 'test', 'plan_sha256': multi_plan.content_hash,
-            'test_word': '0x13572468', 'test_row': 223,
+            'test_word': '0x13572448', 'test_row': 223,
         }))
         receipt_file.chmod(0o600)
         # Session 1: burn ONLY 1 real record (max_records=1).
@@ -512,7 +515,7 @@ class Harness(unittest.TestCase):
     def test_verify_cold_final_expected_takes_precedence_and_checks_real_fpf_rows(self):
         self.run_test()
         cold_test = dict(
-            pci_id=self.plan.pci_id, fpf_rows={'223': '0x13572468'},
+            pci_id=self.plan.pci_id, fpf_rows={'223': '0x13572448'},
             die_rows={str(k): v for k, v in self.plan.die_rows.items()},
             fields={'SYNTHETIC_TEST_EFFECT': '0x1'}, cold_boot=True,
             boot_id='boot-2', previous_boot_id='fake-boot-1',
@@ -536,7 +539,7 @@ class Harness(unittest.TestCase):
                             show=lambda *_: None)
         cold_real = dict(
             pci_id=full_plan.pci_id,
-            fpf_rows={'223': '0x13572468', '224': '0x99999999'},  # wrong persisted real word!
+            fpf_rows={'223': '0x13572448', '224': '0x99999999'},  # wrong persisted real word!
             die_rows={str(k): v for k, v in full_plan.die_rows.items()},
             fields={**full_plan.final_expected_cold, 'SYNTHETIC_TEST_EFFECT': 1},
             cold_boot=True, boot_id='boot-3', previous_boot_id='fake-boot-1',
@@ -544,7 +547,7 @@ class Harness(unittest.TestCase):
         with self.journal() as j:
             with self.assertRaisesRegex(BurnError, 'does not match written record'):
                 verify_cold_snapshot(full_plan, cold_real, stage='real', journal=j)
-        cold_real['fpf_rows']['224'] = '0x24681357'
+        cold_real['fpf_rows']['224'] = '0x04200201'
         with self.journal() as j:
             res = verify_cold_snapshot(full_plan, cold_real, stage='real', journal=j)
         self.assertEqual(res['status'], 'PASS')
@@ -591,7 +594,7 @@ class Harness(unittest.TestCase):
     def test_verify_cold_early_rejection_is_logged(self):
         self.run_test()
         bad_cold = dict(
-            pci_id=self.plan.pci_id, fpf_rows={'223': '0x13572469'},
+            pci_id=self.plan.pci_id, fpf_rows={'223': '0x13572449'},
             die_rows={str(k): v for k, v in self.plan.die_rows.items()},
             fields={'SYNTHETIC_TEST_EFFECT': '0x1'}, cold_boot=True,
             boot_id='boot-2', previous_boot_id='fake-boot-1',

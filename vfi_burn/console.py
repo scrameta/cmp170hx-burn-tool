@@ -471,7 +471,7 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
     host = reader.host()
     ctrl = health.fusectrl
     state_val = (ctrl >> 16) & 0x1F
-    cmd_val = ctrl & 0x3
+    cmd_val = ctrl & 0x1F
     idle_str = "IDLE (state=4)" if (not is_poison(ctrl) and state_val == 4 and cmd_val == 0) else (
         "POISON!" if is_poison(ctrl) else f"NON-IDLE (state={state_val}, cmd={cmd_val})"
     )
@@ -496,7 +496,7 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
         "=== FUSE CONTROLLER STATE (BAR0 0x0082xxxx) ===",
         f"  FUSECTRL (0x820000) : {hex32(ctrl)}  [{idle_str}]",
         f"  DEBUGCTRL(0x820060) : {hex32(health.debugctrl)}  [RWL={rwl} — NEVER WRITTEN]",
-        f"  CRC / DSOV          : CRC(0x820068)={hex32(health.crc)} ({'OK' if health.crc == 0x55 else 'BAD!'}) | DSOV(0x820084)={hex32(health.dsov)} ({'GOLDILOCKS' if health.dsov == 0 else 'LOCKED'})",
+        f"  CRC / DSOV          : CRC(0x820070)={hex32(health.crc)} ({'OK' if health.crc == 0x55 else 'BAD!'}) | DSOV(0x820084)={hex32(health.dsov)} ({'GOLDILOCKS' if health.dsov == 0 else 'LOCKED'})",
         f"  Sense / Arm Flags   : EFP(0x820078)={efp_str}  DFP(0x82007C)={dfp_str}  RESENSE_DIS(0x821058)={resense_str}",
         f"  Override / Shadow   : EN_SW(0x820040)={hex32(health.en_sw)}  SBFE(0x821108)={sbfe_str}  WDATA_WR_SEC(0x82048C)={wsec_str}",
         f"  PLM Gates           : PLM_f4(0x8200F4)={plm_f4_str}  PLM_f8(0x8200F8)={hex32(health.plm_f8)} ({'OPEN' if health.plm_f8 & 1 else 'CLOSED!'})  PLM_fc(0x8200FC)={hex32(health.plm)}",
@@ -562,11 +562,12 @@ def format_pcie_write_plan(
     lines.append(f"  [12] WR32 BAR0+0x0082000C  FUSEWDATA        <- {hex32(word)}  (stage FF word; verify readback)")
     lines.append("  [13] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000002  (CMD_PROGRAM; poll IDLE, halt on 0xBADF/0xBAD0)")
     lines.append("  [14] WR32 BAR0+0x00820004  FUSEADDR         <- orig_addr   (restore FUSEADDR)")
+    lines.append("  [15] WR32 BAR0+0x0082000C  FUSEWDATA        <- 0x00000000  (restore no-burn safety latch)")
     lines.append("  --- Phase 3: Mandatory Read-Back (CMD_READ = 1) & Post-Write Gate ---")
-    lines.append("  [15] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
-    lines.append(f"  [16] WR32 BAR0+0x00820004  FUSEADDR         <- {hex32(row)}  (select row {row})")
-    lines.append(f"  [17] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000001  (CMD_READ; verify FUSEDATA(0x820008) == {hex32(word)})")
-    lines.append("  [18] POST-WRITE GATE       full health/PMBus/host check + second CMD_READ verify")
+    lines.append("  [16] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
+    lines.append(f"  [17] WR32 BAR0+0x00820004  FUSEADDR         <- {hex32(row)}  (select row {row})")
+    lines.append(f"  [18] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000001  (CMD_READ; verify FUSEDATA(0x820008) == {hex32(word)})")
+    lines.append("  [19] POST-WRITE GATE       full health/PMBus/host check + second CMD_READ verify")
     lines.append("  GUARANTEES: single aligned 32-bit stores only | DEBUGCTRL (0x820060) NEVER written | FUSEDATA (0x820008) read-only")
     return lines
 
@@ -1103,7 +1104,8 @@ class ManualConsole:
                 )
             token = f"UNRECONCILED TARGET {target.upper()}"
             self.show(
-                f"!!! WARNING: console one-liner skips defect-mask reconciliation for {target!r}!"
+                f"!!! WARNING: console one-liner has no mask_update/SM metadata for {target!r}; "
+                "genuine defect bits are still refused from the FF word itself."
             )
             if not self._confirm(f"Type '{token}' to confirm unreconciled manual target: ", token):
                 self.journal.append(

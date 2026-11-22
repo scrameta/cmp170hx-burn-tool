@@ -252,7 +252,12 @@ class BurnMenu:
                 dp = self._ask("ffcalc 512-row dump.json path")
                 out = self._ask("Output mode-0600 plan path", "private/plan.json")
                 noop = self._ask("Prepend safe no-op test row? (y/n)", "y").lower().startswith("y")
-                plan_dict = import_ffcalc_plan(bp, dp, prepend_noop_test=noop)
+                base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
+                if not base_sm_s:
+                    raise BurnError("SM ceiling is required; the card cannot supply it (BURN_SPEC §4)")
+                plan_dict = import_ffcalc_plan(
+                    bp, dp, base_sm_ceiling=int(base_sm_s, 0), prepend_noop_test=noop
+                )
                 write_private_json(out, plan_dict)
                 loaded = Plan.load(out)
                 check_plan(loaded)

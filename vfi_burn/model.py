@@ -9,16 +9,35 @@ import math
 
 SKU_CMP170HX_8GB = "10de:20c2"
 DEBUGCTRL_ADDR = 0x00820060
-POISON_PREFIXES = (0xBADF0000, 0xBAD00000)
+POISON_PREFIXES = (0xBADF0000, 0xBAD00000)  # most common; is_poison() matches all 0xBADxxxxx
+
+# Physical GA100 FF (fuseless-fuse) region. Rows 0..221 are control/regular/FPF,
+# 487..511 are IFF. Defined here (not ffrecord) so Plan.load can enforce it.
+FF_ROW_MIN = 222
+FF_ROW_MAX = 486
 
 
 class BurnError(Exception):
     """A fail-closed validation, controller, safety-gate or operator error."""
 
 
+class PreTriggerRefusal(BurnError):
+    """Refusal raised strictly BEFORE CMD_PROGRAM was issued: no fuse can have changed.
+
+    Writers raise this (instead of a plain BurnError) for every failure that happens
+    before the program command, so the journal can record ``write_issued=False``
+    rather than a misleading ``HALT_UNVERIFIED`` / "may be partially programmed".
+    """
+
+
 def is_poison(value: int) -> bool:
-    """Return True if a 32-bit word carries a GPU poison or fuse-unit error prefix."""
-    return (value & 0xFFFF0000) in POISON_PREFIXES
+    """Return True if a 32-bit word carries a GPU PRI-error / fuse-unit error prefix.
+
+    Matches every 0xBADxxxxx value (0xBADF poison, 0xBAD0 fuse unit not answering,
+    and the other 0xBAD1..0xBADE PRI error codes), the same test
+    cmp170hx-8gb-vfi-tools uses (``(v >> 20) == 0xBAD``).
+    """
+    return ((value & 0xFFFFFFFF) >> 20) == 0xBAD
 
 
 def is_debugctrl_target(target: str) -> bool:
@@ -218,8 +237,11 @@ class Plan:
 
         first = u32(_req(fpf, "first_row", "fpf"), "fpf.first_row")
         last = u32(_req(fpf, "last_row", "fpf"), "fpf.last_row")
-        if not (0 <= first < last <= 4096):
-            raise BurnError("invalid explicitly configured FPF row limits (need 0 <= first < last <= 4096)")
+        if not (FF_ROW_MIN <= first < last <= FF_ROW_MAX):
+            raise BurnError(
+                f"fpf.first_row/last_row ({first}..{last}) must lie inside the GA100 FF region "
+                f"{FF_ROW_MIN}..{FF_ROW_MAX} (rows 0..221 control/FPF, 487..511 IFF)"
+            )
         empty_word = u32(_req(fpf, "empty_word", "fpf"), "fpf.empty_word")
 
         stock = _finite_float(_req(env, "stock_mv", "environment"), "environment.stock_mv")

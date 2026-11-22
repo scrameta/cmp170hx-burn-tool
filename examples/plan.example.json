@@ -4,7 +4,7 @@
     "pci_id": "10de:20c2",
     "die_rows": {"8": "0x1008", "9": "0x1009", "10": "0x100a", "11": "0x100b", "12": "0x100c", "13": "0x100d", "14": "0x100e", "15": "0x100f"},
     "expected_masks": {"GPC_DISABLE": "0x85"},
-    "defect_masks": {"GPC_DISABLE": "0x04"}
+    "defect_masks": {"GPC_DISABLE": "0x04", "FBPA_DISABLE": "0x0"}
   },
   "fpf": {"first_row": 222, "last_row": 227, "empty_word": "0x00000000"},
   "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
@@ -12,12 +12,12 @@
   "records": [
     {
       "name": "FAKE_TEST", "kind": "test", "target": "SYNTHETIC_TEST_ROW",
-      "word": "0x13572468", "decode": "SYNTHETIC DATA - NOT A VALID FF RECORD",
+      "word": "0x13572448", "decode": "SYNTHETIC DATA - unmapped FF chain, never burn on a real card",
       "defect_sensitive": false, "expected_cold": {"SYNTHETIC_TEST_EFFECT": "0x1"}
     },
     {
       "name": "FAKE_COMPUTE", "kind": "regular", "target": "GPC_DISABLE",
-      "word": "0x24681357", "decode": "SYNTHETIC DATA - NOT A VALID FF RECORD",
+      "word": "0x04200201", "decode": "SYNTHETIC DATA - chain=1 blk=8 GPC_DISABLE=0x84, never burn on a real card",
       "defect_sensitive": true,
       "mask_update": {"field": "GPC_DISABLE", "from": "0x85", "to": "0x84"},
       "resulting_sm_count": 75,

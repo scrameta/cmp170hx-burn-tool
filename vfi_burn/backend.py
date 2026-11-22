@@ -8,7 +8,7 @@ import importlib
 import json
 import os
 
-from .model import BurnError, require_private_file, u32
+from .model import BurnError, PreTriggerRefusal, require_private_file, u32
 
 REQUIRED_READER_METHODS = (
     "pci_id",
@@ -81,7 +81,9 @@ class MissingWriter:
     writer_verified = False
 
     def write_one_record(self, row: int, word: int) -> None:
-        raise BurnError("REAL FUSE WRITES DISABLED: encoding, command sequence, voltage unverified")
+        raise PreTriggerRefusal(
+            "REAL FUSE WRITES DISABLED: encoding, command sequence, voltage unverified"
+        )
 
 
 def has_verified_writer(adapter) -> bool:
@@ -258,7 +260,12 @@ def fake_from_file(path: str | Path) -> FakeController:
         health_raw = data["health"]
         health_kwargs = {
             **health_raw,
-            **{k: u32(v, f"health.{k}") for k, v in health_raw.items() if k != "vout_mv"},
+            # Optional Health fields are saved as JSON null by --save-fake; keep them None.
+            **{
+                k: (None if v is None else u32(v, f"health.{k}"))
+                for k, v in health_raw.items()
+                if k != "vout_mv"
+            },
         }
         return FakeController(
             pci_id=str(data["pci_id"]),
