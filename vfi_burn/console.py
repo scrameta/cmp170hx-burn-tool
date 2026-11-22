@@ -20,6 +20,8 @@ from .engine import (
     evaluate_host,
     hex32,
     process_records,
+    resolve_fpf_pointer,
+    scan_fpf_rows,
     scan_slots,
 )
 from .ffrecord import (
@@ -333,7 +335,7 @@ def format_plan_review(
                 rows[row_idx] = val
             current_rows = rows
             try:
-                next_free_row, _ = scan_slots(plan, reader, override_slot=override_slot)
+                next_free_row, _ = resolve_fpf_pointer(plan, rows, override_slot=override_slot)
             except BurnError as exc:
                 slot_error = str(exc)
         except BurnError as exc:
@@ -955,16 +957,27 @@ class ManualConsole:
             registers={k: hex32(v) for k, v in readings.items()},
         )
 
-    def _show_write_preview(self, word: int, row: int | None = None) -> int:
+    def _show_write_preview(
+        self,
+        word: int,
+        row: int | None = None,
+        *,
+        preloaded_rows: dict[int, int] | None = None,
+    ) -> int:
+        cur_rows = preloaded_rows
         if row is None:
-            row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+            if cur_rows is None:
+                row, _, cur_rows = scan_fpf_rows(self.plan, self.reader, override_slot=self.overrides.slot)
+            else:
+                row, _ = resolve_fpf_pointer(self.plan, cur_rows, override_slot=self.overrides.slot)
         old_blk = None
         try:
             ff = decode_ff(word)
-            cur_rows = {
-                r: self.reader.fuse_row(r)
-                for r in range(self.plan.first_row, self.plan.last_row + 1)
-            }
+            if cur_rows is None:
+                cur_rows = {
+                    r: self.reader.fuse_row(r)
+                    for r in range(self.plan.first_row, self.plan.last_row + 1)
+                }
             blocks, _ = _safe_replay_rows(cur_rows)
             old_blk = blocks.get(ff.chain, {}).get(ff.block)
         except Exception:
@@ -1010,11 +1023,26 @@ class ManualConsole:
             explicit_row = int(args[1], 0) if len(args) == 2 else None
             target, decode = self._auto_label_for_word(word)
 
-        resolved_row = self._show_write_preview(word, row=explicit_row)
+        preloaded_rows: dict[int, int] | None = None
+        if explicit_row is not None:
+            try:
+                preloaded_rows = {
+                    r: self.reader.fuse_row(r)
+                    for r in range(self.plan.first_row, self.plan.last_row + 1)
+                }
+            except Exception:
+                preloaded_rows = None
+
+        resolved_row = self._show_write_preview(word, row=explicit_row, preloaded_rows=preloaded_rows)
         staged_ok = True
         if explicit_row is not None:
             try:
-                proved_row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+                if preloaded_rows is not None:
+                    proved_row, _ = resolve_fpf_pointer(
+                        self.plan, preloaded_rows, override_slot=self.overrides.slot
+                    )
+                else:
+                    proved_row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
                 if explicit_row != proved_row:
                     staged_ok = False
                     self.show(
@@ -1154,7 +1182,7 @@ class ManualConsole:
             )
             self.show(f"  row {idx:4d}: {hex32(val)}  [{tag}]")
         try:
-            pointer, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+            pointer, _ = resolve_fpf_pointer(self.plan, dict(rows), override_slot=self.overrides.slot)
             self.show(f"Proved next free row: {pointer}")
             self.journal.append(event="manual_scan", proved_pointer=pointer)
         except BurnError as exc:

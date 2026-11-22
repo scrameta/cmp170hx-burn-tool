@@ -384,11 +384,11 @@ sequenceDiagram
 
     Note over Eng: once per session: preflight (host, PCI ID, health, die ID, masks)
     Eng->>Ctl: sense_ctrl() after operator types SENSE (section 5.2)
-    Eng->>Ctl: scan FF rows 222..486 twice, prove next free slot
+    Eng->>Ctl: scan FF rows 222..486 once, verify prefix & prove trailing rows empty
     loop each record in the reviewed plan
         Eng->>Eng: reconcile record against defect masks and SM ceiling
         opt not the first record
-            Eng->>Ctl: re-run passive preflight and slot scan, pointer must not move
+            Eng->>Ctl: re-run passive host/PCI/health check + pointer bounds (no full re-scan)
         end
         Eng->>Ctl: read_row(pointer), must be blank
         Eng->>Op: show row, target, word, decode, defect flags
@@ -406,13 +406,14 @@ sequenceDiagram
             Eng->>Ctl: read_row(pointer) == word
             Eng->>Ctl: full health gate (FUSECTRL first, DSOV, CRC, PLMs)
             Eng->>Ctl: host gate, then second read_row(pointer) == word
-            Eng->>Eng: journal verified_readback_only, advance pointer
+            Eng->>Eng: journal verified_readback_only, update verified rows, advance pointer
         end
         Note over Eng: deferred signals delivered here
         opt test row done in stage all
             Eng->>Op: type CONTINUE SAME WINDOW (or Enter to stop and cold-verify)
         end
     end
+    Note over Eng: pre-power-off sanity check computed from initial scan + read-back-verified rows (0 reads)
     Note over Op,FUSE: only a cold boot plus verify-cold proves the burn took effect
 ```
 

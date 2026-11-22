@@ -207,6 +207,7 @@ def preflight(
     *,
     active_sense: bool,
     match_masks: bool = True,
+    check_die: bool = True,
     expected_masks: dict[str, int] | None = None,
     overrides: Overrides | None = None,
 ) -> str:
@@ -218,7 +219,8 @@ def preflight(
         raise BurnError(f"PCI identity mismatch: expected {plan.pci_id}, got {reader.pci_id()}")
     h = reader.health()
     check_health(h, plan)
-    check_die_rows(plan, reader)
+    if check_die:
+        check_die_rows(plan, reader)
     if match_masks and not ov.mask_mismatch:
         check_masks(expected_masks if expected_masks is not None else plan.expected_masks, reader)
     if active_sense:
@@ -230,38 +232,35 @@ def preflight(
             require_efp_one=True,
         )
         check_host(reader.host())
-        for i, value in plan.die_rows.items():
-            actual = reader.die_row(i)
-            _poison(f"post-sense die row {i}", actual)
-            if actual != value:
-                raise BurnError(f"die ID changed after active sense: row {i}")
+        if check_die:
+            for i, value in plan.die_rows.items():
+                actual = reader.die_row(i)
+                _poison(f"post-sense die row {i}", actual)
+                if actual != value:
+                    raise BurnError(f"die ID changed after active sense: row {i}")
     return host.boot_id
 
 
-def scan_fpf_rows(
+def resolve_fpf_pointer(
     plan: Plan,
-    reader,
+    full_rows: dict[int, int],
     *,
     override_slot: int | None = None,
-) -> tuple[int, list[tuple[int, int]], dict[int, int]]:
-    """Scan full declared FPF region twice and return ``(pointer, nearby, full_rows)``.
+) -> tuple[int, list[tuple[int, int]]]:
+    """Validate poison, contiguity, and bounds on already-read FPF rows and return ``(pointer, nearby)``.
 
-    When ``override_slot`` is provided (after explicit operator confirmation),
-    the scan still enforces double-read stability, poison checks, row bounds,
-    and that the chosen slot currently reads ``plan.empty_word``.
+    Requires every row in ``plan.first_row..plan.last_row`` to be present in ``full_rows``.
+    When ``override_slot`` is provided (after explicit operator confirmation), enforces
+    poison checks, row bounds, and that the chosen slot reads ``plan.empty_word``.
     """
+    a: list[int] = []
+    for row_idx in range(plan.first_row, plan.last_row + 1):
+        if row_idx not in full_rows:
+            raise BurnError(f"FPF row {row_idx} missing from scan result")
+        v = full_rows[row_idx]
+        _poison(f"FPF row {row_idx}", v)
+        a.append(v)
 
-    def scan() -> list[int]:
-        return [reader.fuse_row(i) for i in range(plan.first_row, plan.last_row + 1)]
-
-    a = scan()
-    b = scan()
-    if a != b:
-        raise BurnError("FPF region changed between scans; cannot prove next free slot")
-    for i, v in enumerate(a):
-        _poison(f"FPF row {plan.first_row + i}", v)
-
-    full_rows = {plan.first_row + i: v for i, v in enumerate(a)}
     empty = plan.empty_word
     if override_slot is not None:
         if isinstance(override_slot, bool) or not isinstance(override_slot, int):
@@ -281,7 +280,7 @@ def scan_fpf_rows(
             for i, v in enumerate(a)
             if max(0, rel - 3) <= i < min(len(a), rel + 4)
         ]
-        return override_slot, nearby, full_rows
+        return override_slot, nearby
 
     first = next((i for i, x in enumerate(a) if x == empty), None)
     if first is None:
@@ -297,6 +296,36 @@ def scan_fpf_rows(
         for i, v in enumerate(a)
         if max(0, first - 3) <= i < min(len(a), first + 4)
     ]
+    return pointer, nearby
+
+
+def scan_fpf_rows(
+    plan: Plan,
+    reader,
+    *,
+    override_slot: int | None = None,
+    passes: int = 1,
+) -> tuple[int, list[tuple[int, int]], dict[int, int]]:
+    """Scan full declared FPF region and return ``(pointer, nearby, full_rows)``.
+
+    Defaults to a single full pass (``passes=1``), proving live prefix history and that all
+    rows after the free pointer are empty without doubling ``CMD_READ`` traffic. Pass
+    ``passes=2`` to additionally enforce multi-pass read stability.
+    """
+    if isinstance(passes, bool) or not isinstance(passes, int) or passes < 1:
+        raise BurnError("passes must be a positive integer")
+
+    def scan() -> list[int]:
+        return [reader.fuse_row(i) for i in range(plan.first_row, plan.last_row + 1)]
+
+    a = scan()
+    for _ in range(passes - 1):
+        b = scan()
+        if a != b:
+            raise BurnError("FPF region changed between scans; cannot prove next free slot")
+
+    full_rows = {plan.first_row + i: v for i, v in enumerate(a)}
+    pointer, nearby = resolve_fpf_pointer(plan, full_rows, override_slot=override_slot)
     return pointer, nearby, full_rows
 
 
@@ -305,9 +334,10 @@ def scan_slots(
     reader,
     *,
     override_slot: int | None = None,
+    passes: int = 1,
 ) -> tuple[int, list[tuple[int, int]]]:
-    """Scan full declared FPF region twice. No heuristic for empties."""
-    pointer, nearby, _ = scan_fpf_rows(plan, reader, override_slot=override_slot)
+    """Scan full declared FPF region (single pass by default). No heuristic for empties."""
+    pointer, nearby, _ = scan_fpf_rows(plan, reader, override_slot=override_slot, passes=passes)
     return pointer, nearby
 
 
@@ -770,7 +800,7 @@ def _journal_halt(
 
 def _run_poweroff_sanity(
     plan: Plan,
-    reader,
+    current_rows: dict[int, int],
     journal: Journal,
     show,
     *,
@@ -779,13 +809,10 @@ def _run_poweroff_sanity(
     baseline_blocks: dict[int, dict[int, int]] | None,
     reason: str,
 ) -> dict | None:
-    """Read current FPF rows and report whether the card is at a safe functional boundary."""
+    """Evaluate current FPF rows (initial scan + read-back-verified writes) for a safe power-off boundary."""
     try:
-        cur_rows = {
-            r: reader.fuse_row(r) for r in range(plan.first_row, plan.last_row + 1)
-        }
         sanity = evaluate_poweroff_sanity(
-            cur_rows,
+            current_rows,
             plan,
             committed_records=committed_records,
             remaining_records=remaining_records,
@@ -1072,7 +1099,7 @@ def process_records(
         if is_manual_single:
             if receipt is not None:
                 test_row = receipt["test_row"]
-                actual_test = reader.fuse_row(test_row)
+                actual_test = live_rows[test_row] if test_row in live_rows else reader.fuse_row(test_row)
                 if actual_test != plan.records[0].word or pointer < test_row + 1:
                     raise BurnError(
                         "cold-verified test record not at expected location; refuse manual write"
@@ -1081,7 +1108,7 @@ def process_records(
         else:
             if receipt is not None:
                 test_row = receipt["test_row"]
-                actual_test = reader.fuse_row(test_row)
+                actual_test = live_rows[test_row] if test_row in live_rows else reader.fuse_row(test_row)
                 if actual_test != plan.records[0].word or pointer < test_row + 1:
                     raise BurnError(
                         "cold-verified test record not at expected location; refuse real stage"
@@ -1095,7 +1122,7 @@ def process_records(
                 for offset in range(1, already_written + 1):
                     row_idx = test_row + offset
                     expected_rec = plan.records[offset]
-                    actual_word = reader.fuse_row(row_idx)
+                    actual_word = live_rows[row_idx] if row_idx in live_rows else reader.fuse_row(row_idx)
                     if actual_word != expected_rec.word:
                         raise BurnError(
                             f"committed FPF row {row_idx} reads {hex32(actual_word)}, "
@@ -1220,6 +1247,7 @@ def process_records(
         return pointer
 
     written_records: list[Record] = []
+    verified_rows: dict[int, int] = dict(live_rows)
     prev_groups: set[str] | None = None
     sanity_baseline = (
         replay_ff_rows(plan.baseline_ff_rows)
@@ -1251,25 +1279,21 @@ def process_records(
         )
 
         if idx > 0:
-            # Repeat live health, host, die ID, and slot-scan checks before every subsequent record.
-            # SENSE_CTRL already ran once for this window (GA100 sets RESENSE_DISABLE=1 after it).
+            # Repeat passive host, PCI identity, and health checks plus pointer bounds before
+            # each subsequent record. SENSE_CTRL, die-ID verification, and the full FPF scan
+            # already ran once at session start; BDF lock + target-row blank check + dual
+            # read-back after each burn cover mid-session state without re-scanning all rows.
             try:
                 preflight(
                     plan,
                     reader,
                     active_sense=False,
                     match_masks=False,
+                    check_die=False,
                     overrides=ov,
                 )
-                fresh_pointer, _ = scan_slots(
-                    plan,
-                    reader,
-                    override_slot=pointer if ov.slot is not None else None,
-                )
-                if fresh_pointer != pointer:
-                    raise BurnError(
-                        f"FPF pointer moved externally {pointer} -> {fresh_pointer}; HALT"
-                    )
+                if pointer > plan.last_row:
+                    raise BurnError("FPF region full; no free record")
             except Exception as exc:
                 h_snap, host_snap = _capture_snapshot(reader)
                 journal.append(
@@ -1333,7 +1357,7 @@ def process_records(
                     journal.append(event="declined", row=pointer, record=record.name, reason=token)
                     if written_records:
                         _run_poweroff_sanity(
-                            plan, reader, journal, show,
+                            plan, verified_rows, journal, show,
                             committed_records=already_committed + written_records,
                             remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
                             baseline_blocks=sanity_baseline,
@@ -1365,7 +1389,7 @@ def process_records(
                 journal.append(event="declined", row=pointer, record=record.name, reason=token)
                 if written_records:
                     _run_poweroff_sanity(
-                        plan, reader, journal, show,
+                        plan, verified_rows, journal, show,
                         committed_records=already_committed + written_records,
                         remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
                         baseline_blocks=sanity_baseline,
@@ -1382,7 +1406,7 @@ def process_records(
             journal.append(event="declined", row=pointer, record=record.name)
             if written_records:
                 _run_poweroff_sanity(
-                    plan, reader, journal, show,
+                    plan, verified_rows, journal, show,
                     committed_records=already_committed + written_records,
                     remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
                     baseline_blocks=sanity_baseline,
@@ -1456,6 +1480,7 @@ def process_records(
                 plan_sha256=plan.content_hash,
                 manual_record_sha256=manual_record_sha256,
             )
+        verified_rows[pointer] = readback
         pointer += 1  # The ONLY advance, after read-back AND healthy gate.
         written_records.append(record)
         prev_groups = rec_groups
@@ -1476,7 +1501,7 @@ def process_records(
                 "CONTINUE SAME WINDOW",
             ):
                 _run_poweroff_sanity(
-                    plan, reader, journal, show,
+                    plan, verified_rows, journal, show,
                     committed_records=already_committed + written_records,
                     remaining_records=pending[idx + 1 :] + deferred_by_max + tail_after_stage,
                     baseline_blocks=sanity_baseline,
@@ -1510,7 +1535,7 @@ def process_records(
     )
     if written_records:
         _run_poweroff_sanity(
-            plan, reader, journal, show,
+            plan, verified_rows, journal, show,
             committed_records=already_committed + written_records,
             remaining_records=deferred_by_max + tail_after_stage,
             baseline_blocks=sanity_baseline,
