@@ -175,6 +175,12 @@ class Record:
         )
 
 
+def canonical_ff_prefix_sha256(rows: dict[int, int]) -> str:
+    """Compute a deterministic SHA-256 digest over a canonical sorted (row, word) FF prefix."""
+    payload = "".join(f"{row}:0x{rows[row] & 0xFFFFFFFF:08x}\n" for row in sorted(rows))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
 @dataclass(frozen=True)
 class Plan:
     content_hash: str
@@ -193,6 +199,9 @@ class Plan:
     final_expected_cold: dict[str, int]
     records: tuple[Record, ...]
     allowed_status_mask: int = 0
+    baseline_ff_rows: dict[int, int] | None = None
+    baseline_ff_sha256: str | None = None
+    expected_next_row: int | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "Plan":
@@ -244,6 +253,75 @@ class Plan:
             )
         empty_word = u32(_req(fpf, "empty_word", "fpf"), "fpf.empty_word")
 
+        baseline_ff_rows: dict[int, int] | None = None
+        baseline_ff_sha256: str | None = None
+        expected_next_row: int | None = None
+        raw_baseline = fpf.get("baseline_ff_rows")
+        raw_baseline_sha = fpf.get("baseline_ff_sha256")
+        raw_next_row = fpf.get("expected_next_row")
+
+        if raw_baseline_sha is not None and raw_baseline is None:
+            raise BurnError("fpf.baseline_ff_sha256 requires fpf.baseline_ff_rows")
+        if raw_baseline is not None:
+            if not isinstance(raw_baseline, dict):
+                raise BurnError("fpf.baseline_ff_rows must be a JSON object")
+            parsed_base: dict[int, int] = {}
+            for k, v in raw_baseline.items():
+                try:
+                    r_idx = int(k)
+                except (TypeError, ValueError) as exc:
+                    raise BurnError(f"fpf.baseline_ff_rows key {k!r} is not an integer") from exc
+                if r_idx in parsed_base:
+                    raise BurnError(f"duplicate fpf.baseline_ff_rows key {r_idx}")
+                if not (first <= r_idx <= last):
+                    raise BurnError(
+                        f"fpf.baseline_ff_rows row {r_idx} outside declared window {first}..{last}"
+                    )
+                word = u32(v, f"fpf.baseline_ff_rows.{r_idx}")
+                if word == empty_word:
+                    raise BurnError(
+                        f"fpf.baseline_ff_rows row {r_idx} contains empty_word (0x{empty_word:08x}); "
+                        "store only the contiguous occupied prefix"
+                    )
+                if is_poison(word):
+                    raise BurnError(
+                        f"fpf.baseline_ff_rows row {r_idx} word 0x{word:08x} matches poison prefix"
+                    )
+                if (word >> 5) & 1:
+                    raise BurnError(
+                        f"fpf.baseline_ff_rows row {r_idx} word 0x{word:08x} has IFF bit 5 set"
+                    )
+                parsed_base[r_idx] = word
+            expected_keys = set(range(first, first + len(parsed_base)))
+            if set(parsed_base) != expected_keys:
+                raise BurnError(
+                    "fpf.baseline_ff_rows must form a contiguous prefix starting at "
+                    f"fpf.first_row ({first})"
+                )
+            baseline_ff_rows = dict(sorted(parsed_base.items()))
+            computed_sha = canonical_ff_prefix_sha256(baseline_ff_rows)
+            if raw_baseline_sha is not None:
+                if not isinstance(raw_baseline_sha, str) or raw_baseline_sha.strip().lower() != computed_sha:
+                    raise BurnError(
+                        "fpf.baseline_ff_sha256 does not match fpf.baseline_ff_rows "
+                        f"(expected {computed_sha})"
+                    )
+            baseline_ff_sha256 = computed_sha
+            expected_next_row = first + len(baseline_ff_rows)
+
+        if raw_next_row is not None:
+            parsed_next = u32(raw_next_row, "fpf.expected_next_row")
+            if not (first <= parsed_next <= last):
+                raise BurnError(
+                    f"fpf.expected_next_row ({parsed_next}) outside declared window {first}..{last}"
+                )
+            if expected_next_row is not None and parsed_next != expected_next_row:
+                raise BurnError(
+                    f"fpf.expected_next_row ({parsed_next}) disagrees with "
+                    f"baseline_ff_rows length (expected {expected_next_row})"
+                )
+            expected_next_row = parsed_next
+
         stock = _finite_float(_req(env, "stock_mv", "environment"), "environment.stock_mv")
         tol = _finite_float(_req(env, "tolerance_mv", "environment"), "environment.tolerance_mv")
         if not (400.0 <= stock <= 1500.0 and 0.0 < tol <= 100.0):
@@ -272,6 +350,11 @@ class Plan:
         if len(records) > (last - first + 1):
             raise BurnError(
                 f"plan has {len(records)} records but FPF window {first}..{last} only has {last - first + 1} rows"
+            )
+        if expected_next_row is not None and (expected_next_row + len(records) - 1) > last:
+            raise BurnError(
+                f"plan has {len(records)} records starting at row {expected_next_row}, "
+                f"which exceeds fpf.last_row ({last})"
             )
 
         seen_names: set[str] = set()
@@ -310,4 +393,7 @@ class Plan:
             final_expected_cold=safe_num_mapping(d.get("final_expected_cold", {}), "final_expected_cold"),
             records=records,
             allowed_status_mask=allowed_status_mask,
+            baseline_ff_rows=baseline_ff_rows,
+            baseline_ff_sha256=baseline_ff_sha256,
+            expected_next_row=expected_next_row,
         )

@@ -287,6 +287,19 @@ class TestCLIAndConsole(unittest.TestCase):
             dump_fake(ctl, out_file)
 
     def test_burn_dry_run_and_execute_guards(self):
+        from vfi_burn.ffrecord import encode_ff
+
+        base_row = encode_ff(1, 7, 0x0123)
+        live_plan = json.loads(self.plan_path.read_text())
+        live_plan["card"]["defect_masks"]["FBPA_DISABLE"] = "0x0"
+        live_plan["fpf"]["baseline_ff_rows"] = {"222": f"0x{base_row:08x}"}
+        live_plan["fpf"]["expected_next_row"] = 223
+        live_plan["records"][0]["word"] = f"0x{base_row:08x}"
+        live_plan["records"][0]["decode"] = "NO-OP test row"
+        live_plan_path = self.work / "live_plan.json"
+        live_plan_path.write_text(json.dumps(live_plan))
+        live_plan_path.chmod(0o600)
+
         # Create a temporary non-simulated live adapter module (read-only by default).
         mod_path = self.work / "tmp_live_adapter.py"
         mod_path.write_text(
@@ -294,13 +307,14 @@ class TestCLIAndConsole(unittest.TestCase):
             "EVENTS = []\n"
             "class LiveStub(FakeController):\n"
             "    simulation = False\n"
+            "    write_enabled = False\n"
             "    writer_verified = False\n"
             "    def active_sense_readonly(self):\n"
             "        EVENTS.append('sense')\n"
             "        super().active_sense_readonly()\n"
             "def make():\n"
             "    return LiveStub(fields={'GPC_DISABLE': 0x85},\n"
-            "                    rows={222: 0xABCD00DE, 223: 0, 224: 0, 225: 0, 226: 0, 227: 0})\n"
+            f"                    rows={{222: {base_row}, 223: 0, 224: 0, 225: 0, 226: 0, 227: 0}})\n"
         )
         import sys
         sys.path.insert(0, str(self.work))
@@ -312,7 +326,7 @@ class TestCLIAndConsole(unittest.TestCase):
             [
                 "burn",
                 "--plan",
-                str(self.plan_path),
+                str(live_plan_path),
                 "--adapter",
                 "tmp_live_adapter:make",
                 "--stage",
@@ -327,12 +341,12 @@ class TestCLIAndConsole(unittest.TestCase):
         import tmp_live_adapter
         self.assertEqual(tmp_live_adapter.EVENTS, [])
 
-        # burn --execute refuses when stdin is not a TTY or writer_verified is False.
+        # burn --execute refuses when stdin is not a TTY or write_enabled is False.
         code, out, err = self._run_cli(
             [
                 "burn",
                 "--plan",
-                str(self.plan_path),
+                str(live_plan_path),
                 "--adapter",
                 "tmp_live_adapter:make",
                 "--stage",
@@ -390,30 +404,37 @@ class TestCLIAndConsole(unittest.TestCase):
         self.assertIn("manual_preview_writes", events)
 
     def test_manual_console_preview_then_apply_workflow(self):
+        from dataclasses import replace
         from vfi_burn.ffrecord import encode_ff
 
-        plan = Plan.load(self.plan_path)
-        w_pcie = encode_ff(2, 47, 0x0000)
-        w_gpc = encode_ff(1, 8, 0x0420)  # floorsweep GPC word
+        plan = replace(
+            Plan.load(self.plan_path),
+            defect_masks={"GPC_DISABLE": 0x04, "FBPA_DISABLE": 0x0, "NVLINK_DISABLE": 0x0, "SYS_PIPE_DISABLE": 0x0},
+        )
+        w_nvlink = encode_ff(1, 23, 0x0FE8)  # non-floorsweep, non-PCIe word
+        w_pcie = encode_ff(2, 47, 0x0000)    # PCIe word -> refused without reviewed LnkCap2!
+        w_gpc = encode_ff(1, 8, 0x0420)      # floorsweep GPC word
         ctl = FakeController(
             fields={"GPC_DISABLE": 0x85},
             rows={222: 0xABCD00DE, 223: 0x13572448, 224: 0, 225: 0, 226: 0, 227: 0},
         )
         lines: list[str] = []
         cmds = iter([
-            "apply",                                                # nothing staged -> refused
-            f"preview 0x{w_pcie:08x}",                              # stage auto-labeled PCIe word
+            "apply",                                                    # nothing staged -> refused
+            f"preview 0x{w_nvlink:08x}",                                # stage auto-labeled word
             "staged",
-            "clear",                                                # discard staged write
-            "apply",                                                # nothing staged -> refused
-            f"preview PCIE_GEN4 0x{w_pcie:08x} Clear Gen4 disable", # stage with explicit label
-            "apply 0xdeadbeef",                                     # extra arg -> refused (keeps stage!)
-            "apply",                                                # apply exact staged preview
-            "OVERRIDE NO TEST RECEIPT",                             # confirm no_test_receipt override
-            "YES",                                                  # confirm burn row 224
-            "apply",                                                # consumed -> refused (no double-burn!)
-            f"preview 0x{w_gpc:08x}",                               # floorsweep word
-            "apply",                                                # refused by floorsweep defect-mask guard!
+            "clear",                                                    # discard staged write
+            "apply",                                                    # nothing staged -> refused
+            f"preview NVLINK_UNLOCK 0x{w_nvlink:08x} Clear NVLink dis", # stage with explicit label
+            "apply 0xdeadbeef",                                         # extra arg -> refused (keeps stage!)
+            "apply",                                                    # apply exact staged preview
+            "OVERRIDE NO TEST RECEIPT",                                 # confirm no_test_receipt override
+            "YES",                                                      # confirm burn row 224
+            "apply",                                                    # consumed -> refused (no double-burn!)
+            f"preview 0x{w_pcie:08x}",                                  # PCIe word without LnkCap2 -> refused!
+            "apply",
+            f"preview 0x{w_gpc:08x}",                                   # floorsweep word
+            "apply",                                                    # refused by floorsweep defect-mask guard!
             "quit",
         ])
         with Journal(self.journal_path) as j:
@@ -428,13 +449,14 @@ class TestCLIAndConsole(unittest.TestCase):
             ).run()
         self.assertEqual(rc, 0)
         out = "\n".join(lines)
-        self.assertIn("STAGED: row 224 | target=PCIE_GEN4", out)
+        self.assertIn("STAGED: row 224 | target=NVLINK_UNLOCK", out)
         self.assertIn("Cleared staged write", out)
         self.assertIn("takes NO arguments", out)
         self.assertIn("APPLYING STAGED WRITE: row 224", out)
+        self.assertIn("LnkCap2 before/after", out)
         self.assertIn("looks like a floorsweep/mask field", out)
-        self.assertEqual(ctl.fuse_row(224), w_pcie)
-        self.assertEqual(ctl.fuse_row(225), 0)  # floorsweep word was refused!
+        self.assertEqual(ctl.fuse_row(224), w_nvlink)
+        self.assertEqual(ctl.fuse_row(225), 0)  # PCIe and floorsweep words were both refused!
 
     def test_experimental_registers_cli_console_and_poison_guard(self):
         from vfi_burn.backend import Health

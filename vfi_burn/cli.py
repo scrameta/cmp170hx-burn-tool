@@ -115,6 +115,16 @@ def _add_override_args(parser: argparse.ArgumentParser, *, allow_debugctrl: bool
         action="store_true",
         help="allow operator judgment when SM count is undetermined/above ceiling (genuine defects remain REFUSED)",
     )
+    grp.add_argument(
+        "--override-baseline-mismatch",
+        action="store_true",
+        help="allow proceeding when live FF prefix differs from (or plan lacks) baseline_ff_rows",
+    )
+    grp.add_argument(
+        "--override-unmapped-ff",
+        action="store_true",
+        help="allow unknown FF blocks, changed unmapped/opt-in bits, or fields missing defect masks (known defects & device-ID blocks remain REFUSED)",
+    )
     if allow_debugctrl:
         grp.add_argument(
             "--override-allow-debugctrl",
@@ -132,6 +142,8 @@ def _overrides_from_args(args: argparse.Namespace) -> Overrides:
         vout_range=bool(getattr(args, "override_vout_range", False)),
         undetermined_ceiling=bool(getattr(args, "override_undetermined_ceiling", False)),
         allow_manual_debugctrl=bool(getattr(args, "override_allow_debugctrl", False)),
+        baseline_mismatch=bool(getattr(args, "override_baseline_mismatch", False)),
+        unmapped_ff=bool(getattr(args, "override_unmapped_ff", False)),
     )
 
 
@@ -142,9 +154,8 @@ def _require_live_execute_ready(backend) -> None:
         )
     if not has_verified_writer(backend):
         raise BurnError(
-            "REFUSED --execute: supplied adapter does not implement a verified Writer "
-            "(must define write_one_record(row, word) AND set writer_verified = True "
-            "after independent bench verification)"
+            "REFUSED --execute: supplied adapter does not have write capability armed "
+            "(must define write_one_record(row, word) AND set write_enabled = True or legacy writer_verified = True)"
         )
 
 
@@ -300,8 +311,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     imp_p.add_argument(
         "--prepend-noop-test",
-        action="store_true",
-        help="prepend a safe zero-effect no-op FF test row (recommended so SM/PES/ROP_L2 burn together)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="prepend a proved zero-effect no-op FF test row (default: enabled; disabling requires burn[0] to already be a no-op)",
     )
 
     snap_p = sub.add_parser(
@@ -349,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         required=True,
         choices=("test", "real", "all"),
-        help="'all' burns test row then asks CONTINUE SAME WINDOW to burn real records without losing the glitch; 'test'/'real' splits across a cold boot",
+        help="'test' burns only the no-op test row; 'real' burns real records (requires test receipt unless overridden); 'all' runs no-op test then lets you stop or continue through functional groups (runs pre-power-off sanity check whenever stopped/finished)",
     )
     burn_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
     burn_p.add_argument("--receipt", help="cold-verified test receipt (required for --stage real)")
