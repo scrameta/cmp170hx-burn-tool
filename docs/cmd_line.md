@@ -76,44 +76,42 @@ python3 -m vfi_burn plan --plan private/plan.json
 
 # 3. After holding a Goldilocks frame with your glitcher, inspect (passive first):
 sudo python3 -m vfi_burn inspect --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 --journal private/session.jsonl
+  --bdf 0000:05:00.0 --journal private/session.jsonl
 
 # 4. Passive dry-run preview (does NOT run SENSE_CTRL or write fuses):
 sudo python3 -m vfi_burn burn --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
+  --bdf 0000:05:00.0 \
   --stage all --journal private/session.jsonl
 
 # 5A. SINGLE-WINDOW BURN (recommended when re-glitching is slow/hard — keeps your glitch!):
 #     - Runs SENSE_CTRL once (prompts 'SENSE'), burns the no-op test row first and verifies
-#       read-back + CRC=0x55 + PLM/VRM health.
+#       read-back + CRC=0x55 + PLM health.
 #     - Then pauses at an explicit checkpoint: type 'CONTINUE SAME WINDOW' to burn the real
 #       records in the same Goldilocks window (confirming each record with 'YES <row> <0xword>'),
 #       OR press Enter to stop cleanly and cold-boot verify the test row first.
 #     IMPORTANT: Burn all SM/HBM records (GPC/TPC/PES/FBP/FBPA/FBIO/ROP_L2) in ONE window;
 #     do NOT power-cycle with SMs unlocked while PES/ROP_L2 remain masked (GSP boot will fail).
 sudo python3 -m vfi_burn burn --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
+  --bdf 0000:05:00.0 \
   --stage all --journal private/session.jsonl --execute
 
 # 5B. OPTIONAL SPLIT-WINDOW BURN (if your card re-glitches easily and you want a cold boot
 #     after the test row before touching real unlock records):
 #   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
-#     --port /dev/ttyACM0 --stage test --journal private/session.jsonl --execute
+#     --stage test --journal private/session.jsonl --execute
 #   # Cold power-cycle (~30 s off), then snapshot + verify-cold --stage test --receipt-out private/test.receipt
 #   # Re-glitch to Goldilocks, then run:
 #   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
-#     --port /dev/ttyACM0 --stage real --receipt private/test.receipt \
+#     --stage real --receipt private/test.receipt \
 #     --journal private/session.jsonl --execute
 
 # 6. Cold power-cycle (~30 s off), capture final cold snapshot, and verify:
 sudo setpci -s 0000:05:00.0 COMMAND=0x0002:0x0002   # only if BAR0 reads 0xFFFFFFFF
-sudo python3 -m vfi_burn snapshot --bdf 0000:05:00.0 --port /dev/ttyACM0 \
+sudo python3 -m vfi_burn snapshot --bdf 0000:05:00.0 \
   --previous-boot-id <BOOT_ID_FROM_JOURNAL> --out private/cold-final.json
 python3 -m vfi_burn verify-cold --plan private/plan.json \
   --cold private/cold-final.json --stage real --journal private/session.jsonl
 ```
-
-> **Without a Pico `--port`**: omit `--port` and pass `--assume-vout-mv 787.5` after verifying stock NVVDD externally.
 
 ---
 
@@ -123,7 +121,7 @@ Read-only manual commands (`status`, `read-row`, `read-rows`, `read-reg`, `read-
 
 ```bash
 sudo python3 -m vfi_burn manual --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
+  --bdf 0000:05:00.0 \
   --journal private/session.jsonl console
 ```
 
@@ -141,6 +139,7 @@ Every override is off by default, prints a loud banner, requires its own distinc
 | `--override-skip-sense` | Skip `SENSE_CTRL` (passive goldilocks checks remain) | `OVERRIDE SKIP SENSE` |
 | `--override-no-test-receipt` | Run `real` stage when test row was verified outside `vfi_burn` | `OVERRIDE NO TEST RECEIPT` |
 | `--override-mask-mismatch` | Skip initial live mask equality check | `OVERRIDE MASK MISMATCH` |
-| `--override-vout-range` | Allow VOUT outside `stock_mv ± tolerance_mv` (within hard `400..1500 mV`) | `OVERRIDE VOUT <mV>` |
 | `--override-undetermined-ceiling` | Override undetermined/exceeded SM ceiling (genuine defects remain refused) | `OVERRIDE CEILING` |
+| `--override-baseline-mismatch` | Allow proceeding when live FF prefix differs from (or plan lacks) `baseline_ff_rows` | `OVERRIDE BASELINE MISMATCH` |
+| `--override-unmapped-ff` | Allow unknown FF blocks, changed unmapped/opt-in bits, or fields missing defect masks | `OVERRIDE UNMAPPED FF` |
 | `--override-allow-debugctrl` | **Manual mode only**: permit `DEBUGCTRL` (`0x820060`) target | `REVIEW DEBUGCTRL` + `CONFIRM DEBUGCTRL` |

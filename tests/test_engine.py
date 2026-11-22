@@ -70,9 +70,8 @@ class Harness(unittest.TestCase):
 
     def test_poison_health_preflight(self):
         for attr,value in [('fusectrl',0xBADF510E),('en_sw',0xBAD00001),
-                           ('plm_f8',0xFFFFFFFE),('status_word',0x2042),
-                           ('crc',0x44),('plm',0xFFFFFFFE),('dsov',1),
-                           ('vout_mv',300.0)]:
+                           ('plm_f8',0xFFFFFFFE),
+                           ('crc',0x44),('plm',0xFFFFFFFE),('dsov',1)]:
             with self.subTest(attr=attr):
                 c=copy.deepcopy(self.controller)
                 setattr(c.state,attr,value)
@@ -94,7 +93,7 @@ class Harness(unittest.TestCase):
     def test_host_gates(self):
         variations = [ ('bound_driver','nvidia'), ('nvidia_loaded',True),
                        ('nouveau_loaded',True), ('lockdown','[integrity]'),
-                       ('vrm_tainted',True), ('hold_active',False) ]
+                       ('hold_active',False) ]
         for attr,v in variations:
             with self.subTest(attr=attr):
                 c=copy.deepcopy(self.controller)
@@ -163,8 +162,7 @@ class Harness(unittest.TestCase):
         self.assertFalse(self.logged()[-1]['pointer_advanced'])
 
     def test_no_advance_postwrite_poison(self):
-        for field, value in [('fusectrl',0xBADF5040),('status_word',0x2042),
-                             ('plm_f8',0xFFFFFFFE),('vout_mv',41.0)]:
+        for field, value in [('fusectrl',0xBADF5040),('plm_f8',0xFFFFFFFE)]:
             with self.subTest(field=field):
                 c=copy.deepcopy(self.controller)
                 c.after_write=lambda obj, f=field, v=value: setattr(obj.state,f,v)
@@ -427,12 +425,8 @@ class Harness(unittest.TestCase):
         self.assertEqual(self.controller.rows[226], self.plan.records[0].word)
         self.assertEqual(tokens, ['OVERRIDE SLOT 226', 'YES'])
 
-    def test_manual_overrides_skip_sense_no_receipt_vout_and_ceiling(self):
+    def test_manual_overrides_skip_sense_no_receipt_and_ceiling(self):
         from vfi_burn.engine import Overrides
-        # 1. VOUT slightly outside tolerance (750 mV) allowed with override, but 300 mV floor NEVER allowed.
-        self.controller.state.vout_mv = 750.0
-        with self.assertRaisesRegex(BurnError, 'expected 787.5'):
-            check_health(self.controller.state, self.plan)
         tokens = []
         def track(prompt, token):
             tokens.append(token)
@@ -441,39 +435,17 @@ class Harness(unittest.TestCase):
             process_records(
                 self.plan, self.controller, self.controller, j,
                 stage='real', confirm=track,
-                overrides=Overrides(no_test_receipt=True, skip_active_sense=True, vout_range=True),
+                overrides=Overrides(no_test_receipt=True, skip_active_sense=True),
                 show=lambda *_: None,
             )
         self.assertIn('OVERRIDE NO TEST RECEIPT', tokens)
         self.assertIn('OVERRIDE SKIP SENSE', tokens)
-        self.assertIn('OVERRIDE VOUT 750.0', tokens)
         self.assertEqual([e for e in self.controller.events if e[0] == 'sense'], [])
-        # Hard 400 mV rail floor is NEVER overrideable:
-        self.controller.state.vout_mv = 300.0
-        with self.assertRaisesRegex(BurnError, 'hard safety bounds'):
-            check_health(self.controller.state, self.plan, allow_vout_override=True)
         # Genuine defect bits are NEVER overrideable even with undetermined_ceiling=True:
         bad_defect = replace(self.plan.records[1], from_disable=0x85, to_disable=0x80)
         with self.assertRaisesRegex(BurnError, 'genuinely defective'):
             reconcile(self.plan, bad_defect, self.plan.expected_masks.copy(),
                       allow_undetermined_ceiling=True)
-
-    def test_pmbus_fault_bits_and_allowed_status_mask(self):
-        for sw in (0x2042, 0x2842, 0x0040, 0x8000, 0x0800, 0x0004):
-            with self.subTest(status_word=hex(sw)):
-                c = copy.deepcopy(self.controller)
-                c.state.status_word = sw
-                with self.assertRaisesRegex(BurnError, 'STATUS_WORD'):
-                    check_health(c.state, self.plan)
-        # Benign non-critical bit allowed if explicitly declared in allowed_status_mask
-        c = copy.deepcopy(self.controller)
-        c.state.status_word = 0x0001
-        relaxed = replace(self.plan, allowed_status_mask=0x0001)
-        check_health(c.state, relaxed)
-        # Critical OFF bit (0x0040) STILL refused even if in allowed_status_mask!
-        c.state.status_word = 0x0040
-        with self.assertRaisesRegex(BurnError, 'STATUS_WORD'):
-            check_health(c.state, replace(self.plan, allowed_status_mask=0xFFFF))
 
     def test_plan_validation_rejects_empty_word_poison_word_dups_and_numeric_debugctrl(self):
         base = json.loads((ROOT / 'examples/plan.example.json').read_text())

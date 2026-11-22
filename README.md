@@ -23,7 +23,7 @@ It sits downstream of:
 
 Design philosophy (see [`BURN_SPEC.md`](BURN_SPEC.md)):
 - **Passive dry-run by default**: `vfi_burn burn` performs passive preflight and slot proving without firing active sense or programming fuses unless you explicitly opt in (`--sense` / `--execute`).
-- **One record at a time, mandatory read-back**: no batching, no automatic retries, and the row pointer never advances until both read-back and the full post-write health/PMBus/host gate pass.
+- **One record at a time, mandatory read-back**: no batching, no automatic retries, and the row pointer never advances until both read-back and the full post-write health/host gate pass.
 - **Full audit trail**: every read, preflight/sense pass or failure, override, confirmation, write attempt (`fsync`ed *before* touching hardware), halt, and cold verification is appended to an exclusively locked (`flock`), mode-`0600` JSONL journal.
 - **Granular manual overrides, never a blanket `--force`**: bench edge cases have explicit, loud, double-confirmed, journaled overrides while hard brick-prevention invariants remain unbreakable.
 
@@ -42,7 +42,6 @@ The register map, FF binary format, and Goldilocks arming/programming sequences 
 Key protocol details implemented:
 - **FF Record Encoding**: `word = (data16 << 16) | (block10 << 6) | chain5`, with **bit 5 (`IFF`) strictly `0`**. Later records for the same `(chain, block)` override earlier records.
 - **FF Row Bounds & Empty Marker**: rows **`222..486`** only (rows `0..221` control/regular/FPF and `487..511` IFF are hard-refused). Blank rows read **`0x00000000`** via `CMD_READ`.
-- **Burn Voltage**: on-die programming at **stock parked NVVDD (~787.5 mV)** under PMBus control; no external elevated voltage is used.
 - **Single Aligned 32-Bit MMIO Stores**: [`AlignedMMIO`](vfi_burn/mmio.py) uses `memoryview(mm)[off:off+4].cast("I")[0] = value` (patch 0012 — never `struct.pack_into`, which zeroes the register first). `DEBUGCTRL (0x00820060)` is never written (must read `0`, `RWL=0`).
 - **Goldilocks Arming (`SENSE_CTRL`)**:
   1. `EN_SW_OVERRIDE (0x820040) = 1` (sticks only while `DSOV = 0`) and `WDATA_WR_SECURE (0x82048C) = 0` (`PLM_f4` opens to `0xFFFFFFFF`).
@@ -50,7 +49,7 @@ Key protocol details implemented:
   3. Write `FUSECTRL = 0 (IDLE)` → `FUSECTRL = 3 (SENSE_CTRL)`, poll `IDLE` (state=4). Verify `EFP (0x820078) == 1`, `DSOV == 0`, `CRC == 0x55`, `DFP (0x82007C) == 0`, `PLM_f8` bit 0 open. Idempotent when `EFP == 1` already (only one `SENSE_CTRL` per glitch window because `RESENSE_DISABLE` becomes `1`).
   4. Shadow-clear `SBFE_SHADOW (0x821108) = 0` and assert all 12 armed invariants (`FUSECTRL` idle, `DEBUGCTRL == 0`, `CRC == 0x55`, `DSOV == 0`, `EFP == 1`, `DFP == 0`, `EN_SW_OVERRIDE == 1`, `SBFE == 0`, `WDATA_WR_SECURE == 0`, `PLM_f4 == PLM_f8 == PLM_fc == 0xFFFFFFFF`).
 - **Single-Record Program (`CMD_PROGRAM = 2`)**:
-  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/PMBus/host gate → second `CMD_READ`.
+  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/host gate → second `CMD_READ`.
 
 For a full walkthrough of the fuse controller (register map, `FUSECTRL` command state machine, the locked → Goldilocks → sensed → armed security state machine, and sequence diagrams for read / sense / arm / program), see [`docs/FUSE_CONTROLLER.md`](docs/FUSE_CONTROLLER.md).
 
@@ -63,9 +62,9 @@ vfi_burn/
   mmio.py        # ReadOnlyMMIO & AlignedMMIO (single 32-bit aligned stores + DEBUGCTRL guard)
   model.py       # Strict mode-0600 Plan & Record schema validation
   ffrecord.py    # GA100 FF codec, replay simulator, option map, no-op test builder, ffcalc importer
-  ga100.py       # GA100FuseController protocol & Linux sysfs BAR0 + Pico PMBus GA100LiveAdapter
+  ga100.py       # GA100FuseController protocol & Linux sysfs BAR0 GA100LiveAdapter
   backend.py     # Reader/Writer protocols, MissingWriter, FakeController, atomic 0600 JSON I/O
-  engine.py      # Fail-closed state machine, Overrides, PMBus decode, flock Journal, verify_cold
+  engine.py      # Fail-closed state machine, Overrides, flock Journal, verify_cold
   console.py     # Interactive manual console & status formatter
   menu.py        # High-level numbered interactive menu (SSH/tmux-friendly, read-only by default)
   cli.py         # CLI entry point (menu, plan, decode, import-ffcalc, snapshot, inspect, burn, simulate, manual, verify-cold)
@@ -108,9 +107,8 @@ adapter_template.py    # Template for custom hardware adapters
 - FF row bounds `222..486`, IFF bit 5 == `0`, blank target slot (`0x00000000`), no poison payload
 - Genuine `defect_masks` bits are strictly refused — derived from the **FF word itself** (replace semantics over its 16-bit block), so missing or wrong `mask_update` metadata, shared multi-field blocks, and console one-liners cannot bypass it; a word touching a field with no known defect mask is refused unless `--override-undetermined-ceiling`
 - Declared `mask_update.to` / `resulting_sm_count` must match what the word actually writes; GPC/TPC changes are checked against the SM ceiling from the word
-- Hard rail bounds `400..1500 mV` and critical PMBus fault bits (`0x2042`, `OFF`, `VOUT`, `POWER_GOOD#`)
 - Instantaneous pre-trigger check *after* confirmation and *immediately before* `CMD_PROGRAM`
-- Mandatory `CMD_READ` read-back + post-write health/PMBus/host gate + second `CMD_READ`; immediate `HALT_UNVERIFIED` with no retry and no pointer advance on any error
+- Mandatory `CMD_READ` read-back + post-write health/host gate + second `CMD_READ`; immediate `HALT_UNVERIFIED` with no retry and no pointer advance on any error
 - Failures strictly before `CMD_PROGRAM` are journaled as `aborted_pre_trigger` (`write_issued=false`), not as a possibly-partial `HALT_UNVERIFIED`
 - `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` are held back from the `attempt` journal entry until the record's outcome is fsynced (Ctrl-C or an SSH drop cannot land mid-program); `FUSEWDATA` is reset to the `0` no-burn latch after every program
 - Any `0xBADxxxxx` read is treated as poison (same test as `cmp170hx-8gb-vfi-tools`)

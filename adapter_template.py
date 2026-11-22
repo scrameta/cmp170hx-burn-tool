@@ -3,7 +3,7 @@
 How to use:
 1. Copy this file to your private bench directory (outside git).
 2. Implement ``MyLiveReader`` using ``ReadOnlyMMIO`` (from ``vfi_burn.mmio``) and your
-   measured/verified read-only BAR0 + PMBus paths from ``cmp170hx-8gb-vfi-tools``.
+   measured/verified read-only BAR0 paths from ``cmp170hx-8gb-vfi-tools``.
 3. Test read-only inspection first:
       vfi-burn inspect --plan private/plan.json --adapter my_adapter:create_reader
       vfi-burn inspect --plan private/plan.json --adapter my_adapter:create_reader --sense
@@ -38,13 +38,13 @@ class MyLiveReader:
     def host(self) -> Host:
         raise NotImplementedError(
             "fresh reads: sysfs bound driver, /proc/modules (nvidia/nouveau), "
-            "/sys/kernel/security/lockdown, VRM taint state, held-frame flag, /proc/sys/kernel/random/boot_id"
+            "/sys/kernel/security/lockdown, held-frame flag, /proc/sys/kernel/random/boot_id"
         )
 
     def health(self) -> Health:
         # CRITICAL ORDER (BURN_SPEC §5): read FUSECTRL FIRST, then DSOV, CRC, PLM,
-        # PLM_f8, PMBus STATUS_WORD, PMBus READ_VOUT (mV), and EN_SW.
-        raise NotImplementedError("fresh BAR0 register reads (FUSECTRL first) + PMBus VOUT/STATUS_WORD")
+        # PLM_f8, and EN_SW.
+        raise NotImplementedError("fresh BAR0 register reads (FUSECTRL first)")
 
     def die_row(self, index: int) -> int:
         raise NotImplementedError("verified non-programming fuse row read (rows 8..15)")

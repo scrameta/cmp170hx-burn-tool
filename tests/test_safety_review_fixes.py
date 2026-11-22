@@ -61,14 +61,12 @@ class LiveMMIOAdapter:
         *,
         boot_id: str = "boot-live-1",
         fields: dict[str, int] | None = None,
-        rail_telemetry_live: bool = True,
         pre_trigger_check=None,
     ) -> None:
         self.mmio = mmio
         self.ctl = GA100FuseController(mmio, read_only=False, sleep=lambda _: None)
         self._boot = boot_id
         self._fields = dict(fields or {"FBP_DISABLE": 0x852, "LnkCap2": 0x06})
-        self.rail_telemetry_live = rail_telemetry_live
         self._pre_trigger_check = pre_trigger_check
 
     def pci_id(self) -> str:
@@ -89,10 +87,10 @@ class LiveMMIOAdapter:
         return 0
 
     def health(self):
-        return self.ctl.read_health_registers(status_word=0, vout_mv=787.5)
+        return self.ctl.read_health_registers()
 
     def host(self) -> Host:
-        return Host("pci-stub", False, False, "[none]", False, True, self._boot)
+        return Host("pci-stub", False, False, "[none]", True, self._boot)
 
     def active_sense_readonly(self) -> None:
         self.ctl.sense_ctrl()
@@ -170,7 +168,6 @@ class SafetyReviewTestBase(unittest.TestCase):
                 },
             },
             "fpf": fpf,
-            "environment": {"stock_mv": 787.5, "tolerance_mv": 25.0},
             "ceiling": {"base_sm": 122},
             "records": records,
         }
@@ -478,29 +475,6 @@ class TestP0_3_NoopTestProof(SafetyReviewTestBase):
         # Disabling prepend_noop_test when burn[0] changes bits MUST be refused!
         with self.assertRaisesRegex(BurnError, "is NOT a no-op"):
             import_ffcalc_plan(burn_p, dump_p, base_sm_ceiling=122, prepend_noop_test=False)
-
-
-class TestP0_4_UnmeasuredRailWarningOnly(SafetyReviewTestBase):
-    """P0-4 (user policy): Assumed voltage warns loudly and journals, without requiring Pico."""
-
-    def test_assumed_rail_warns_and_journals_without_blocking_live_execute(self):
-        plan = self._make_plan([self._noop_rec()])
-        mmio = self._live_mmio()
-        ad = LiveMMIOAdapter(mmio, rail_telemetry_live=False)
-        shown: list[str] = []
-        status_lines = format_status_report(plan, ad)
-        self.assertTrue(any("ASSUMED / UNMEASURED" in line for line in status_lines))
-
-        with Journal(self.journal_path) as j:
-            ptr = process_records(
-                plan, ad, ad, j, stage="test", confirm=lambda *_: True, show=shown.append
-            )
-        self.assertEqual(ptr, 228)
-        self.assertEqual(mmio.program_calls, 1)
-        self.assertTrue(any("NO LIVE PMBUS RAIL TELEMETRY" in s for s in shown))
-        events = self._logged()
-        session_starts = [e for e in events if e["event"] == "session_start"]
-        self.assertEqual(session_starts[0]["rail_telemetry"], "assumed_unmeasured")
 
 
 class TestP1_1_PoweroffSanityCheck(SafetyReviewTestBase):

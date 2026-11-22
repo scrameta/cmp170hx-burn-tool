@@ -27,8 +27,6 @@
     "crc": "0x55",
     "plm": "0xFFFFFFFF",
     "plm_f8": "0xFFFFFFFF",
-    "status_word": 0,
-    "vout_mv": 787.5,
     "en_sw": 0
   },
   "host": {
@@ -36,7 +34,6 @@
     "nvidia_loaded": false,
     "nouveau_loaded": false,
     "lockdown": "[none]",
-    "vrm_tainted": false,
     "hold_active": true,
     "boot_id": "synthetic-boot-1"
   },

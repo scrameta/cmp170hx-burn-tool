@@ -288,8 +288,8 @@ class TestGA100Controller(unittest.TestCase):
             def register(self, a): return ctl.rd(a)
             def field(self, name):
                 return {"FBP_DISABLE": 0x852, "GPC_DISABLE": 0x0}.get(name, 0)
-            def health(self): return ctl.read_health_registers(status_word=0, vout_mv=787.5)
-            def host(self): return Host("pci-stub", False, False, "[none]", False, True, self._boot)
+            def health(self): return ctl.read_health_registers()
+            def host(self): return Host("pci-stub", False, False, "[none]", True, self._boot)
             def active_sense_readonly(self): ctl.sense_ctrl()
             def write_one_record(self, row, word): ctl.program_row(row, word)
 
@@ -312,7 +312,6 @@ class TestGA100Controller(unittest.TestCase):
                     "expected_next_row": 225,
                     "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
                 },
-                "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
                 "ceiling": {"base_sm": 124},
                 "records": [
                     {
@@ -424,7 +423,6 @@ class TestGA100Controller(unittest.TestCase):
                     "expected_next_row": 225,
                     "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
                 },
-                "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
                 "ceiling": {"base_sm": 124},
                 "records": [
                     {
@@ -460,8 +458,8 @@ class TestGA100Controller(unittest.TestCase):
                     def fuse_row(self, i): return ctl_obj.read_row(i)
                     def register(self, a): return ctl_obj.rd(a)
                     def field(self, name): return {"FBP_DISABLE": 0x852}.get(name, 0)
-                    def health(self): return ctl_obj.read_health_registers(status_word=0, vout_mv=787.5)
-                    def host(self): return Host("pci-stub", False, False, "[none]", False, True, boot_id)
+                    def health(self): return ctl_obj.read_health_registers()
+                    def host(self): return Host("pci-stub", False, False, "[none]", True, boot_id)
                     def active_sense_readonly(self): ctl_obj.sense_ctrl()
                     def write_one_record(self, row, word): ctl_obj.program_row(row, word)
                 return _Adapter()

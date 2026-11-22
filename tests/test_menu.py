@@ -152,7 +152,7 @@ class TestBurnMenu(unittest.TestCase):
         rc, out, _ = self._run_menu(
             session,
             [
-                "8", "1", "225", "2", "5", "0",  # set slot=225, skip_active_sense, vout_range
+                "8", "1", "225", "2", "5", "0",  # set slot=225, skip_active_sense, undetermined_ceiling
                 "9", "status", "quit",           # enter manual console and exit cleanly
                 "8", "1", "-", "r", "0",         # clear slot with '-', reset all overrides
                 "0",
@@ -168,7 +168,6 @@ class TestBurnMenu(unittest.TestCase):
         session = MenuSession(
             plan_path=str(self.plan_path),
             bdf="0000:ff:00.0",
-            assume_vout_mv=787.5,
             journal_path=str(self.journal_path),
             execute_live=False,
         )
@@ -178,7 +177,7 @@ class TestBurnMenu(unittest.TestCase):
                 "6",                                 # must refuse: Live Execute mode is OFF
                 "1", "g", "WRONG TOKEN",             # wrong token leaves execute OFF
                 "g", "ENABLE LIVE WRITES",           # arms live execute
-                "c", "0000:fe:00.0", "", "787.5",    # changing target resets execute back to OFF
+                "c", "0000:fe:00.0",                 # changing target resets execute back to OFF
                 "0",
                 "0",
             ],
@@ -253,7 +252,6 @@ class TestBurnMenu(unittest.TestCase):
                 "defect_masks": {"GPC_DISABLE": "0x04", "FBPA_DISABLE": "0x0", "NVLINK_DISABLE": "0x0", "SYS_PIPE_DISABLE": "0x0"},
             },
             "fpf": {"first_row": 222, "last_row": 486, "empty_word": "0x00000000"},
-            "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
             "ceiling": {"base_sm": 122, "override_sm": 128},
             "records": [
                 {

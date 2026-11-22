@@ -404,7 +404,7 @@ sequenceDiagram
             Eng->>Eng: journal HALT_UNVERIFIED, stop, never retry
         else programmed
             Eng->>Ctl: read_row(pointer) == word
-            Eng->>Ctl: full health gate (FUSECTRL first, DSOV, CRC, PLMs, PMBus, VOUT)
+            Eng->>Ctl: full health gate (FUSECTRL first, DSOV, CRC, PLMs)
             Eng->>Ctl: host gate, then second read_row(pointer) == word
             Eng->>Eng: journal verified_readback_only, advance pointer
         end
@@ -508,7 +508,6 @@ and [`AlignedMMIO.write32()`](../vfi_burn/mmio.py) separately refuses `DEBUGCTRL
 | `EFP == 0` but `RESENSE_DISABLE == 1` | `sense_ctrl()` | Sense already consumed, programming not enabled | Cold boot, re-glitch |
 | `FUSECTRL` not idle within timeout | `poll_idle()` | Unit hung | Pre-trigger: refuse. Post-trigger: `HALT_UNVERIFIED` |
 | Read-back ≠ intended | `program_row()`, engine | Partial or wrong program | `HALT_UNVERIFIED`; do not retry, do not advance |
-| PMBus `STATUS_WORD == 0x2042` / VOUT out of range | engine health gate | VRM latch or brown-out | Stop; power cycle |
 
 The guiding rule (BURN_SPEC §6): automatic decisions only ever resolve toward *not writing*. The
 controller never retries a program, never re-issues `SENSE_CTRL` in the same window, and never

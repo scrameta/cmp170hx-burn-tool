@@ -7,7 +7,6 @@
     "defect_masks": {"GPC_DISABLE": "0x04", "FBPA_DISABLE": "0x0"}
   },
   "fpf": {"first_row": 222, "last_row": 227, "empty_word": "0x00000000"},
-  "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
   "ceiling": {"base_sm": 122, "override_sm": 126},
   "records": [
     {
