@@ -600,6 +600,7 @@ class ManualConsole:
         self.show = show
         self.baseline_rows: dict[int, int] = {}
         self.baseline_fields: dict[str, int] = {}
+        self._staged: dict | None = None
 
     def _confirm(self, prompt: str, token: str) -> bool:
         try:
@@ -624,7 +625,7 @@ class ManualConsole:
             return "SIMULATION (fake backend)"
         if self.execute:
             return "LIVE EXECUTE (verified writer enabled)"
-        return "LIVE READ-ONLY (writes disabled; 'write' runs dry-run only)"
+        return "LIVE READ-ONLY (writes disabled; 'apply'/'write' runs dry-run only)"
 
     def run(self) -> int:
         check_host_readonly_safe(self.reader.host())
@@ -638,15 +639,20 @@ class ManualConsole:
         self.show(f"vfi_burn manual console | {self._mode_label()}")
         if self.overrides.active_names():
             self.show("Active overrides: " + ", ".join(self.overrides.active_names()))
-        self.show("Type 'help' for commands, 'quit' to exit.")
+        self.show("Type 'help' for commands, 'preview <word>' then 'apply' to burn without re-typing, 'quit' to exit.")
         for line in format_status_report(
             self.plan, self.reader, allow_vout_override=self.overrides.vout_range
         ):
             self.show(line)
 
         while True:
+            prompt = (
+                f"vfi-manual [STAGED row {self._staged['row']} {hex32(self._staged['word'])}]> "
+                if self._staged is not None
+                else "vfi-manual> "
+            )
             try:
-                raw = self.input_fn("vfi-manual> ")
+                raw = self.input_fn(prompt)
             except EOFError:
                 self.show("")
                 break
@@ -695,6 +701,15 @@ class ManualConsole:
         if cmd == "preview":
             self._cmd_preview(args)
             return True
+        if cmd == "apply":
+            self._cmd_apply(args)
+            return True
+        if cmd in ("clear", "unstage"):
+            self._cmd_clear()
+            return True
+        if cmd == "staged":
+            self._cmd_staged()
+            return True
         if cmd == "sense":
             self._cmd_sense()
             return True
@@ -730,7 +745,10 @@ class ManualConsole:
             "Commands:\n"
             "  status                         Show full health, host, die ID, and mask status\n"
             "  state                          Show detailed GA100 fuse controller registers & armed state\n"
-            "  preview <word> [row]           Show fuse state + exact PCIe BAR0 MMIO writes (NO writes)\n"
+            "  preview <word> [row]           Inspect fuse state + exact PCIe BAR0 MMIO writes & stage\n"
+            "  preview <target> <word> <desc> Inspect exact PCIe BAR0 writes & stage with custom label\n"
+            "  apply                          Execute the exact staged preview (no re-typing; gated)\n"
+            "  staged / clear                 Show or discard the currently staged write\n"
             "  sense                          Run opt-in active_sense_readonly() and diff health\n"
             "  scan                           Double-scan FPF window and prove next free row\n"
             "  row <index>                    Read one FPF row (with poison & diff check)\n"
@@ -739,7 +757,7 @@ class ManualConsole:
             "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, LnkCap2)\n"
             "  diff                           Diff current FPF rows & fields vs console start\n"
             "  overrides                      Show active overrides & unbreakable invariants\n"
-            "  write <target> <word> <decode> Preview exact PCIe BAR0 writes + write ONE gated record\n"
+            "  write <target> <word> <decode> One-step preview + gated write (prefer preview -> apply)\n"
             "  quit                           Exit manual console"
         )
 
@@ -778,13 +796,124 @@ class ManualConsole:
             self.show(out)
         return row
 
+    def _auto_label_for_word(self, word: int) -> tuple[str, str]:
+        try:
+            ff = decode_ff(word)
+            analysis = analyze_ff_block(ff.chain, ff.block, ff.data, None)
+            fields = analysis["fields"]
+            if fields:
+                # Prefer a floorsweep field name if any overlap (ensures defect-mask guard triggers).
+                primary = next((f for f in fields if f.category == "floorsweep"), fields[0])
+                names = ", ".join(f.name for f in fields)
+                return primary.key.upper(), f"FF c{ff.chain}/b{ff.block}=0x{ff.data:04x} ({names})"
+            return f"FF_C{ff.chain}_B{ff.block}", f"FF c{ff.chain}/b{ff.block}=0x{ff.data:04x} (unknown block)"
+        except BurnError as exc:
+            return "INVALID_FF_WORD", f"invalid FF word ({exc})"
+
     def _cmd_preview(self, args: list[str]) -> None:
-        if not (1 <= len(args) <= 2):
-            raise BurnError("usage: preview <32-bit-hex-word> [row]")
-        word = u32(args[0], "word")
-        row = int(args[1], 0) if len(args) == 2 else None
-        resolved_row = self._show_write_preview(word, row=row)
-        self.journal.append(event="manual_preview_writes", row=resolved_row, word=hex32(word))
+        if not args:
+            raise BurnError("usage: preview <32-bit-hex-word> [row]  OR  preview <target> <word> <decode>")
+        explicit_row: int | None = None
+        if len(args) >= 3:
+            target = args[0]
+            word = u32(args[1], "word")
+            decode = " ".join(args[2:]).strip()
+            if not decode:
+                raise BurnError("preview decode description must be non-empty")
+        else:
+            word = u32(args[0], "word")
+            explicit_row = int(args[1], 0) if len(args) == 2 else None
+            target, decode = self._auto_label_for_word(word)
+
+        resolved_row = self._show_write_preview(word, row=explicit_row)
+        staged_ok = True
+        if explicit_row is not None:
+            try:
+                proved_row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+                if explicit_row != proved_row:
+                    staged_ok = False
+                    self.show(
+                        f"NOTE: previewed explicit row {explicit_row}, but next proved free row is {proved_row} "
+                        "(not staged — omit [row] or set --override-slot to stage)."
+                    )
+            except BurnError:
+                staged_ok = False
+
+        if staged_ok:
+            self._staged = {
+                "row": resolved_row,
+                "target": target,
+                "word": word,
+                "decode": decode,
+            }
+            self.show(
+                f"STAGED: row {resolved_row} | target={target} | word={hex32(word)} | decode={decode!r}"
+            )
+            self.show(
+                "Type 'apply' when happy to execute this exact staged write (no re-typing needed), "
+                "or 'clear' to discard."
+            )
+        self.journal.append(
+            event="manual_preview_writes",
+            row=resolved_row,
+            target=target,
+            word=hex32(word),
+            decode=decode,
+            staged=staged_ok,
+        )
+
+    def _cmd_staged(self) -> None:
+        if self._staged is None:
+            self.show("Nothing staged. Use 'preview <word>' or 'preview <target> <word> <decode>' to stage a write.")
+            return
+        s = self._staged
+        self.show(
+            f"STAGED: row {s['row']} | target={s['target']} | word={hex32(s['word'])} | decode={s['decode']!r}"
+        )
+
+    def _cmd_clear(self) -> None:
+        if self._staged is None:
+            self.show("Nothing was staged.")
+            return
+        old = self._staged
+        self._staged = None
+        self.journal.append(
+            event="manual_staged_cleared",
+            row=old["row"],
+            target=old["target"],
+            word=hex32(old["word"]),
+        )
+        self.show(f"Cleared staged write (row {old['row']} {hex32(old['word'])}).")
+
+    def _cmd_apply(self, args: list[str]) -> None:
+        if args:
+            raise BurnError(
+                "usage: apply (takes NO arguments — executes the exact staged preview to prevent typos; "
+                "use 'preview ...' to change what is staged)"
+            )
+        if self._staged is None:
+            raise BurnError(
+                "nothing staged — run 'preview <word>' or 'preview <target> <word> <decode>' first"
+            )
+        staged = self._staged
+        self._staged = None  # consume immediately so a stale staged write can never apply twice
+
+        cur_row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+        if cur_row != staged["row"]:
+            raise BurnError(
+                f"next proved free row changed since preview (staged row {staged['row']}, now row {cur_row}); "
+                "re-run 'preview' before applying"
+            )
+        self.show(
+            f"APPLYING STAGED WRITE: row {staged['row']} | target={staged['target']} | "
+            f"word={hex32(staged['word'])} | decode={staged['decode']!r}"
+        )
+        self._execute_manual_record(
+            staged["target"],
+            staged["word"],
+            staged["decode"],
+            show_preview=False,
+        )
 
     def _cmd_sense(self) -> None:
         before = self.reader.health()
@@ -922,14 +1051,23 @@ class ManualConsole:
             "genuine defect bits."
         )
 
-    def _is_floorsweep_target(self, target: str) -> bool:
+    def _is_floorsweep_target(self, target: str, word: int | None = None) -> bool:
         upper = target.strip().upper()
         known = {k.upper() for k in self.plan.defect_masks} | {
             k.upper() for k in self.plan.expected_masks
         }
         if upper in known:
             return True
-        return any(tok in upper for tok in ("GPC", "TPC", "SM_", "FBP", "DISABLE", "RECONFIG"))
+        if any(tok in upper for tok in ("GPC", "TPC", "SM_", "FBP", "DISABLE", "RECONFIG")):
+            return True
+        if word is not None:
+            try:
+                ff = decode_ff(word)
+                if any(f.category == "floorsweep" for f in analyze_ff_block(ff.chain, ff.block, ff.data, None)["fields"]):
+                    return True
+            except BurnError:
+                pass
+        return False
 
     def _cmd_write(self, args: list[str]) -> None:
         if len(args) < 3:
@@ -939,8 +1077,17 @@ class ManualConsole:
         decode = " ".join(args[2:]).strip()
         if not decode:
             raise BurnError("manual write requires a non-empty decode description")
+        self._execute_manual_record(target, word, decode, show_preview=True)
 
-        if self._is_floorsweep_target(target):
+    def _execute_manual_record(
+        self,
+        target: str,
+        word: int,
+        decode: str,
+        *,
+        show_preview: bool,
+    ) -> None:
+        if self._is_floorsweep_target(target, word):
             if not self.overrides.undetermined_ceiling:
                 self.journal.append(
                     event="manual_console_write_refused",
@@ -995,10 +1142,11 @@ class ManualConsole:
         if dry_run:
             self.show("NOTE: console is READ-ONLY — running write as DRY-RUN preview only.")
 
-        try:
-            self._show_write_preview(word)
-        except BurnError:
-            pass  # let process_records surface the exact preflight/slot-proof error & journal it
+        if show_preview:
+            try:
+                self._show_write_preview(word)
+            except BurnError:
+                pass  # let process_records surface the exact preflight/slot-proof error & journal it
 
         self.journal.append(
             event="manual_console_write_request",

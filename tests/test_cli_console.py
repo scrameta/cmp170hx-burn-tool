@@ -389,6 +389,53 @@ class TestCLIAndConsole(unittest.TestCase):
         self.assertIn("manual_fuse_state", events)
         self.assertIn("manual_preview_writes", events)
 
+    def test_manual_console_preview_then_apply_workflow(self):
+        from vfi_burn.ffrecord import encode_ff
+
+        plan = Plan.load(self.plan_path)
+        w_pcie = encode_ff(2, 47, 0x0000)
+        w_gpc = encode_ff(1, 8, 0x0420)  # floorsweep GPC word
+        ctl = FakeController(
+            fields={"GPC_DISABLE": 0x85},
+            rows={222: 0xABCD00DE, 223: 0x13572468, 224: 0, 225: 0, 226: 0, 227: 0},
+        )
+        lines: list[str] = []
+        cmds = iter([
+            "apply",                                                # nothing staged -> refused
+            f"preview 0x{w_pcie:08x}",                              # stage auto-labeled PCIe word
+            "staged",
+            "clear",                                                # discard staged write
+            "apply",                                                # nothing staged -> refused
+            f"preview PCIE_GEN4 0x{w_pcie:08x} Clear Gen4 disable", # stage with explicit label
+            "apply 0xdeadbeef",                                     # extra arg -> refused (keeps stage!)
+            "apply",                                                # apply exact staged preview
+            "OVERRIDE NO TEST RECEIPT",                             # confirm no_test_receipt override
+            "YES",                                                  # confirm burn row 224
+            "apply",                                                # consumed -> refused (no double-burn!)
+            f"preview 0x{w_gpc:08x}",                               # floorsweep word
+            "apply",                                                # refused by floorsweep defect-mask guard!
+            "quit",
+        ])
+        with Journal(self.journal_path) as j:
+            rc = ManualConsole(
+                plan,
+                ctl,
+                ctl,
+                j,
+                overrides=Overrides(no_test_receipt=True),
+                input_fn=lambda prompt="": next(cmds),
+                show=lines.append,
+            ).run()
+        self.assertEqual(rc, 0)
+        out = "\n".join(lines)
+        self.assertIn("STAGED: row 224 | target=PCIE_GEN4", out)
+        self.assertIn("Cleared staged write", out)
+        self.assertIn("takes NO arguments", out)
+        self.assertIn("APPLYING STAGED WRITE: row 224", out)
+        self.assertIn("looks like a floorsweep/mask field", out)
+        self.assertEqual(ctl.fuse_row(224), w_pcie)
+        self.assertEqual(ctl.fuse_row(225), 0)  # floorsweep word was refused!
+
 
 if __name__ == "__main__":
     unittest.main()
