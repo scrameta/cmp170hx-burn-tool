@@ -18,10 +18,16 @@ from .ffrecord import (
     FFCALC_KEY_TO_FIELD,
     TOTAL_GPC,
     apply_ff_word_to_masks,
+    classify_ff_functional_groups,
     compute_sm_count,
     decode_ff,
+    evaluate_poweroff_sanity,
     ff_word_defect_audit,
+    ff_word_safety_audit,
+    ff_word_touches_pcie,
     fields_in_block,
+    replay_ff_rows,
+    verify_noop_test_record,
 )
 from .model import (
     BurnError,
@@ -107,7 +113,8 @@ class Overrides:
 
     Hard brick-prevention invariants (aligned 32-bit stores, empty target slot,
     no GPU driver, die/SKU match, poison/PLM_f8/latch halt, mandatory read-back,
-    post-write gate, genuine defect bits) are NEVER overrideable.
+    post-write gate, known genuine defect bits, and read-only PCIe device-ID
+    blocks c2/b37-38 & burnable=False bits) are NEVER overrideable.
     """
 
     slot: int | None = None
@@ -117,6 +124,8 @@ class Overrides:
     vout_range: bool = False
     undetermined_ceiling: bool = False
     allow_manual_debugctrl: bool = False
+    baseline_mismatch: bool = False
+    unmapped_ff: bool = False
 
     def active_names(self) -> list[str]:
         active: list[str] = []
@@ -134,6 +143,10 @@ class Overrides:
             active.append("undetermined_ceiling")
         if self.allow_manual_debugctrl:
             active.append("allow_manual_debugctrl")
+        if self.baseline_mismatch:
+            active.append("baseline_mismatch")
+        if self.unmapped_ff:
+            active.append("unmapped_ff")
         return active
 
 
@@ -320,13 +333,13 @@ def preflight(
     return host.boot_id
 
 
-def scan_slots(
+def scan_fpf_rows(
     plan: Plan,
     reader,
     *,
     override_slot: int | None = None,
-) -> tuple[int, list[tuple[int, int]]]:
-    """Scan full declared FPF region twice. No heuristic for empties.
+) -> tuple[int, list[tuple[int, int]], dict[int, int]]:
+    """Scan full declared FPF region twice and return ``(pointer, nearby, full_rows)``.
 
     When ``override_slot`` is provided (after explicit operator confirmation),
     the scan still enforces double-read stability, poison checks, row bounds,
@@ -343,6 +356,7 @@ def scan_slots(
     for i, v in enumerate(a):
         _poison(f"FPF row {plan.first_row + i}", v)
 
+    full_rows = {plan.first_row + i: v for i, v in enumerate(a)}
     empty = plan.empty_word
     if override_slot is not None:
         if isinstance(override_slot, bool) or not isinstance(override_slot, int):
@@ -362,7 +376,7 @@ def scan_slots(
             for i, v in enumerate(a)
             if max(0, rel - 3) <= i < min(len(a), rel + 4)
         ]
-        return override_slot, nearby
+        return override_slot, nearby, full_rows
 
     first = next((i for i, x in enumerate(a) if x == empty), None)
     if first is None:
@@ -378,7 +392,94 @@ def scan_slots(
         for i, v in enumerate(a)
         if max(0, first - 3) <= i < min(len(a), first + 4)
     ]
+    return pointer, nearby, full_rows
+
+
+def scan_slots(
+    plan: Plan,
+    reader,
+    *,
+    override_slot: int | None = None,
+) -> tuple[int, list[tuple[int, int]]]:
+    """Scan full declared FPF region twice. No heuristic for empties."""
+    pointer, nearby, _ = scan_fpf_rows(plan, reader, override_slot=override_slot)
     return pointer, nearby
+
+
+def verify_live_ff_prefix(
+    plan: Plan,
+    live_rows: dict[int, int],
+    pointer: int,
+    *,
+    is_live: bool,
+    stage: str,
+    receipt: dict | None = None,
+    is_manual_single: bool = False,
+    allow_baseline_mismatch: bool = False,
+) -> list[str]:
+    """Verify every occupied live FF row matches the plan's baseline FF prefix snapshot.
+
+    Returns a list of mismatch descriptions (empty when verified). Raises ``BurnError``
+    unless ``allow_baseline_mismatch=True``.
+    """
+    issues: list[str] = []
+    if plan.baseline_ff_rows is None:
+        if is_live:
+            issues.append(
+                "plan lacks fpf.baseline_ff_rows snapshot; re-import from a full 512-row card "
+                "dump so the live FF history can be verified (or use --override-baseline-mismatch)"
+            )
+    else:
+        for row_idx, expected_word in sorted(plan.baseline_ff_rows.items()):
+            actual_word = live_rows.get(row_idx)
+            if actual_word != expected_word:
+                actual_s = hex32(actual_word) if actual_word is not None else "MISSING"
+                issues.append(
+                    f"baseline FF row {row_idx} mismatch: live={actual_s} != plan={hex32(expected_word)}"
+                )
+        expected_next = (
+            plan.expected_next_row
+            if plan.expected_next_row is not None
+            else (plan.first_row + len(plan.baseline_ff_rows))
+        )
+        if stage in ("test", "all"):
+            if pointer != expected_next:
+                issues.append(
+                    f"stale plan or extra FF rows on card: live next free row is {pointer}, "
+                    f"plan baseline expects {expected_next}"
+                )
+        else:
+            if pointer < expected_next:
+                issues.append(
+                    f"live next free row {pointer} is behind plan baseline expected_next_row {expected_next}"
+                )
+            if receipt is not None and receipt.get("test_row") != expected_next:
+                issues.append(
+                    f"test receipt row {receipt.get('test_row')} disagrees with plan baseline "
+                    f"expected_next_row {expected_next}"
+                )
+            if receipt is None and not is_manual_single and pointer > expected_next:
+                # Without a receipt, any rows past expected_next must still match the plan prefix.
+                extra_count = pointer - expected_next
+                if extra_count > len(plan.records):
+                    issues.append(
+                        f"live next free row {pointer} has {extra_count} extra row(s) past "
+                        f"baseline {expected_next} (exceeds plan length {len(plan.records)})"
+                    )
+                else:
+                    for offset in range(extra_count):
+                        row_idx = expected_next + offset
+                        exp_rec = plan.records[offset]
+                        got_w = live_rows.get(row_idx)
+                        if got_w != exp_rec.word:
+                            issues.append(
+                                f"extra FF row {row_idx} reads {hex32(got_w) if got_w is not None else 'MISSING'}, "
+                                f"expected plan record {exp_rec.name!r} ({hex32(exp_rec.word)})"
+                            )
+
+    if issues and not allow_baseline_mismatch:
+        raise BurnError("FF PREFIX HISTORY MISMATCH: " + "; ".join(issues))
+    return issues
 
 
 def _is_compute_mask_field(field: str) -> bool:
@@ -393,8 +494,12 @@ def reconcile(
     *,
     allow_manual_debugctrl: bool = False,
     allow_undetermined_ceiling: bool = False,
+    allow_unmapped_ff: bool = False,
+    baseline_blocks: dict[int, dict[int, int]] | None = None,
+    enforce_known_ff: bool = False,
+    require_noop_test: bool = False,
 ) -> None:
-    """Prove defect bits and ceilings; never estimates unknown SM counts."""
+    """Prove defect bits, approved FF effects, PCIe gates, and ceilings; never guesses unknown SM counts."""
     if record.word == plan.empty_word:
         raise BurnError(
             f"{record.name}: payload equals FPF empty_word ({hex32(plan.empty_word)})"
@@ -411,6 +516,8 @@ def reconcile(
     word_masks: dict[str, int] = {}
     word_mapped_fields: set[str] = set()
     prior_masks = dict(assumed_masks)
+    old_block: int | None = None
+    touches_pcie = record.kind == "pcie"
     try:
         ff = decode_ff(record.word)
         is_ff = True
@@ -418,10 +525,34 @@ def reconcile(
         ff = None
         is_ff = False
     if is_ff and ff is not None:
+        if baseline_blocks is not None:
+            old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
+
+        # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
+        hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
+        if hard_denials:
+            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
+        if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
+            raise BurnError(
+                f"{record.name}: REFUSED; "
+                + "; ".join(overridable_ff)
+                + " (use --override-unmapped-ff only after independent verification)"
+            )
+
+        # Independent no-op proof for test records whenever a verified baseline is available.
+        if record.kind == "test" and require_noop_test and baseline_blocks is not None:
+            verify_noop_test_record(record.word, baseline_blocks)
+
+        # Word-derived PCIe classification (cannot be evaded by setting kind="regular").
+        if ff_word_touches_pcie(record.word, old_block):
+            touches_pcie = True
+
+        # Word-derived genuine defect audit. Known defects are NEVER overrideable; missing
+        # defect masks are NOT bypassed by --override-undetermined-ceiling.
         violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
         if violations:
             raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
-        if unknown and not allow_undetermined_ceiling:
+        if unknown and not allow_unmapped_ff:
             raise BurnError(
                 f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
                 "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
@@ -516,10 +647,15 @@ def reconcile(
                 f"{record.name}: predicted {record.resulting_sm_count} SM beyond supplied ceiling {ceiling}"
             )
 
-    if record.kind == "pcie" and (
+    if touches_pcie and (
         record.link_cap2_before is None or record.link_cap2_after is None
     ):
-        raise BurnError("PCIe record must declare reviewed LnkCap2 before/after")
+        raise BurnError(
+            "PCIe record (or FF word modifying PCIe speed/boot fuses) must declare reviewed LnkCap2 before/after"
+        )
+
+    if baseline_blocks is not None and is_ff and ff is not None:
+        baseline_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
 
 
 def check_plan(
@@ -527,8 +663,13 @@ def check_plan(
     *,
     allow_manual_debugctrl: bool = False,
     allow_undetermined_ceiling: bool = False,
+    allow_unmapped_ff: bool = False,
 ) -> dict[str, int]:
     assumed = plan.expected_masks.copy()
+    sim_blocks = (
+        replay_ff_rows(plan.baseline_ff_rows) if plan.baseline_ff_rows is not None else None
+    )
+    has_baseline = sim_blocks is not None
     record_cold: dict[str, int] = {}
     for r in plan.records:
         reconcile(
@@ -537,6 +678,10 @@ def check_plan(
             assumed,
             allow_manual_debugctrl=allow_manual_debugctrl,
             allow_undetermined_ceiling=allow_undetermined_ceiling,
+            allow_unmapped_ff=allow_unmapped_ff,
+            baseline_blocks=sim_blocks,
+            enforce_known_ff=has_baseline,
+            require_noop_test=has_baseline,
         )
         record_cold.update(r.expected_cold)
     if plan.final_expected_cold:
@@ -635,7 +780,11 @@ def _require_override_confirm(
     token: str,
     details: dict | None = None,
 ) -> None:
-    show(f"!!! MANUAL OVERRIDE [{name}]: {banner}")
+    show("\n" + "!" * 72)
+    show(f"!!! WARNING — MANUAL SAFETY OVERRIDE ENABLED: [{name}]")
+    show(f"!!! {banner}")
+    show("!!! OTP fuse burns are PERMANENT and IRREVERSIBLE.")
+    show("!" * 72)
     if not _confirm_token(confirm, f"Type '{token}' to confirm override: ", token):
         journal.append(event="override_declined", override=name, **(details or {}))
         raise BurnError(f"manual override {name!r} declined by operator")
@@ -792,6 +941,56 @@ def _journal_halt(
     )
 
 
+def _rail_telemetry_mode(reader) -> str:
+    if getattr(reader, "simulation", False):
+        return "simulated"
+    if getattr(reader, "rail_telemetry_live", True):
+        return "live_pmbus"
+    return "assumed_unmeasured"
+
+
+def _run_poweroff_sanity(
+    plan: Plan,
+    reader,
+    journal: Journal,
+    show,
+    *,
+    committed_records: list[Record],
+    remaining_records: list[Record],
+    baseline_blocks: dict[int, dict[int, int]] | None,
+    reason: str,
+) -> dict | None:
+    """Read current FPF rows and report whether the card is at a safe functional boundary."""
+    try:
+        cur_rows = {
+            r: reader.fuse_row(r) for r in range(plan.first_row, plan.last_row + 1)
+        }
+        sanity = evaluate_poweroff_sanity(
+            cur_rows,
+            plan,
+            committed_records=committed_records,
+            remaining_records=remaining_records,
+            baseline_blocks=baseline_blocks,
+        )
+    except Exception as exc:
+        show(f"\nNOTE: Pre-power-off fuse sanity check skipped ({exc}).")
+        return None
+    for line in sanity["lines"]:
+        show(line)
+    journal.append(
+        event="poweroff_sanity_check",
+        reason=reason,
+        safe_to_power_off=sanity["safe_to_power_off"],
+        committed_groups=sanity["committed_groups"],
+        remaining_groups=sanity["remaining_groups"],
+        split_groups=sanity["split_groups"],
+        sm_count=sanity["sm_count"],
+        errors=sanity["errors"],
+        warnings=sanity["warnings"],
+    )
+    return sanity
+
+
 def process_records(
     plan: Plan,
     reader,
@@ -823,6 +1022,9 @@ def process_records(
         raise BurnError("max_records must be a positive integer")
 
     ov = overrides or Overrides()
+    is_live = not getattr(reader, "simulation", False)
+    strict_ff = is_live or (plan.baseline_ff_rows is not None)
+    rail_mode = _rail_telemetry_mode(reader)
     effective_debugctrl = allow_manual_debugctrl or ov.allow_manual_debugctrl
     use_active_sense = (
         (not ov.skip_active_sense)
@@ -833,14 +1035,25 @@ def process_records(
         plan,
         allow_manual_debugctrl=effective_debugctrl,
         allow_undetermined_ceiling=ov.undetermined_ceiling,
+        allow_unmapped_ff=ov.unmapped_ff,
     )
-    if not getattr(reader, "simulation", False):
+    if is_live:
         # Refuse non-FF payloads before preflight/SENSE_CTRL, not inside the write block.
         for r in plan.records:
             try:
                 decode_ff(r.word)
             except BurnError as exc:
                 raise BurnError(f"{r.name}: not a valid GA100 FF record word ({exc})") from exc
+
+    if is_live and rail_mode == "assumed_unmeasured":
+        show("\n" + "!" * 72)
+        show("!!! WARNING: NO LIVE PMBUS RAIL TELEMETRY (USING ASSUMED VOLTAGE)")
+        show(
+            "!!! READ_VOUT is operator-assumed and STATUS_WORD is assumed 0x0000.\n"
+            "!!! vfi_burn CANNOT detect rail brown-out, VRM latch, or VRM profile taint.\n"
+            "!!! Monitor NVVDD externally before and during every write."
+        )
+        show("!" * 72)
 
     receipt: dict | None = None
     if stage == "real":
@@ -887,8 +1100,23 @@ def process_records(
                 journal,
                 show,
                 name="undetermined_ceiling",
-                banner="Allowing operator-supplied SM ceiling override (genuine defect bits remain REFUSED).",
+                banner=(
+                    "Allowing operator-supplied SM ceiling override "
+                    "(known genuine defect bits and missing defect masks remain REFUSED)."
+                ),
                 token="OVERRIDE CEILING",
+            )
+        if ov.unmapped_ff:
+            _require_override_confirm(
+                confirm,
+                journal,
+                show,
+                name="unmapped_ff",
+                banner=(
+                    "Allowing unknown FF blocks, changed unmapped/opt-in bits, or fields missing "
+                    "defect masks (known genuine defect bits and read-only device-ID blocks remain REFUSED)."
+                ),
+                token="OVERRIDE UNMAPPED FF",
             )
 
     if use_active_sense and confirm_active_sense:
@@ -912,6 +1140,7 @@ def process_records(
             plan_sha256=plan.content_hash,
             phase="initial_preflight",
             active_sense=use_active_sense,
+            rail_telemetry=rail_mode,
             health=h_snap,
             host=host_snap,
             error=str(exc),
@@ -939,7 +1168,7 @@ def process_records(
             )
 
     try:
-        pointer, nearby = scan_slots(plan, reader, override_slot=ov.slot)
+        pointer, nearby, live_rows = scan_fpf_rows(plan, reader, override_slot=ov.slot)
     except Exception as exc:
         h_snap, host_snap = _capture_snapshot(reader)
         journal.append(
@@ -948,11 +1177,50 @@ def process_records(
             plan_sha256=plan.content_hash,
             phase="slot_scan",
             active_sense=use_active_sense,
+            rail_telemetry=rail_mode,
             health=h_snap,
             host=host_snap,
             error=str(exc),
         )
         raise
+
+    try:
+        baseline_issues = verify_live_ff_prefix(
+            plan,
+            live_rows,
+            pointer,
+            is_live=is_live,
+            stage=stage,
+            receipt=receipt,
+            is_manual_single=is_manual_single,
+            allow_baseline_mismatch=ov.baseline_mismatch,
+        )
+    except Exception as exc:
+        h_snap, host_snap = _capture_snapshot(reader)
+        journal.append(
+            event="preflight_failed",
+            stage=stage,
+            plan_sha256=plan.content_hash,
+            phase="baseline_ff_prefix",
+            active_sense=use_active_sense,
+            rail_telemetry=rail_mode,
+            health=h_snap,
+            host=host_snap,
+            error=str(exc),
+        )
+        raise
+
+    if baseline_issues and ov.baseline_mismatch and not dry_run:
+        _require_override_confirm(
+            confirm,
+            journal,
+            show,
+            name="baseline_mismatch",
+            banner="Live FF prefix disagrees with (or plan lacks) baseline_ff_rows: "
+            + "; ".join(baseline_issues),
+            token="OVERRIDE BASELINE MISMATCH",
+            details={"issues": baseline_issues},
+        )
 
     show(
         f"Free FPF row {pointer}, nearby: "
@@ -970,10 +1238,16 @@ def process_records(
         )
 
     assumed = plan.expected_masks.copy()
+    already_committed: list[Record] = []
+    pre_commit_blocks = (
+        replay_ff_rows(plan.baseline_ff_rows) if plan.baseline_ff_rows is not None else None
+    )
     if stage == "test":
         pending = list(plan.records[:1])
+        tail_after_stage: list[Record] = list(plan.records[1:])
     elif stage == "all":
         pending = list(plan.records)
+        tail_after_stage = []
     else:
         reconcile(
             plan,
@@ -981,7 +1255,13 @@ def process_records(
             assumed,
             allow_manual_debugctrl=effective_debugctrl,
             allow_undetermined_ceiling=ov.undetermined_ceiling,
+            allow_unmapped_ff=ov.unmapped_ff,
+            baseline_blocks=pre_commit_blocks,
+            enforce_known_ff=pre_commit_blocks is not None,
+            require_noop_test=pre_commit_blocks is not None,
         )
+        already_committed.append(plan.records[0])
+        tail_after_stage = []
         if is_manual_single:
             if receipt is not None:
                 test_row = receipt["test_row"]
@@ -1020,7 +1300,12 @@ def process_records(
                         assumed,
                         allow_manual_debugctrl=effective_debugctrl,
                         allow_undetermined_ceiling=ov.undetermined_ceiling,
+                        allow_unmapped_ff=ov.unmapped_ff,
+                        baseline_blocks=pre_commit_blocks,
+                        enforce_known_ff=pre_commit_blocks is not None,
+                        require_noop_test=False,
                     )
+                    already_committed.append(expected_rec)
                 if already_written > 0:
                     show(
                         f"Resuming real stage: {already_written} record(s) already committed "
@@ -1048,14 +1333,29 @@ def process_records(
                 plan_sha256=plan.content_hash,
                 phase="mask_check",
                 active_sense=use_active_sense,
+                rail_telemetry=rail_mode,
                 health=h_snap,
                 host=host_snap,
                 error=str(exc),
             )
             raise
 
+    deferred_by_max: list[Record] = []
     if max_records is not None:
+        deferred_by_max = pending[max_records:]
         pending = pending[:max_records]
+
+    # Build verified block image from live_rows when enforcing exact FF before/after proofs.
+    working_blocks: dict[int, dict[int, int]] | None = None
+    initial_live_blocks: dict[int, dict[int, int]] | None = None
+    if strict_ff:
+        working_blocks = replay_ff_rows(live_rows)
+        initial_live_blocks = {c: dict(b) for c, b in working_blocks.items()}
+    else:
+        try:
+            initial_live_blocks = replay_ff_rows(live_rows)
+        except BurnError:
+            initial_live_blocks = None
 
     start_health, start_host = _capture_snapshot(reader)
     journal.append(
@@ -1064,9 +1364,9 @@ def process_records(
         pci_id=plan.pci_id,
         stage=stage,
         boot_id=boot_id,
-        held_frame_source="operator_supplied_live_adapter"
-        if not getattr(reader, "simulation", False)
-        else "fake_simulation",
+        held_frame_source="operator_supplied_live_adapter" if is_live else "fake_simulation",
+        rail_telemetry=rail_mode,
+        baseline_ff_sha256=plan.baseline_ff_sha256,
         pointer=pointer,
         pending_records=[r.name for r in pending],
         dry_run=dry_run,
@@ -1079,36 +1379,73 @@ def process_records(
 
     if dry_run:
         dry_assumed = assumed.copy()
+        dry_blocks = {c: dict(b) for c, b in working_blocks.items()} if working_blocks is not None else None
         for offset, record in enumerate(pending):
+            old_b = None
+            if dry_blocks is not None:
+                try:
+                    ff_d = decode_ff(record.word)
+                    old_b = dry_blocks.get(ff_d.chain, {}).get(ff_d.block, 0)
+                except BurnError:
+                    old_b = None
+            groups = sorted(classify_ff_functional_groups(record.word, old_b))
             reconcile(
                 plan,
                 record,
                 dry_assumed,
                 allow_manual_debugctrl=effective_debugctrl,
                 allow_undetermined_ceiling=ov.undetermined_ceiling,
+                allow_unmapped_ff=ov.unmapped_ff,
+                baseline_blocks=dry_blocks,
+                enforce_known_ff=strict_ff,
+                require_noop_test=strict_ff,
             )
             slot = pointer + offset
             show(
                 f"DRY-RUN [{record.kind.upper()}]: would write row {slot} "
-                f"{record.target}={hex32(record.word)} ({record.decode})"
+                f"{record.target}={hex32(record.word)} [{'+'.join(groups)}] ({record.decode})"
             )
         journal.append(
             event="dry_run_complete",
             stage=stage,
             pointer=pointer,
             active_sense=use_active_sense,
+            rail_telemetry=rail_mode,
             records=[r.name for r in pending],
         )
         return pointer
 
+    written_records: list[Record] = []
+    prev_groups: set[str] | None = None
+    sanity_baseline = (
+        replay_ff_rows(plan.baseline_ff_rows)
+        if plan.baseline_ff_rows is not None
+        else initial_live_blocks
+    )
+
     for idx, record in enumerate(pending):
+        rec_old_block: int | None = None
+        if working_blocks is not None:
+            try:
+                ff_cur = decode_ff(record.word)
+                rec_old_block = working_blocks.get(ff_cur.chain, {}).get(ff_cur.block, 0)
+            except BurnError:
+                rec_old_block = None
+        rec_touches_pcie = (record.kind == "pcie") or ff_word_touches_pcie(record.word, rec_old_block)
+        rec_groups = classify_ff_functional_groups(record.word, rec_old_block)
+
         reconcile(
             plan,
             record,
             assumed,
             allow_manual_debugctrl=effective_debugctrl,
             allow_undetermined_ceiling=ov.undetermined_ceiling,
+            allow_unmapped_ff=ov.unmapped_ff,
+            baseline_blocks=working_blocks,
+            enforce_known_ff=strict_ff,
+            require_noop_test=strict_ff,
         )
+
         if idx > 0:
             # Repeat live health, host, die ID, and slot-scan checks before every subsequent record.
             # SENSE_CTRL already ran once for this window (GA100 sets RESENSE_DISABLE=1 after it).
@@ -1137,11 +1474,23 @@ def process_records(
                     plan_sha256=plan.content_hash,
                     phase=f"before_record:{record.name}",
                     active_sense=False,
+                    rail_telemetry=rail_mode,
                     health=h_snap,
                     host=host_snap,
                     error=str(exc),
                 )
                 raise
+
+        if (
+            prev_groups is not None
+            and prev_groups != {"noop"}
+            and rec_groups != {"noop"}
+            and not (prev_groups & rec_groups)
+        ):
+            show(
+                f"\n--- Functional group boundary: completed [{', '.join(sorted(prev_groups))}]; "
+                f"next is [{', '.join(sorted(rec_groups))}] (clean point to stop & restart if desired) ---"
+            )
 
         previous = reader.fuse_row(pointer)
         _poison(f"FPF row {pointer}", previous)
@@ -1159,8 +1508,9 @@ def process_records(
             )
             if record.resulting_sm_count is not None:
                 mask_info += f" ({record.resulting_sm_count} SM)"
+        group_tag = "+".join(sorted(rec_groups))
         show(
-            f"{record.kind.upper()}: row {pointer} {record.target}={hex32(record.word)} "
+            f"{record.kind.upper()}[{group_tag}]: row {pointer} {record.target}={hex32(record.word)} "
             f"({record.decode}); defect_sensitive={record.defect_sensitive}{mask_info}; "
             f"current={hex32(previous)}"
         )
@@ -1172,9 +1522,17 @@ def process_records(
                 show("WARNING: DEBUGCTRL (0x00820060) is a sensitive controller register.")
                 if not _confirm_token(confirm, f"Type '{token}' separately: ", token):
                     journal.append(event="declined", row=pointer, record=record.name, reason=token)
+                    if written_records:
+                        _run_poweroff_sanity(
+                            plan, reader, journal, show,
+                            committed_records=already_committed + written_records,
+                            remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
+                            baseline_blocks=sanity_baseline,
+                            reason="operator_declined",
+                        )
                     raise BurnError("DEBUGCTRL separately confirmed manual action declined")
 
-        if record.kind == "pcie":
+        if rec_touches_pcie:
             observed_link = reader.field("LnkCap2")
             _poison("LnkCap2", observed_link)
             show(
@@ -1187,14 +1545,23 @@ def process_records(
                     f"before state ({hex32(record.link_cap2_before)})"
                 )
 
-        if record.kind in ("pcie", "reconfig"):
-            token = f"REVIEW {record.kind.upper()}"
+        if rec_touches_pcie or record.kind == "reconfig":
+            review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()
+            token = f"REVIEW {review_kind}"
             if not _confirm_token(
                 confirm,
                 f"{token}: externally verify current link/ceiling and type '{token}': ",
                 token,
             ):
                 journal.append(event="declined", row=pointer, record=record.name, reason=token)
+                if written_records:
+                    _run_poweroff_sanity(
+                        plan, reader, journal, show,
+                        committed_records=already_committed + written_records,
+                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
+                        baseline_blocks=sanity_baseline,
+                        reason="operator_declined",
+                    )
                 raise BurnError("special record not confirmed")
 
         confirm_word = f"YES {pointer} {hex32(record.word)}" if strict_confirm else "YES"
@@ -1204,6 +1571,14 @@ def process_records(
             confirm_word,
         ):
             journal.append(event="declined", row=pointer, record=record.name)
+            if written_records:
+                _run_poweroff_sanity(
+                    plan, reader, journal, show,
+                    committed_records=already_committed + written_records,
+                    remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
+                    baseline_blocks=sanity_baseline,
+                    reason="operator_declined",
+                )
             raise BurnError("operator declined")
 
         # Instantaneous pre-trigger gate: closes the window while the human was reading/typing.
@@ -1244,6 +1619,7 @@ def process_records(
                 previous=hex32(previous),
                 confirmation=confirm_word,
                 boot_id=boot_id,
+                rail_telemetry=rail_mode,
                 overrides=ov.active_names(),
             )
             readback, health, host_after = _write_verify_or_halt(
@@ -1266,6 +1642,7 @@ def process_records(
                 result="MATCH",
                 full_post_write_gate=health.serializable(),
                 host_after=host_after.serializable(),
+                rail_telemetry=rail_mode,
                 pointer_advanced=True,
                 cold_boot_verified=False,
                 boot_id=boot_id,
@@ -1273,6 +1650,8 @@ def process_records(
                 manual_record_sha256=manual_record_sha256,
             )
         pointer += 1  # The ONLY advance, after read-back AND healthy gate.
+        written_records.append(record)
+        prev_groups = rec_groups
 
         if stage == "all" and record.kind == "test" and idx + 1 < len(pending):
             show(
@@ -1281,7 +1660,7 @@ def process_records(
             )
             show(
                 "NOTE: Read-back confirms the test write landed in the fuse array, NOT a cold-boot re-parse.\n"
-                "Continuing keeps your current Goldilocks glitch window (no re-glitch required)."
+                "You can stop now to cold-boot verify the test row, or continue directly into real records."
             )
             if not _confirm_token(
                 confirm,
@@ -1289,6 +1668,13 @@ def process_records(
                 "(or press Enter to stop and cold-boot verify first): ",
                 "CONTINUE SAME WINDOW",
             ):
+                _run_poweroff_sanity(
+                    plan, reader, journal, show,
+                    committed_records=already_committed + written_records,
+                    remaining_records=pending[idx + 1 :] + deferred_by_max + tail_after_stage,
+                    baseline_blocks=sanity_baseline,
+                    reason="paused_after_test",
+                )
                 journal.append(
                     event="stage_all_paused_after_test",
                     test_row=pointer - 1,
@@ -1312,9 +1698,18 @@ def process_records(
         event="session_complete_readback_only",
         stage=stage,
         last_pointer=pointer,
-        records_written=len(pending),
+        records_written=len(written_records),
+        rail_telemetry=rail_mode,
         cold_boot_verified=False,
     )
+    if written_records:
+        _run_poweroff_sanity(
+            plan, reader, journal, show,
+            committed_records=already_committed + written_records,
+            remaining_records=deferred_by_max + tail_after_stage,
+            baseline_blocks=sanity_baseline,
+            reason="session_complete",
+        )
     return pointer
 
 
@@ -1337,6 +1732,18 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
         if cold["boot_id"] == cold["previous_boot_id"]:
             raise BurnError("not a distinct cold boot")
 
+        ctrl_state = cold.get("controller_state")
+        if isinstance(ctrl_state, dict) and ctrl_state:
+            if "dsov" in ctrl_state and u32(ctrl_state["dsov"], "cold.controller_state.dsov") == 0:
+                raise BurnError(
+                    "cold snapshot controller_state has DSOV=0 (still in a held glitch window; "
+                    "power-cycle card completely before capturing cold snapshot)"
+                )
+            if "en_sw" in ctrl_state and (u32(ctrl_state["en_sw"], "cold.controller_state.en_sw") & 1) == 1:
+                raise BurnError(
+                    "cold snapshot controller_state has EN_SW_OVERRIDE=1 (not a fresh cold boot)"
+                )
+
         raw_die = cold.get("die_rows")
         if not isinstance(raw_die, dict):
             raise BurnError("cold snapshot missing die_rows object")
@@ -1353,6 +1760,7 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
             ]
 
         test_row: int | None = None
+        expected_written_rows: dict[int, int] = {}
         if stage == "test":
             for item in reversed(prior):
                 if (
@@ -1379,6 +1787,7 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
                 raise BurnError("cold snapshot lacks the written test FPF row")
             if u32(raw_rows[str(test_row)], f"cold.fpf_rows.{test_row}") != plan.records[0].word:
                 raise BurnError("cold test FPF row does not persist")
+            expected_written_rows[test_row] = plan.records[0].word
         else:
             # Every journaled write for this plan must persist across the cold boot.
             # Snapshots store only NON-ZERO rows, so an absent row means it reads 0x00000000
@@ -1399,7 +1808,8 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
             if not written:
                 raise BurnError("no journaled verified writes for this plan to cold-verify")
             for item in written:
-                row_key = str(item["row"])
+                row_idx = int(item["row"])
+                row_key = str(row_idx)
                 expected_word = u32(item["intended"], "journal.intended")
                 observed_word = (
                     u32(raw_rows[row_key], f"cold.fpf_rows.{row_key}") if row_key in raw_rows else 0
@@ -1409,6 +1819,28 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
                         f"cold FPF row {row_key} ({hex32(observed_word)}) "
                         f"does not match written record {item['record']!r} ({hex32(expected_word)})"
                     )
+                expected_written_rows[row_idx] = expected_word
+
+        # When the plan includes baseline_ff_rows, verify the full FF row image in the snapshot.
+        if plan.baseline_ff_rows is not None and isinstance(raw_rows, dict):
+            parsed_cold_rows = {
+                int(k): u32(v, f"cold.fpf_rows.{k}")
+                for k, v in raw_rows.items()
+                if u32(v, f"cold.fpf_rows.{k}") != plan.empty_word
+            }
+            expected_full = {**plan.baseline_ff_rows, **expected_written_rows}
+            for r_idx, exp_w in sorted(expected_full.items()):
+                got_w = parsed_cold_rows.get(r_idx, plan.empty_word)
+                if got_w != exp_w:
+                    raise BurnError(
+                        f"cold snapshot FF row {r_idx} ({hex32(got_w)}) disagrees with "
+                        f"expected baseline+burned image ({hex32(exp_w)})"
+                    )
+            unexpected = sorted(set(parsed_cold_rows) - set(expected_full))
+            if unexpected:
+                raise BurnError(
+                    f"cold snapshot contains unexpected extra FF row(s): {unexpected[:5]}"
+                )
 
         expected: dict[str, int] = {}
         records = plan.records[:1] if stage == "test" else plan.records

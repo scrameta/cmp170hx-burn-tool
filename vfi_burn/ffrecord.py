@@ -16,11 +16,23 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .model import FF_ROW_MAX, FF_ROW_MIN, BurnError, SKU_CMP170HX_8GB, require_private_file, u32
+from .model import (
+    FF_ROW_MAX,
+    FF_ROW_MIN,
+    BurnError,
+    SKU_CMP170HX_8GB,
+    canonical_ff_prefix_sha256,
+    require_private_file,
+    u32,
+)
 
 FF_EMPTY_WORD = 0x00000000
 DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
 TOTAL_FUSE_ROWS = 512
+
+# Chain 2 blocks 37 and 38 carry read-only PCIe device-ID fuses (DEVIDA/DEVIDB) and no
+# burnable fields; unconditionally denied in both the engine and low-level fuse controller.
+DEVICE_ID_DENIED_BLOCKS: frozenset[tuple[int, int]] = frozenset({(2, 37), (2, 38)})
 
 TOTAL_GPC = 8
 TPC_PER_GPC = 8
@@ -137,6 +149,27 @@ FFCALC_KEY_TO_FIELD: dict[str, str] = {
     "nvlink_disable": "NVLINK_DISABLE",
     "sys_pipe_disable": "SYS_PIPE_DISABLE",
     **{f"tpc_gpc{i}_disable": f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)},
+}
+
+# Functional subsystem groupings used for pre-power-off boundary sanity checks.
+FIELD_FUNCTIONAL_GROUP: dict[str, str] = {
+    "gpc_disable": "compute",
+    "pes_disable": "compute",
+    **{f"tpc_gpc{i}_disable": "compute" for i in range(TOTAL_GPC)},
+    "fbp_disable": "memory",
+    "fbio_disable": "memory",
+    "fbpa_disable": "memory",
+    "rop_l2_disable": "memory",
+    "disable_gen3_speed_bit1": "pcie",
+    "disable_gen3_speed_bit9": "pcie",
+    "pcie_magic_gen4_dis": "pcie",
+    "pcie_boot_gen23_dis": "pcie",
+    "pcie_boot_gen3_dis": "pcie",
+    "magic_d": "pcie",
+    "nvlink_disable": "nvlink",
+    "sys_pipe_disable": "mig",
+    "pcie_devida": "identity",
+    "pcie_devidb": "identity",
 }
 
 
@@ -435,6 +468,287 @@ def compute_sm_count(gpc_disable: int, tpc_disables: list[int]) -> int:
     return total
 
 
+def ff_word_safety_audit(
+    word: int,
+    old_block: int | None = None,
+) -> tuple[list[str], list[str]]:
+    """Audit one 32-bit FF word for hard-denied and overridable safety violations.
+
+    Returns ``(hard_denials, overridable_issues)``:
+      - ``hard_denials`` are NEVER overridable (device-ID blocks c2/b37-38, any changed
+        ``burnable=False`` bit, or overlap with a ``burnable=False`` field when ``old_block``
+        is unknown so preservation of e.g. ``pcie_devidb[15]`` in c2/b39 cannot be proved).
+      - ``overridable_issues`` are refused by default and require explicit
+        ``--override-unmapped-ff`` + operator approval (unknown FF blocks, changed unmapped
+        bits, unmapped bits with unknown baseline, or ``opt_in`` fields such as full ``magic_d``).
+    """
+    rec = decode_ff(word)
+    hard_denials: list[str] = []
+    overridable: list[str] = []
+
+    if (rec.chain, rec.block) in DEVICE_ID_DENIED_BLOCKS:
+        hard_denials.append(
+            f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} targets unconditionally denied "
+            "read-only PCIe device-ID block (chain 2 blocks 37/38)"
+        )
+        return hard_denials, overridable
+
+    analysis = analyze_ff_block(rec.chain, rec.block, rec.data, old_block)
+    fields = analysis["fields"]
+
+    if old_block is not None:
+        for f in analysis["changed_fields"]:
+            if not f.burnable:
+                hard_denials.append(
+                    f"FF c{rec.chain}/b{rec.block} (0x{old_block:04x}->0x{rec.data:04x}) "
+                    f"modifies read-only field {f.name} ({f.note or 'burnable=False'})"
+                )
+            elif f.opt_in:
+                overridable.append(
+                    f"FF c{rec.chain}/b{rec.block} (0x{old_block:04x}->0x{rec.data:04x}) "
+                    f"modifies experimental opt-in field {f.name} ({f.note})"
+                )
+        if not fields:
+            overridable.append(
+                f"FF c{rec.chain}/b{rec.block} (0x{old_block:04x}->0x{rec.data:04x}) "
+                "targets an unknown FF block not in the GA100 option map"
+            )
+        elif analysis["changed_unmapped_bits"]:
+            overridable.append(
+                f"FF c{rec.chain}/b{rec.block} (0x{old_block:04x}->0x{rec.data:04x}) "
+                f"changes unmapped/undocumented chain bits {_compact_bit_list(analysis['changed_unmapped_bits'])}"
+            )
+    else:
+        for f in fields:
+            if not f.burnable:
+                hard_denials.append(
+                    f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} overlaps read-only field "
+                    f"{f.name} and no verified baseline block is available to prove it is unchanged"
+                )
+            elif f.opt_in:
+                overridable.append(
+                    f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} overlaps experimental opt-in "
+                    f"field {f.name} without a verified baseline block"
+                )
+        if not fields:
+            overridable.append(
+                f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} targets an unknown FF block "
+                "not in the GA100 option map"
+            )
+        elif analysis["unmapped_bits"]:
+            overridable.append(
+                f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} shares unmapped chain bits "
+                f"{_compact_bit_list(analysis['unmapped_bits'])} and no verified baseline block "
+                "is available to prove they are preserved"
+            )
+    return hard_denials, overridable
+
+
+def ff_word_touches_pcie(word: int, old_block: int | None = None) -> bool:
+    """Return True if ``word`` modifies (or, without baseline, overlaps) any PCIe option field."""
+    try:
+        rec = decode_ff(word)
+    except BurnError:
+        return False
+    analysis = analyze_ff_block(rec.chain, rec.block, rec.data, old_block)
+    if old_block is not None:
+        return any(f.category == "pcie" for f in analysis["changed_fields"])
+    return any(f.category == "pcie" for f in analysis["fields"])
+
+
+def verify_noop_test_record(word: int, existing_blocks: dict[int, dict[int, int]]) -> None:
+    """Prove that ``word`` is a demonstrable 0-bit-diff no-op against an existing FF block.
+
+    Requires BOTH that ``(chain, block)`` already exists in ``existing_blocks`` (so we never
+    assume an unmentioned block's underlying OTP default is 0) AND that ``data`` equals the
+    currently effective 16-bit block value.
+    """
+    rec = decode_ff(word)
+    if (rec.chain, rec.block) in DEVICE_ID_DENIED_BLOCKS:
+        raise BurnError(
+            f"test record c{rec.chain}/b{rec.block} targets denied PCIe device-ID block"
+        )
+    if not fields_in_block(rec.chain, rec.block):
+        raise BurnError(
+            f"test record c{rec.chain}/b{rec.block} targets an unknown FF block; "
+            "use a known chain-1 block for the no-op test row"
+        )
+    chain_blocks = existing_blocks.get(rec.chain, {})
+    if rec.block not in chain_blocks:
+        raise BurnError(
+            f"test record c{rec.chain}/b{rec.block}=0x{rec.data:04x} cannot be proved no-op: "
+            "block is not present in the card's existing FF prefix (underlying OTP value unknown)"
+        )
+    current = chain_blocks[rec.block]
+    if current != rec.data:
+        diff = current ^ rec.data
+        raise BurnError(
+            f"test record c{rec.chain}/b{rec.block} is NOT a no-op: "
+            f"effective block would change 0x{current:04x} -> 0x{rec.data:04x} (diff=0x{diff:04x})"
+        )
+
+
+def classify_ff_functional_groups(word: int, old_block: int | None = None) -> set[str]:
+    """Classify which functional GPU subsystem(s) a 32-bit FF record modifies."""
+    try:
+        rec = decode_ff(word)
+    except BurnError:
+        return {"unknown"}
+    analysis = analyze_ff_block(rec.chain, rec.block, rec.data, old_block)
+    if old_block is not None:
+        if analysis["is_noop"]:
+            return {"noop"}
+        groups = {FIELD_FUNCTIONAL_GROUP.get(f.key, f.category) for f in analysis["changed_fields"]}
+        if not groups:
+            return {"unknown"}
+        return groups
+    if not analysis["fields"]:
+        return {"unknown"}
+    return {FIELD_FUNCTIONAL_GROUP.get(f.key, f.category) for f in analysis["fields"]}
+
+
+def evaluate_poweroff_sanity(
+    live_rows: dict[int, int],
+    plan,
+    *,
+    committed_records: list,
+    remaining_records: list,
+    baseline_blocks: dict[int, dict[int, int]] | None = None,
+) -> dict:
+    """Run a pre-power-off sanity check on the current FF state vs remaining planned records.
+
+    Checks:
+      1. Zero genuine defect bits enabled in the live replayed FF state.
+      2. Replayed SM count does not exceed the plan ceiling (when compute masks are present).
+      3. No functional subsystem (compute / memory / pcie / nvlink / mig) is split half-burned
+         between already-committed records and remaining unburned records.
+      4. Internal compute consistency (e.g. an enabled GPC with all 8 TPCs disabled).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    live_blocks = replay_ff_rows(live_rows)
+    live_fields = decode_all_fields(live_blocks)
+
+    # 1. Check all known genuine defect masks against the live replayed state.
+    for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
+        if vfi_name not in plan.defect_masks:
+            continue
+        defect = plan.defect_masks[vfi_name]
+        cur_val = live_fields[ff_key]
+        reenabled = defect & ~cur_val & 0xFFFFFFFF
+        if reenabled:
+            errors.append(
+                f"LIVE REPLAY DEFECT VIOLATION: {vfi_name}=0x{cur_val:x} leaves genuinely "
+                f"defective bits 0x{reenabled:x} enabled!"
+            )
+
+    # 2. Replayed SM count check (only when GPC/TPC blocks exist in replay or expected masks).
+    sm_count: int | None = None
+    tpc_keys = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
+    if "GPC_DISABLE" in plan.expected_masks and all(k in plan.expected_masks for k in tpc_keys):
+        sm_count = compute_sm_count(
+            live_fields["gpc_disable"],
+            [live_fields[f"tpc_gpc{i}_disable"] for i in range(TOTAL_GPC)],
+        )
+        has_reconfig = any(r.kind == "reconfig" for r in committed_records)
+        ceiling = plan.override_sm_ceiling if (has_reconfig and plan.override_sm_ceiling) else plan.base_sm_ceiling
+        if ceiling is not None and sm_count > ceiling:
+            errors.append(
+                f"LIVE REPLAY SM COUNT {sm_count} exceeds plan ceiling {ceiling}!"
+            )
+        # Internal compute sanity: warn if an enabled GPC has all 8 TPCs disabled.
+        gpc_dis = live_fields["gpc_disable"]
+        for i in range(TOTAL_GPC):
+            if not ((gpc_dis >> i) & 1) and (live_fields[f"tpc_gpc{i}_disable"] & 0xFF) == 0xFF:
+                warnings.append(
+                    f"GPC{i} is enabled in GPC_DISABLE (0x{gpc_dis:02x}) but all 8 TPCs "
+                    f"in TPC_GPC{i}_DISABLE are disabled (0xff)."
+                )
+
+    # 3. Functional-group boundary check between committed and remaining planned records.
+    if baseline_blocks is not None:
+        walk_blocks = {c: dict(b) for c, b in baseline_blocks.items()}
+    else:
+        walk_blocks = {c: dict(b) for c, b in live_blocks.items()}
+
+    committed_by_group: dict[str, list[str]] = {}
+    for rec in committed_records:
+        try:
+            ff = decode_ff(rec.word)
+            old_b = walk_blocks.get(ff.chain, {}).get(ff.block, 0)
+            groups = classify_ff_functional_groups(rec.word, old_b)
+            walk_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
+        except BurnError:
+            groups = {"unknown"}
+        for g in groups:
+            if g != "noop":
+                committed_by_group.setdefault(g, []).append(rec.name)
+
+    remaining_by_group: dict[str, list[str]] = {}
+    for rec in remaining_records:
+        try:
+            ff = decode_ff(rec.word)
+            old_b = walk_blocks.get(ff.chain, {}).get(ff.block, 0)
+            groups = classify_ff_functional_groups(rec.word, old_b)
+            walk_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
+        except BurnError:
+            groups = {"unknown"}
+        for g in groups:
+            if g != "noop":
+                remaining_by_group.setdefault(g, []).append(rec.name)
+
+    split_groups = sorted(set(committed_by_group) & set(remaining_by_group))
+    for grp in split_groups:
+        warnings.append(
+            f"PARTIAL '{grp.upper()}' FUNCTIONAL GROUP BURNED: committed "
+            f"[{', '.join(committed_by_group[grp])}] while [{', '.join(remaining_by_group[grp])}] "
+            f"are still pending! Powering off before finishing the '{grp}' group may leave "
+            "an inconsistent configuration."
+        )
+
+    safe_to_power_off = (not errors) and (not split_groups)
+
+    lines = ["", "=== PRE-POWER-OFF FUSE SANITY CHECK ==="]
+    committed_groups = sorted(committed_by_group)
+    remaining_groups = sorted(remaining_by_group)
+    lines.append(
+        f"  Committed groups : {', '.join(committed_groups) if committed_groups else 'none (no-op test only)'}"
+    )
+    lines.append(
+        f"  Remaining groups : {', '.join(remaining_groups) if remaining_groups else 'none (plan complete)'}"
+    )
+    if sm_count is not None:
+        lines.append(f"  Replayed SM count: {sm_count} SMs (base ceiling={plan.base_sm_ceiling})")
+    for err in errors:
+        lines.append(f"  !!! ERROR   : {err}")
+    for warn in warnings:
+        lines.append(f"  !!! WARNING : {warn}")
+    if safe_to_power_off and not warnings:
+        lines.append(
+            "  VERDICT: SAFE TO POWER OFF — burned FF rows form a clean functional boundary."
+        )
+    elif safe_to_power_off:
+        lines.append(
+            "  VERDICT: CAUTION — no split functional groups, but review warnings above before power-off."
+        )
+    else:
+        lines.append(
+            "  VERDICT: DO NOT POWER OFF YET (if glitch window is still healthy) — "
+            "complete the split functional group or resolve errors above first."
+        )
+    return {
+        "safe_to_power_off": safe_to_power_off,
+        "errors": errors,
+        "warnings": warnings,
+        "committed_groups": committed_groups,
+        "remaining_groups": remaining_groups,
+        "split_groups": split_groups,
+        "sm_count": sm_count,
+        "lines": lines,
+    }
+
+
 def make_noop_test_record(ff_rows: dict[int, int]) -> dict:
     """Create a safe throwaway no-op FF record re-writing an existing chain-1 block unchanged.
 
@@ -443,9 +757,15 @@ def make_noop_test_record(ff_rows: dict[int, int]) -> dict:
     """
     blocks = replay_ff_rows(ff_rows)
     chain1 = blocks.get(1, {})
-    if not chain1:
-        raise BurnError("cannot derive no-op test record: no existing chain-1 FF rows in dump")
-    blk = 7 if 7 in chain1 else sorted(chain1)[0]
+    candidates = [
+        b for b in sorted(chain1)
+        if fields_in_block(1, b) and (1, b) not in DEVICE_ID_DENIED_BLOCKS
+    ]
+    if not candidates:
+        raise BurnError(
+            "cannot derive no-op test record: no existing known chain-1 FF rows in dump"
+        )
+    blk = 7 if 7 in candidates else candidates[0]
     data = chain1[blk]
     word = encode_ff(1, blk, data)
     return {
@@ -467,8 +787,8 @@ def import_ffcalc_plan(
     stock_mv: float = 787.5,
     tolerance_mv: float = 25.0,
     override_sm_ceiling: int | None = None,
-    first_record_as_test: bool = True,
-    prepend_noop_test: bool = False,
+    first_record_as_test: bool = False,
+    prepend_noop_test: bool = True,
     link_cap2_before: int = 0x06,
     link_cap2_after: int = 0x1E,
 ) -> dict:
@@ -478,10 +798,14 @@ def import_ffcalc_plan(
       - All 8 Die ID rows (8..15) are present in the card dump (refuses incomplete dumps).
       - Every planned FF record decodes cleanly (IFF bit 5 == 0) and matches chain/block/new.
       - The dump covers every FF row 222..486, and its used rows are one contiguous prefix.
+      - Preserves the canonical occupied FF prefix (``baseline_ff_rows`` + SHA-256 digest +
+        ``expected_next_row``) so live preflight proves the on-card history matches this dump.
       - Planned rows are contiguous, start at the first free FF row and never collide.
       - Each planned ``old`` value equals the replayed current block.
       - The dump's fused mask registers agree with the FF replay (model check).
+      - No planned record touches read-only device-ID blocks, unknown blocks, or unmapped bits.
       - No planned record leaves any *_defective unit enabled (word-derived check).
+      - Ensures the first record (``kind="test"``) is a demonstrable 0-bit-diff no-op.
       - Computes exact before/after disable masks and SM counts from full FF replay.
 
     ``base_sm_ceiling`` is required: it is community/operator knowledge the card cannot
@@ -528,7 +852,10 @@ def import_ffcalc_plan(
         raise BurnError("ffcalc dump shows the FF region full")
     if any(v != FF_EMPTY_WORD for v in region[first_free_idx:]):
         raise BurnError("ffcalc dump FF rows are non-contiguous; vfi_burn's free-slot proof would refuse")
-    next_row = FF_ROW_MIN + first_free_idx
+    baseline_next_row = FF_ROW_MIN + first_free_idx
+    next_row = baseline_next_row
+    baseline_ff_prefix = {r: ff_rows[r] for r in range(FF_ROW_MIN, baseline_next_row)}
+    baseline_ff_sha = canonical_ff_prefix_sha256(baseline_ff_prefix)
 
     opt_words = dump_obj.get("option_words", {})
     if not isinstance(opt_words, dict):
@@ -569,12 +896,17 @@ def import_ffcalc_plan(
         noop = make_noop_test_record(ff_rows)
         if "GPC_DISABLE" in expected_masks:
             noop["expected_cold"] = {"GPC_DISABLE": f"0x{expected_masks['GPC_DISABLE']:x}"}
-        else:
+        elif expected_masks:
             first_key = sorted(expected_masks)[0]
             noop["expected_cold"] = {first_key: f"0x{expected_masks[first_key]:x}"}
         vfi_records.append(noop)
         first_record_as_test = False
         next_row += 1  # the no-op occupies the first free row; planned rows shift by one
+    else:
+        # Without prepending a no-op test row, burn[0] MUST itself be a demonstrable no-op.
+        first_word = u32(burn_list[0]["record"], "burn[0].record")
+        verify_noop_test_record(first_word, base_blocks)
+        first_record_as_test = True
 
     planned_rows = [int(item["row"]) for item in burn_list]
     if len(set(planned_rows)) != len(planned_rows):
@@ -599,18 +931,27 @@ def import_ffcalc_plan(
                 f"burn[{idx}] row {row}: record 0x{word:08x} disagrees with "
                 f"chain={chain} block={block} new=0x{new_data:04x}"
             )
+        replay_blocks_now = replay_ff_rows(running_rows)
+        replay_old = replay_blocks_now.get(chain, {}).get(block, 0)
         if "old" in item:
-            replay_old = replay_ff_rows(running_rows).get(chain, {}).get(block, 0)
             if u32(item["old"], f"burn[{idx}].old") != replay_old:
                 raise BurnError(
                     f"burn[{idx}] row {row}: planned old=0x{u32(item['old'], 'old'):04x} != "
                     f"replayed current block 0x{replay_old:04x}"
                 )
+        hard_denials, overridable_issues = ff_word_safety_audit(word, replay_old)
+        if hard_denials:
+            raise BurnError(f"burn[{idx}] row {row}: REFUSED; " + "; ".join(hard_denials))
+        # Reject unknown blocks and changed unmapped bits at import time too.
+        non_optin_issues = [msg for msg in overridable_issues if "opt-in field" not in msg]
+        if non_optin_issues:
+            raise BurnError(f"burn[{idx}] row {row}: REFUSED; " + "; ".join(non_optin_issues))
+
         sim = simulate_ff_write(running_rows, row, word)
         running_rows[row] = word  # rows validated free + contiguous above; no-op test is replay-neutral
 
         fields = list(item.get("fields", []))
-        is_pcie = any(
+        is_pcie = ff_word_touches_pcie(word, replay_old) or any(
             FIELDS_BY_KEY[k].category == "pcie" for k in fields if k in FIELDS_BY_KEY
         )
 
@@ -685,7 +1026,13 @@ def import_ffcalc_plan(
         for ff_key, (_before_v, after_v) in changed_masks:
             rec_dict["expected_cold"][FFCALC_KEY_TO_FIELD[ff_key]] = f"0x{after_v:x}"
         if kind == "test" and not rec_dict["expected_cold"]:
-            rec_dict["expected_cold"][target_name] = f"0x{sim['new_block']:x}"
+            if "GPC_DISABLE" in expected_masks:
+                rec_dict["expected_cold"]["GPC_DISABLE"] = f"0x{expected_masks['GPC_DISABLE']:x}"
+            elif expected_masks:
+                first_key = sorted(expected_masks)[0]
+                rec_dict["expected_cold"][first_key] = f"0x{expected_masks[first_key]:x}"
+            else:
+                rec_dict["expected_cold"][target_name] = f"0x{sim['new_block']:x}"
         if kind == "pcie":
             rec_dict["link_cap2_before"] = f"0x{link_cap2_before:x}"
             rec_dict["link_cap2_after"] = f"0x{link_cap2_after:x}"
@@ -727,6 +1074,9 @@ def import_ffcalc_plan(
             "first_row": FF_ROW_MIN,
             "last_row": FF_ROW_MAX,
             "empty_word": f"0x{FF_EMPTY_WORD:08x}",
+            "expected_next_row": baseline_next_row,
+            "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in sorted(baseline_ff_prefix.items())},
+            "baseline_ff_sha256": baseline_ff_sha,
         },
         "environment": {
             "stock_mv": stock_mv,

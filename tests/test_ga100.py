@@ -264,7 +264,11 @@ class TestGA100Controller(unittest.TestCase):
         from vfi_burn.model import Plan
 
         die = {i: 0x1000 + i for i in range(8, 16)}
-        existing_ff = {222: encode_ff(1, 7, 0x0123), 223: encode_ff(1, 19, 0x4290)}
+        existing_ff = {
+            222: encode_ff(1, 7, 0x0123),
+            223: encode_ff(1, 19, 0x4290),
+            224: encode_ff(1, 23, 0x0FEF),
+        }
         noop_word = encode_ff(1, 7, 0x0123)
         fbp_word = encode_ff(1, 19, 0x4200)
         nvlink_word = encode_ff(1, 23, 0x0FE8)
@@ -274,6 +278,7 @@ class TestGA100Controller(unittest.TestCase):
 
         class MockLiveAdapter:
             simulation = False
+            write_enabled = True
             writer_verified = True
             def __init__(self, boot_id):
                 self._boot = boot_id
@@ -300,7 +305,13 @@ class TestGA100Controller(unittest.TestCase):
                     "expected_masks": {"FBP_DISABLE": "0x852"},
                     "defect_masks": {"FBP_DISABLE": "0x840", "FBPA_DISABLE": "0x0", "ROP_L2_DISABLE": "0x0", "NVLINK_DISABLE": "0x0", "SYS_PIPE_DISABLE": "0x0"},
                 },
-                "fpf": {"first_row": 222, "last_row": 230, "empty_word": "0x00000000"},
+                "fpf": {
+                    "first_row": 222,
+                    "last_row": 230,
+                    "empty_word": "0x00000000",
+                    "expected_next_row": 225,
+                    "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
+                },
                 "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
                 "ceiling": {"base_sm": 124},
                 "records": [
@@ -338,17 +349,20 @@ class TestGA100Controller(unittest.TestCase):
                     stage="test", confirm=confirm_1, strict_confirm=True,
                     confirm_active_sense=True, show=lambda *_: None,
                 )
-            self.assertEqual(ptr, 225)
-            self.assertEqual(mmio.rows[224], noop_word)
+            self.assertEqual(ptr, 226)
+            self.assertEqual(mmio.rows[225], noop_word)
             self.assertEqual(mmio.sense_calls, 1)
-            self.assertEqual(tokens_1, ["SENSE", f"YES 224 0x{noop_word:08x}"])
+            self.assertEqual(tokens_1, ["SENSE", f"YES 225 0x{noop_word:08x}"])
 
             # Cold boot verify Stage 1 -> receipt
             cold_1 = {
                 "pci_id": "10de:20c2", "cold_boot": True,
                 "boot_id": "boot-2", "previous_boot_id": "boot-1",
                 "die_rows": {str(k): f"0x{v:08x}" for k, v in die.items()},
-                "fpf_rows": {"224": f"0x{noop_word:08x}"},
+                "fpf_rows": {
+                    **{str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
+                    "225": f"0x{noop_word:08x}",
+                },
                 "fields": {"FBP_DISABLE": "0x852"},
             }
             with Journal(jpath) as j:
@@ -367,9 +381,9 @@ class TestGA100Controller(unittest.TestCase):
                     stage="real", test_receipt=rpath, confirm=lambda p, t: True,
                     strict_confirm=True, confirm_active_sense=True, show=lambda *_: None,
                 )
-            self.assertEqual(ptr2, 227)
-            self.assertEqual(mmio2.rows[225], fbp_word)
-            self.assertEqual(mmio2.rows[226], nvlink_word)
+            self.assertEqual(ptr2, 228)
+            self.assertEqual(mmio2.rows[226], fbp_word)
+            self.assertEqual(mmio2.rows[227], nvlink_word)
             self.assertEqual(mmio2.sense_calls, 1)
             self.assertEqual(mmio2.program_calls, 2)
 
@@ -382,6 +396,11 @@ class TestGA100Controller(unittest.TestCase):
         from vfi_burn.model import Plan
 
         die = {i: 0x1000 + i for i in range(8, 16)}
+        existing_ff = {
+            222: encode_ff(1, 7, 0x0123),
+            223: encode_ff(1, 19, 0x4290),
+            224: encode_ff(1, 23, 0x0FEF),
+        }
         noop_word = encode_ff(1, 7, 0x0123)
         fbp_word = encode_ff(1, 19, 0x4200)
         nvlink_word = encode_ff(1, 23, 0x0FE8)
@@ -398,7 +417,13 @@ class TestGA100Controller(unittest.TestCase):
                     "expected_masks": {"FBP_DISABLE": "0x852"},
                     "defect_masks": {"FBP_DISABLE": "0x840", "FBPA_DISABLE": "0x0", "ROP_L2_DISABLE": "0x0", "NVLINK_DISABLE": "0x0", "SYS_PIPE_DISABLE": "0x0"},
                 },
-                "fpf": {"first_row": 222, "last_row": 230, "empty_word": "0x00000000"},
+                "fpf": {
+                    "first_row": 222,
+                    "last_row": 230,
+                    "empty_word": "0x00000000",
+                    "expected_next_row": 225,
+                    "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
+                },
                 "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
                 "ceiling": {"base_sm": 124},
                 "records": [
@@ -428,6 +453,7 @@ class TestGA100Controller(unittest.TestCase):
                 ctl_obj = GA100FuseController(mmio_obj, read_only=False, sleep=lambda _: None)
                 class _Adapter:
                     simulation = False
+                    write_enabled = True
                     writer_verified = True
                     def pci_id(self): return "10de:20c2"
                     def die_row(self, i): return ctl_obj.read_row(i)
@@ -441,7 +467,7 @@ class TestGA100Controller(unittest.TestCase):
                 return _Adapter()
 
             # Case 1: Single-window --stage all with CONTINUE SAME WINDOW (no re-glitch, SENSE asked ONCE!)
-            mmio1 = FakeGA100MMIO(rows={**die, 222: noop_word}, goldilocks=True)
+            mmio1 = FakeGA100MMIO(rows={**die, **existing_ff}, goldilocks=True)
             ad1 = make_adapter(mmio1, "boot-single-1")
             j1 = work / "j1.jsonl"
             tokens = []
@@ -453,19 +479,19 @@ class TestGA100Controller(unittest.TestCase):
                     plan, ad1, ad1, j, stage="all", confirm=confirm_all,
                     strict_confirm=True, confirm_active_sense=True, show=lambda *_: None,
                 )
-            self.assertEqual(ptr, 226)
+            self.assertEqual(ptr, 228)
             self.assertEqual(mmio1.sense_calls, 1)
             self.assertEqual(mmio1.program_calls, 3)
             self.assertEqual(tokens, [
                 "SENSE",
-                f"YES 223 0x{noop_word:08x}",
+                f"YES 225 0x{noop_word:08x}",
                 "CONTINUE SAME WINDOW",
-                f"YES 224 0x{fbp_word:08x}",
-                f"YES 225 0x{nvlink_word:08x}",
+                f"YES 226 0x{fbp_word:08x}",
+                f"YES 227 0x{nvlink_word:08x}",
             ])
 
             # Case 2: --stage all where operator pauses after test row -> clean stop, verify-cold works!
-            mmio2 = FakeGA100MMIO(rows={**die, 222: noop_word}, goldilocks=True)
+            mmio2 = FakeGA100MMIO(rows={**die, **existing_ff}, goldilocks=True)
             ad2 = make_adapter(mmio2, "boot-pause-1")
             j2 = work / "j2.jsonl"
             def pause_after_test(prompt, token):
@@ -475,14 +501,17 @@ class TestGA100Controller(unittest.TestCase):
                     plan, ad2, ad2, j, stage="all", confirm=pause_after_test,
                     strict_confirm=True, confirm_active_sense=True, show=lambda *_: None,
                 )
-            self.assertEqual(ptr2, 224)
-            self.assertEqual(mmio2.rows[223], noop_word)
-            self.assertEqual(mmio2.rows[224], 0)
+            self.assertEqual(ptr2, 226)
+            self.assertEqual(mmio2.rows[225], noop_word)
+            self.assertEqual(mmio2.rows[226], 0)
             cold = {
                 "pci_id": "10de:20c2", "cold_boot": True,
                 "boot_id": "boot-pause-2", "previous_boot_id": "boot-pause-1",
                 "die_rows": {str(k): f"0x{v:08x}" for k, v in die.items()},
-                "fpf_rows": {"223": f"0x{noop_word:08x}"},
+                "fpf_rows": {
+                    **{str(r): f"0x{w:08x}" for r, w in existing_ff.items()},
+                    "225": f"0x{noop_word:08x}",
+                },
                 "fields": {"FBP_DISABLE": "0x852"},
             }
             with Journal(j2) as j:

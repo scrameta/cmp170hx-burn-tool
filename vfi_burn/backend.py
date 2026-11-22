@@ -78,29 +78,43 @@ class Writer(Protocol):
 class MissingWriter:
     """Mandatory default for physical hardware; refuses any write attempt."""
 
+    write_enabled = False
     writer_verified = False
 
     def write_one_record(self, row: int, word: int) -> None:
         raise PreTriggerRefusal(
-            "REAL FUSE WRITES DISABLED: encoding, command sequence, voltage unverified"
+            "REAL FUSE WRITES DISABLED: write mode not armed (pass --execute on an interactive TTY)"
         )
 
 
-def has_verified_writer(adapter) -> bool:
-    """Return True only if an owner-supplied live adapter explicitly opts into verified writes."""
+def has_write_capability(adapter) -> bool:
+    """Return True if a live adapter has write capability armed (write_enabled or legacy writer_verified).
+
+    NOTE: This indicates write mode/capability was explicitly armed by the caller or custom adapter,
+    NOT that the hardware write sequence has been independently bench-certified.
+    """
     if adapter is None or isinstance(adapter, MissingWriter):
         return False
     if getattr(adapter, "simulation", False):
         return False
-    if getattr(adapter, "writer_verified", False) is not True:
+    armed = (
+        getattr(adapter, "write_enabled", False) is True
+        or getattr(adapter, "writer_verified", False) is True
+    )
+    if not armed:
         return False
     return callable(getattr(adapter, "write_one_record", None))
+
+
+# Backward-compatible alias for callers/adapters importing has_verified_writer.
+has_verified_writer = has_write_capability
 
 
 class FakeController:
     """In-memory simulation only; cannot access BAR0, PMBus, or physical fuses."""
 
     simulation = True
+    write_enabled = False
     writer_verified = False
 
     def __init__(

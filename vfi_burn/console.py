@@ -28,6 +28,7 @@ from .ffrecord import (
     FF_ROW_MIN,
     TOTAL_GPC,
     analyze_ff_block,
+    classify_ff_functional_groups,
     compute_sm_count,
     decode_all_fields,
     decode_ff,
@@ -212,10 +213,14 @@ def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = Fals
         if health.resense_disable is not None:
             arm_parts.append(f"RESENSE_DIS={health.resense_disable}")
         lines.append("  Arming State : " + "  ".join(arm_parts))
+    assumed_rail = (not getattr(reader, "simulation", False)) and (
+        not getattr(reader, "rail_telemetry_live", True)
+    )
+    rail_note = "  [ASSUMED / UNMEASURED — no live PMBus]" if assumed_rail else ""
     lines.append(
         f"  VRM / Rail   : STATUS_WORD={format_pmbus_status(health.status_word)}  "
         f"READ_VOUT={health.vout_mv:.1f} mV "
-        f"(plan {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV)"
+        f"(plan {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV){rail_note}"
     )
 
     die_bad: list[str] = []
@@ -406,6 +411,11 @@ def format_plan_review(
     if current_rows is not None:
         sim_blocks, _ = _safe_replay_rows(current_rows)
         before_ff_fields = decode_all_fields(sim_blocks)
+    elif plan.baseline_ff_rows is not None:
+        sim_blocks, _ = _safe_replay_rows(plan.baseline_ff_rows)
+        before_ff_fields = decode_all_fields(sim_blocks)
+        if next_free_row is None and plan.expected_next_row is not None:
+            next_free_row = plan.expected_next_row
 
     record_analyses: list[tuple[int, Record, dict | None, str | None]] = []
     audit_warnings: list[str] = []
@@ -588,6 +598,7 @@ def format_plan_review(
         slot_str = f"row {next_free_row + idx:3d}" if next_free_row is not None else f"slot +{idx:<2d}"
         if decode_err is not None:
             ff_tag = "INVALID/IFF!"
+            grp_tag = "unknown"
         else:
             c, b, nd, od = analysis["chain"], analysis["block"], analysis["new_data"], analysis["old_data"]
             if od is not None:
@@ -595,8 +606,9 @@ def format_plan_review(
             else:
                 delta_s = f"0x{nd:04x}"
             ff_tag = f"c{c}/b{b:<3d} {delta_s}"
+            grp_tag = "+".join(sorted(classify_ff_functional_groups(rec.word, od)))
         lines.append(
-            f"  {slot_str} | {rec.kind:8} | {rec.name:18} | {hex32(rec.word)} ({ff_tag}) | {rec.decode}"
+            f"  {slot_str} | {rec.kind:8} | {grp_tag:10} | {rec.name:18} | {hex32(rec.word)} ({ff_tag}) | {rec.decode}"
         )
 
     return lines
@@ -629,6 +641,10 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
     else:
         verdict = "PASSIVE GOLDILOCKS OK (DSOV=0, CRC=0x55, PLM_f8 OPEN; needs SENSE_CTRL + arm before CMD_PROGRAM)"
 
+    assumed_rail = (not getattr(reader, "simulation", False)) and (
+        not getattr(reader, "rail_telemetry_live", True)
+    )
+    rail_tag = " [ASSUMED/UNMEASURED]" if assumed_rail else ""
     lines = [
         "=== FUSE CONTROLLER STATE (BAR0 0x0082xxxx) ===",
         f"  FUSECTRL (0x820000) : {hex32(ctrl)}  [{idle_str}]",
@@ -637,7 +653,7 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
         f"  Sense / Arm Flags   : EFP(0x820078)={efp_str}  DFP(0x82007C)={dfp_str}  RESENSE_DIS(0x821058)={resense_str}",
         f"  Override / Shadow   : EN_SW(0x820040)={hex32(health.en_sw)}  SBFE(0x821108)={sbfe_str}  WDATA_WR_SEC(0x82048C)={wsec_str}",
         f"  PLM Gates           : PLM_f4(0x8200F4)={plm_f4_str}  PLM_f8(0x8200F8)={hex32(health.plm_f8)} ({'OPEN' if health.plm_f8 & 1 else 'CLOSED!'})  PLM_fc(0x8200FC)={hex32(health.plm)}",
-        f"  VRM / Host          : READ_VOUT={health.vout_mv:.1f} mV  STATUS_WORD={format_pmbus_status(health.status_word)}  driver={host.bound_driver or 'none'}  hold={host.hold_active}",
+        f"  VRM / Host          : READ_VOUT={health.vout_mv:.1f} mV{rail_tag}  STATUS_WORD={format_pmbus_status(health.status_word)}  driver={host.bound_driver or 'none'}  hold={host.hold_active}",
         f"  Controller Verdict  : {verdict}",
     ]
     return lines
@@ -1214,7 +1230,7 @@ class ManualConsole:
         self.show(
             "Never-overrideable invariants: aligned 32-bit stores, no GPU driver, SKU/die ID match, "
             "empty target slot, poison/PLM_f8/latch halt, mandatory read-back, post-write gate, "
-            "genuine defect bits."
+            "known genuine defect bits, and read-only PCIe device-ID blocks (c2/b37-38)."
         )
 
     def _is_floorsweep_target(self, target: str, word: int | None = None) -> bool:

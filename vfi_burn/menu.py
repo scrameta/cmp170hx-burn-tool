@@ -157,7 +157,9 @@ class BurnMenu:
     def _require_execute_ready(self, backend) -> None:
         self._check_execute_policy()
         if not self.s.fake_path and not has_verified_writer(backend):
-            raise BurnError("supplied adapter does not implement a verified Writer (writer_verified=True)")
+            raise BurnError(
+                "supplied adapter does not have write capability armed (write_enabled=True / writer_verified=True)"
+            )
 
     def _render_header(self) -> None:
         plan_info = self.s.plan_path or "not selected"
@@ -184,8 +186,8 @@ class BurnMenu:
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
         self.show("   [5] Dry-Run Burn Preview (passive preflight + row plan, NO writes)")
-        self.show("   [6] Burn Plan — Single Window (test row -> CONTINUE SAME WINDOW -> real)")
-        self.show("   [7] Burn Plan — Split Window (test only, or real with receipt)")
+        self.show("   [6] Burn Plan — Interactive (no-op test first, pause/stop by functional block)")
+        self.show("   [7] Burn Plan — By Stage (no-op test only, or real records with test receipt)")
         self.show("   [8] Configure Manual Overrides (granular, audited)")
         self.show("   [9] Manual Low-Level Console (read rows/regs/fields, diff, single write)")
         self.show("  [10] Decode Any 32-Bit FF Word (offline)")
@@ -442,11 +444,11 @@ class BurnMenu:
     def _menu_burn_single_window(self) -> None:
         self._run_burn_stage("all", receipt=None, max_records=None)
 
-    # ------------------------------------------------------------------ [7] Split-Window Burn
+    # ------------------------------------------------------------------ [7] Burn Plan By Stage
     def _menu_burn_split(self) -> None:
-        self.show("\n--- [7] Split-Window Burn ---")
-        self.show("  [1] Stage 'test' (burn ONLY the first/test record, then stop)")
-        self.show("  [2] Stage 'real' (burn real records; requires cold-verified test receipt)")
+        self.show("\n--- [7] Burn Plan By Stage ---")
+        self.show("  [1] Stage 'test' (burn ONLY the no-op test record, then stop)")
+        self.show("  [2] Stage 'real' (burn real records; requires cold-verified test receipt unless overridden)")
         pick = self.input_fn("Choose [1-2, Enter to cancel]: ").strip()
         if pick == "1":
             self._run_burn_stage("test", receipt=None, max_records=None)
@@ -499,11 +501,14 @@ class BurnMenu:
             self.show(f"  [5] Allow VOUT outside stock +/- tol          : {'ON' if ov.vout_range else 'OFF'}")
             self.show(f"  [6] Override undetermined/exceeded SM ceiling : {'ON' if ov.undetermined_ceiling else 'OFF'}")
             self.show(f"  [7] Manual-only: allow DEBUGCTRL target       : {'ON' if ov.allow_manual_debugctrl else 'OFF'}")
+            self.show(f"  [8] Allow baseline FF prefix mismatch/absent  : {'ON' if ov.baseline_mismatch else 'OFF'}")
+            self.show(f"  [9] Allow unknown/unmapped FF & missing mask  : {'ON' if ov.unmapped_ff else 'OFF'}")
             self.show("  [r] Reset ALL overrides to strict defaults")
             self.show("  [0] Back to main menu")
             self.show("  (Never overrideable: aligned 32-bit stores, no nvidia/nouveau, Die ID, rows 222..486,")
-            self.show("   IFF bit 5=0, blank slot, genuine defects, hard 400..1500mV, read-back & post-write gate.)")
-            pick = self.input_fn("Toggle [1-7, r, 0]: ").strip().lower()
+            self.show("   IFF bit 5=0, blank slot, known genuine defects, PCIe device-ID c2/b37-38,")
+            self.show("   hard 400..1500mV, read-back & post-write gate.)")
+            pick = self.input_fn("Toggle [1-9, r, 0]: ").strip().lower()
             if pick in ("0", ""):
                 return
             if pick == "1":
@@ -524,6 +529,10 @@ class BurnMenu:
                 self.s.overrides = replace(ov, undetermined_ceiling=not ov.undetermined_ceiling)
             elif pick == "7":
                 self.s.overrides = replace(ov, allow_manual_debugctrl=not ov.allow_manual_debugctrl)
+            elif pick == "8":
+                self.s.overrides = replace(ov, baseline_mismatch=not ov.baseline_mismatch)
+            elif pick == "9":
+                self.s.overrides = replace(ov, unmapped_ff=not ov.unmapped_ff)
             elif pick == "r":
                 self.s.overrides = Overrides()
                 self.show("All manual overrides reset to OFF.")

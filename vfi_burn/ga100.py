@@ -13,15 +13,18 @@ NEVER struct.pack_into). DEBUGCTRL (0x00820060) is never written.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import mmap
 import os
 from pathlib import Path
 import re
+import stat
 import struct
 import time
 
 from .backend import Health, Host
 from .ffrecord import (
+    DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FF_EMPTY_WORD,
     FF_ROW_MAX,
@@ -754,7 +757,14 @@ class GA100FuseController:
         except Exception:
             pass
 
-    def program_row(self, row: int, word: int, *, timeout_s: float = 10.0) -> int:
+    def program_row(
+        self,
+        row: int,
+        word: int,
+        *,
+        timeout_s: float = 10.0,
+        pre_trigger_check=None,
+    ) -> int:
         """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions.
 
         Every failure before CMD_PROGRAM is raised as ``PreTriggerRefusal`` (nothing burned).
@@ -770,7 +780,12 @@ class GA100FuseController:
                     f"REFUSED: row {row} is outside the FF region {FF_ROW_MIN}..{FF_ROW_MAX} "
                     "(rows 0..221 are regular/control/FPF; 487..511 are IFF)"
                 )
-            decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
+            ff = decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
+            if (ff.chain, ff.block) in DEVICE_ID_DENIED_BLOCKS:
+                raise BurnError(
+                    f"REFUSED: FF word 0x{word:08x} targets read-only PCIe device-ID block "
+                    f"(chain {ff.chain} block {ff.block})"
+                )
             if is_poison(word):
                 raise BurnError(f"REFUSED: payload 0x{word:08x} matches poison prefix")
 
@@ -795,6 +810,23 @@ class GA100FuseController:
                     f"FUSEWDATA readback mismatch before CMD_PROGRAM: "
                     f"wrote 0x{word:08x}, read 0x{rb_wdata:08x} (PLM_f4 blocked?)"
                 )
+
+            # Final pre-trigger gate: closes TOCTOU between arm/staging and CMD_PROGRAM.
+            final_problems = self.armed_problems()
+            if final_problems:
+                raise BurnError(
+                    "final pre-trigger controller gate failed: " + "; ".join(final_problems)
+                )
+            if self.rd(REG_FUSEADDR) != row:
+                raise BurnError(
+                    f"FUSEADDR drifted before CMD_PROGRAM (reads 0x{self.rd(REG_FUSEADDR):08x}, want {row})"
+                )
+            if self.rd(REG_FUSEWDATA) != word:
+                raise BurnError(
+                    f"FUSEWDATA drifted before CMD_PROGRAM (reads 0x{self.rd(REG_FUSEWDATA):08x}, want 0x{word:08x})"
+                )
+            if pre_trigger_check is not None:
+                pre_trigger_check()
         except PreTriggerRefusal:
             if staged:
                 self._relatch_no_burn(orig_addr)
@@ -823,12 +855,84 @@ class GA100FuseController:
         return got
 
 
+def _default_bdf_lock_dir() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        rt_path = Path(runtime)
+        if rt_path.is_dir() and not rt_path.is_symlink() and os.access(rt_path, os.W_OK):
+            return rt_path / "vfi_burn"
+    return Path.home() / ".local" / "state" / "vfi_burn"
+
+
+class BDFLock:
+    """Exclusive non-blocking per-PCI-BDF lock preventing concurrent sessions on the same GPU."""
+
+    def __init__(self, bdf: str, *, lock_dir: str | Path | None = None) -> None:
+        self.bdf = normalize_bdf(bdf)
+        base = Path(lock_dir) if lock_dir is not None else _default_bdf_lock_dir()
+        if base.is_symlink():
+            raise BurnError(f"refusing symlink BDF lock directory: {base}")
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if base.stat().st_mode & 0o077:
+            raise BurnError(
+                f"BDF lock directory not private (must be mode 0700): {base} — run: chmod 700 {base}"
+            )
+        safe_name = self.bdf.replace(":", "_")
+        self.path = base / f"bdf_{safe_name}.lock"
+        if self.path.is_symlink():
+            raise BurnError(f"refusing symlink BDF lock file: {self.path}")
+        self.fd: int | None = os.open(
+            self.path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            if stat.S_IMODE(os.fstat(self.fd).st_mode) != 0o600:
+                raise BurnError(f"BDF lock file is not mode 0600: {self.path}")
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise BurnError(
+                    f"PCI device {self.bdf} is already locked by another vfi_burn process "
+                    f"({self.path}); never run concurrent sessions on the same GPU"
+                ) from exc
+            try:
+                os.ftruncate(self.fd, 0)
+                os.write(self.fd, f"pid={os.getpid()} bdf={self.bdf}\n".encode("ascii"))
+            except OSError:
+                pass
+        except Exception:
+            os.close(self.fd)
+            self.fd = None
+            raise
+
+    def release(self) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __enter__(self) -> "BDFLock":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.release()
+
+
 class GA100LiveAdapter:
     """Linux live hardware adapter for CMP 170HX 8 GB (10de:20c2) via sysfs BAR0 + optional Pico PMBus.
 
     Read-only by default (``writable=False``). When ``writable=True`` is requested by
-    ``burn --execute`` or ``manual write-record --execute``, sets ``writer_verified = True``
-    and enables ``write_one_record`` through ``GA100FuseController.program_row``.
+    ``burn --execute`` or ``manual write-record --execute``, sets ``write_enabled = True``
+    (and legacy alias ``writer_verified = True``) to arm ``write_one_record`` through
+    ``GA100FuseController.program_row``. This reflects operator write permission, NOT
+    independent hardware bench certification.
     """
 
     simulation = False
@@ -841,53 +945,60 @@ class GA100LiveAdapter:
         writable: bool = False,
         assume_vout_mv: float | None = None,
         assume_hold_active: bool = False,
+        lock_dir: str | Path | None = None,
     ) -> None:
         self.bdf = normalize_bdf(bdf)
         self.pico_port = pico_port
         self.writable = bool(writable)
-        self.writer_verified = bool(writable)
+        self.write_enabled = bool(writable)
+        self.writer_verified = bool(writable)  # legacy alias; means write mode enabled, not bench-certified
         self.assume_vout_mv = assume_vout_mv
         self.assume_hold_active = assume_hold_active
+        self._bdf_lock: BDFLock | None = None
+        self._card = None
+        self._fd: int | None = None
+        self._mm = None
+
         self._sysfs = Path("/sys/bus/pci/devices") / self.bdf
         if not self._sysfs.exists():
             raise BurnError(f"PCI device not found in sysfs: {self._sysfs}")
 
-        self._card = None
-        if self.pico_port:
-            self._card = self._open_pico(self.pico_port)
-            # Check rail over I2C BEFORE opening BAR0 or reading PCI config space.
-            _, vout_mv, _ = self._read_pmbus_rail()
-            if vout_mv < HEALTHY_RAIL_MIN_MV:
-                self._close_pico()
+        self._bdf_lock = BDFLock(self.bdf, lock_dir=lock_dir)
+        try:
+            if self.pico_port:
+                self._card = self._open_pico(self.pico_port)
+                # Check rail over I2C BEFORE opening BAR0 or reading PCI config space.
+                _, vout_mv, _ = self._read_pmbus_rail()
+                if vout_mv < HEALTHY_RAIL_MIN_MV:
+                    raise BurnError(
+                        f"rail at {vout_mv:.1f} mV (brown-out/latch): refusing to touch PCI config or BAR0"
+                    )
+
+            # Verify PCI config memory decode is on before mapping BAR0.
+            cfg = self._read_pci_config()
+            if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
+                raise BurnError("PCI config space reads 0xFFFFFFFF (link down); park/power-cycle card")
+            cmd = struct.unpack_from("<H", cfg, 4)[0]
+            if (cmd & 0x0002) == 0:
                 raise BurnError(
-                    f"rail at {vout_mv:.1f} mV (brown-out/latch): refusing to touch PCI config or BAR0"
+                    f"PCI memory decode is off (COMMAND=0x{cmd:04x}); "
+                    f"enable with: sudo setpci -s {self.bdf} COMMAND=0x0002:0x0002"
                 )
 
-        # Verify PCI config memory decode is on before mapping BAR0.
-        cfg = self._read_pci_config()
-        if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
-            self._close_pico()
-            raise BurnError("PCI config space reads 0xFFFFFFFF (link down); park/power-cycle card")
-        cmd = struct.unpack_from("<H", cfg, 4)[0]
-        if (cmd & 0x0002) == 0:
-            self._close_pico()
-            raise BurnError(
-                f"PCI memory decode is off (COMMAND=0x{cmd:04x}); "
-                f"enable with: sudo setpci -s {self.bdf} COMMAND=0x0002:0x0002"
-            )
-
-        res0 = self._sysfs / "resource0"
-        self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
-        try:
+            res0 = self._sysfs / "resource0"
+            self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
             self._mm = mmap.mmap(
                 self._fd, BAR0_MAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
             )
+            self._mmio = AlignedMMIO(self._mm)
+            self.controller = GA100FuseController(self._mmio, read_only=not self.writable)
         except Exception:
-            os.close(self._fd)
-            self._close_pico()
+            self.close()
             raise
-        self._mmio = AlignedMMIO(self._mm)
-        self.controller = GA100FuseController(self._mmio, read_only=not self.writable)
+
+    @property
+    def rail_telemetry_live(self) -> bool:
+        return self._card is not None
 
     @staticmethod
     def _open_pico(port: str):
@@ -903,7 +1014,7 @@ class GA100LiveAdapter:
         return Card(port)
 
     def _close_pico(self) -> None:
-        if self._card is not None:
+        if getattr(self, "_card", None) is not None:
             try:
                 self._card.close()
             except Exception:
@@ -924,6 +1035,9 @@ class GA100LiveAdapter:
                 pass
             self._fd = None
         self._close_pico()
+        if getattr(self, "_bdf_lock", None) is not None:
+            self._bdf_lock.release()
+            self._bdf_lock = None
 
     def __enter__(self) -> "GA100LiveAdapter":
         return self
@@ -1028,10 +1142,28 @@ class GA100LiveAdapter:
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
+    def _pre_trigger_rail_check(self) -> None:
+        if self._card is None:
+            return
+        e1, vout_mv, status_word = self._read_pmbus_rail()
+        if e1 != E1_PMBUS_HELD:
+            raise BurnError(
+                f"live PMBus hold lost before CMD_PROGRAM (E1=0x{e1:04x}, expected 0x{E1_PMBUS_HELD:04x})"
+            )
+        if vout_mv < HEALTHY_RAIL_MIN_MV:
+            raise BurnError(
+                f"live rail collapse before CMD_PROGRAM ({vout_mv:.1f} mV < {HEALTHY_RAIL_MIN_MV} mV)"
+            )
+        if status_word == 0x2042 or (status_word & 0x8840):
+            raise BurnError(
+                f"live PMBus critical fault before CMD_PROGRAM (STATUS_WORD=0x{status_word:04x})"
+            )
+
     def write_one_record(self, row: int, word: int) -> None:
         if not self.writable:
             raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
-        self.controller.program_row(row, word)
+        check_cb = self._pre_trigger_rail_check if self._card is not None else None
+        self.controller.program_row(row, word, pre_trigger_check=check_cb)
 
     def capture_cold_snapshot(
         self,
@@ -1068,7 +1200,15 @@ class GA100LiveAdapter:
             val = self.field(fname)
             fields[fname] = val if fname == "SM_COUNT" else f"0x{val:08x}"
         experimental_registers: dict[str, str] = {}
-        if not is_poison(self.controller.rd(REG_FUSECTRL)):
+        controller_state: dict[str, str] = {}
+        ctrl_now = self.controller.rd(REG_FUSECTRL)
+        if not is_poison(ctrl_now):
+            controller_state = {
+                "fusectrl": f"0x{ctrl_now:08x}",
+                "dsov": f"0x{self.controller.rd(REG_DSOV_STATUS):08x}",
+                "en_sw": f"0x{self.controller.rd(REG_EN_SW_OVERRIDE):08x}",
+                "plm_f8": f"0x{self.controller.rd(REG_PLM_F8):08x}",
+            }
             for exp in EXPERIMENTAL_INSPECT_REGS:
                 try:
                     experimental_registers[exp.name] = f"0x{self.controller.rd(exp.address):08x}"
@@ -1082,5 +1222,6 @@ class GA100LiveAdapter:
             "die_rows": die_rows,
             "fpf_rows": fpf_rows,
             "fields": fields,
+            "controller_state": controller_state,
             "experimental_registers": experimental_registers,
         }
