@@ -75,6 +75,7 @@ tests/
   test_cli_console.py  # CLI, faulted-card read diagnostics, dry-run, interactive console tests
   test_menu.py         # High-level interactive menu workflow, Live Execute guard & CLI entry tests
 examples/              # Synthetic-only example plan/fake/cold files (NEVER put real die IDs here)
+docs/screenshots/      # Terminal screenshots captured in offline simulation mode
 BURN_SPEC.md           # Original design spec and safety invariants
 adapter_template.py    # Template for custom hardware adapters
 ```
@@ -106,6 +107,23 @@ sudo python3 -m vfi_burn menu \
 The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JSONL journal, and typed confirmations:
 - **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6]` Single-Window `--stage all` or `[7]` Split-Window) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
 - **Full end-to-end bench flow in one place**: `[1]` Setup / import `cmp170hx-ffcalc` plan, `[2]` Offline Plan Review, `[3]` Live Status & Passive Inspection, `[4]` Active Sense (`SENSE_CTRL`), `[5]` Passive Dry-Run Preview, `[6]` Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records), `[7]` Split-Window Burn, `[8]` Granular Manual Overrides, `[9]` Manual Low-Level Console, `[10]` Offline FF Word Decoder, `[11]` Cold-Boot Snapshot & Verify.
+
+### Walkthrough Screenshots (Offline Simulation Mode)
+
+> All screenshots below were captured offline against synthetic [`examples/`](examples/) fixtures (no physical GPU contacted).
+
+#### 1. Main Menu & Live Status Header
+![vfi_burn Main Interactive Menu](docs/screenshots/01-main-menu.png)
+
+#### 2. `[3]` Live Status, Passive Health Gates & Free-Slot Proof
+![vfi_burn Live Status and Passive Inspection](docs/screenshots/02-status-inspect.png)
+
+#### 3. `[6]` Single-Window Burn (`--stage all`) With `CONTINUE SAME WINDOW` Checkpoint
+On live hardware (`--execute`), each record additionally requires typing the exact row and hex word (`YES <row> <0xword>`), plus `SENSE` before `SENSE_CTRL`.
+![vfi_burn Single-Window Burn Walkthrough](docs/screenshots/03-single-window-burn.png)
+
+#### 4. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
+![vfi_burn Manual Overrides and FF Word Decoder](docs/screenshots/04-overrides-and-decode.png)
 
 ---
 
