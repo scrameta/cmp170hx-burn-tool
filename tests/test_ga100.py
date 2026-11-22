@@ -243,7 +243,7 @@ class TestGA100Controller(unittest.TestCase):
         with self.assertRaises(BurnError):
             normalize_bdf("not-a-bdf")
         self.assertTrue(is_fusectrl_idle(0xE0040000))
-        self.assertFalse(is_fusectrl_idle(0xE00C0000))  # WRITE_PROGRAM state=3
+        self.assertFalse(is_fusectrl_idle(0xE00C0000))  # PROGRAM busy, state field 0xC
         self.assertFalse(is_fusectrl_idle(0xBADF510E))
 
         # Build synthetic 256-byte PCIe config space with Cap ID 0x10 at 0x60 and LnkCap2 at 0x8C.
