@@ -16,6 +16,13 @@ from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, MMIOBus, MMIO
 from .menu import BurnMenu, MenuSession
 from .mmio import AlignedMMIO, ReadOnlyMMIO
 from .model import BurnError, Plan, Record
+from .sim_pcie import (
+    PCIeTransaction,
+    SimulatedGA100Adapter,
+    SimulatedGA100PCIe,
+    TracingMMIOBus,
+    trace_hal_program_sequence,
+)
 
 __version__ = "0.3.0"
 
@@ -47,9 +54,13 @@ __all__ = [
     "MenuSession",
     "MissingWriter",
     "Overrides",
+    "PCIeTransaction",
     "Plan",
     "ReadOnlyMMIO",
     "Record",
+    "SimulatedGA100Adapter",
+    "SimulatedGA100PCIe",
+    "TracingMMIOBus",
     "check_health",
     "check_plan",
     "decode_ff",
@@ -62,4 +73,5 @@ __all__ = [
     "replay_ff_rows",
     "scan_slots",
     "simulate_ff_write",
+    "trace_hal_program_sequence",
 ]
