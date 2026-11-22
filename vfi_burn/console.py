@@ -31,8 +31,10 @@ from .ffrecord import (
     compute_sm_count,
     decode_all_fields,
     decode_ff,
+    decode_present_fields,
     replay_ff_rows,
 )
+from .fuse_rules import evaluate_fuse_combinations
 from .fuses import (
     EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
     EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
@@ -434,6 +436,8 @@ def format_plan_review(
 
     if sim_blocks is not None:
         after_ff_fields = decode_all_fields(sim_blocks)
+        for issue in evaluate_fuse_combinations(decode_present_fields(sim_blocks)):
+            audit_warnings.append(f"[COMBINATION/{issue.rule_id}] {issue.message}")
 
     # ------------------------------------------------------------------ 4. Expected Outcome (Enabled / Disabled)
     lines.append("")

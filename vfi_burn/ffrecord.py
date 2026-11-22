@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
+from .fuse_rules import evaluate_fuse_combinations
 from .fuses import (
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
@@ -304,6 +305,16 @@ def decode_all_fields(blocks_by_chain: dict[int, dict[int, int]]) -> dict[str, i
     return {f.key: get_bits(blocks_by_chain, f.chain, f.bit, f.width) for f in OPTION_FIELDS}
 
 
+def decode_present_fields(blocks_by_chain: dict[int, dict[int, int]]) -> dict[str, int]:
+    """Decode only option fields whose backing FF block(s) are all present in ``blocks_by_chain``."""
+    out: dict[str, int] = {}
+    for f in OPTION_FIELDS:
+        chain_blocks = blocks_by_chain.get(f.chain, {})
+        if all(b in chain_blocks for b in f.blocks):
+            out[f.key] = get_bits(blocks_by_chain, f.chain, f.bit, f.width)
+    return out
+
+
 def simulate_ff_write(
     current_rows: dict[int, int],
     row: int,
@@ -537,14 +548,18 @@ def evaluate_poweroff_sanity(
             errors.append(
                 f"LIVE REPLAY SM COUNT {sm_count} exceeds plan ceiling {ceiling}!"
             )
-        # Internal compute sanity: warn if an enabled GPC has all 8 TPCs disabled.
-        gpc_dis = live_fields["gpc_disable"]
+
+    # 2b. Declarative cross-fuse combination & coherence rules (compute / memory / PCIe).
+    present_fields = decode_present_fields(live_blocks)
+    if "GPC_DISABLE" in plan.expected_masks and all(k in plan.expected_masks for k in tpc_keys):
+        present_fields.setdefault("gpc_disable", live_fields["gpc_disable"])
         for i in range(TOTAL_GPC):
-            if not ((gpc_dis >> i) & 1) and (live_fields[f"tpc_gpc{i}_disable"] & 0xFF) == 0xFF:
-                warnings.append(
-                    f"GPC{i} is enabled in GPC_DISABLE (0x{gpc_dis:02x}) but all 8 TPCs "
-                    f"in TPC_GPC{i}_DISABLE are disabled (0xff)."
-                )
+            present_fields.setdefault(f"tpc_gpc{i}_disable", live_fields[f"tpc_gpc{i}_disable"])
+    for issue in evaluate_fuse_combinations(present_fields):
+        if issue.severity == "error":
+            errors.append(issue.message)
+        else:
+            warnings.append(issue.message)
 
     # 3. Functional-group boundary check between committed and remaining planned records.
     if baseline_blocks is not None:
