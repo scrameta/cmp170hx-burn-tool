@@ -77,165 +77,29 @@ tests/
   test_cli_console.py  # CLI, faulted-card read diagnostics, dry-run, interactive console tests
   test_menu.py         # High-level interactive menu workflow, Live Execute guard & CLI entry tests
 examples/              # Synthetic-only example plan/fake/cold files (NEVER put real die IDs here)
-docs/FUSE_CONTROLLER.md # How the GA100 fuse controller works (state machines + programming sequence)
-docs/screenshots/      # Terminal screenshots captured in offline simulation mode
+docs/
+  menu_driven.md       # Interactive menu guide & offline screenshot walkthrough
+  cmd_line.md          # Command-line reference, offline simulation & live bench workflow
+  FUSE_CONTROLLER.md   # How the GA100 fuse controller works (state machines + programming sequence)
+  screenshots/         # Terminal screenshots captured in offline simulation mode
 BURN_SPEC.md           # Original design spec and safety invariants
 adapter_template.py    # Template for custom hardware adapters
 ```
 
 ---
 
-## Interactive Menu Interface (Recommended for Bench Use)
+## Usage & Documentation
 
-Running `vfi_burn` with **no arguments** (or with `menu` plus optional pre-filled flags) launches a plain numbered menu designed for SSH/serial/tmux sessions (no fragile `curses`, full scrollback preserved):
+`vfi_burn` provides two interfaces over the same fail-closed engine, safety gates, and `fsync`ed JSONL audit journal:
 
-```bash
-# Launch empty menu and configure everything interactively:
-python3 -m vfi_burn
-
-# Launch pre-loaded for offline simulation (no GPU touched):
-python3 -m vfi_burn menu \
-  --plan private/plan.json \
-  --fake private/fake.json \
-  --journal private/session.jsonl
-
-# Launch pre-loaded for a live bench session (starts in LIVE READ-ONLY / DRY-RUN mode):
-sudo python3 -m vfi_burn menu \
-  --plan private/plan.json \
-  --bdf 0000:05:00.0 \
-  --port /dev/ttyACM0 \
-  --journal private/session.jsonl
-```
-
-The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JSONL journal, and typed confirmations:
-- **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6]` Single-Window `--stage all` or `[7]` Split-Window) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
-- **Full end-to-end bench flow in one place**: `[1]` Setup / import `cmp170hx-ffcalc` plan, `[2]` Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit), `[3]` Live Status & Passive Inspection, `[4]` Active Sense (`SENSE_CTRL`), `[5]` Passive Dry-Run Preview, `[6]` Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records), `[7]` Split-Window Burn, `[8]` Granular Manual Overrides, `[9]` Manual Low-Level Console, `[10]` Offline FF Word Decoder, `[11]` Cold-Boot Snapshot & Verify.
-
-### Walkthrough Screenshots (Offline Simulation Mode)
-
-> All screenshots below were captured offline against synthetic fixtures (no physical GPU contacted).
-
-#### 1. Main Menu & Live Status Header
-![vfi_burn Main Interactive Menu](docs/screenshots/01-main-menu.png)
-
-#### 2. `[2]` Review Plan & Expected Outcome (Enabled/Disabled, Unknown Fuses, FF Rows Taken & Remaining)
-Shows exact FF rows used/taken/remaining, what compute/PCIe/feature units are being enabled or disabled (with defect masks preserved), and flags any unknown FF blocks, unmapped bits, or experimental/untested fields before you ever touch a burn command.
-![vfi_burn Review Plan and Expected Outcome](docs/screenshots/02-review-plan.png)
-
-#### 3. `[3]` Live Status, Passive Health Gates & Free-Slot Proof
-![vfi_burn Live Status and Passive Inspection](docs/screenshots/03-status-inspect.png)
-
-#### 4. `[6]` Single-Window Burn (`--stage all`) With `CONTINUE SAME WINDOW` Checkpoint
-On live hardware (`--execute`), each record additionally requires typing the exact row and hex word (`YES <row> <0xword>`), plus `SENSE` before `SENSE_CTRL`.
-![vfi_burn Single-Window Burn Walkthrough](docs/screenshots/04-single-window-burn.png)
-
-#### 5. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
-![vfi_burn Manual Overrides and FF Word Decoder](docs/screenshots/05-overrides-and-decode.png)
-
-#### 6. `[9]` Manual Low-Level Console — Fuse Controller State, Exact PCIe BAR0 Writes & Staged `preview` → `apply`
-Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the complete decoded GA100 fuse controller state (`FUSECTRL`, `DEBUGCTRL`, `CRC`, `DSOV`, `EFP/DFP/RESENSE_DIS`, `EN_SW/SBFE/WDATA_WR_SEC`, `PLM_f4/f8/fc`, VRM rail, host hold) and the exact ordered 32-bit aligned PCIe BAR0 MMIO writes — and **stage** that exact write so you simply type `apply` (no arguments, zero risk of re-typing typos; still gated by row/word confirmation & read-back) or `clear` to discard.
-![vfi_burn Manual Console Fuse State and Exact PCIe BAR0 Writes](docs/screenshots/06-manual-console-writes.png)
+- **[Interactive Menu Guide (`docs/menu_driven.md`)](docs/menu_driven.md)** *(recommended for bench use)* — SSH/serial/tmux-friendly numbered menu (`python3 -m vfi_burn` or `python3 -m vfi_burn menu`), read-only by default on live hardware, covering plan import/review, live status, active sense, dry-run preview, single-window (`--stage all`) and split-window burns, overrides, the staged `preview` → `apply` manual console, FF word decoding, and cold-boot verification, complete with an offline screenshot walkthrough.
+- **[Command-Line Interface (`docs/cmd_line.md`)](docs/cmd_line.md)** — scriptable subcommands (`plan`, `decode`, `import-ffcalc`, `snapshot`, `inspect`, `burn`, `simulate`, `manual`, `verify-cold`), offline simulation examples, step-by-step live hardware bench workflow, and low-level `manual` diagnostics/console commands.
+- **[GA100 Fuse Controller Reference (`docs/FUSE_CONTROLLER.md`)](docs/FUSE_CONTROLLER.md)** — register map, `FUSECTRL` command FSM, locked → Goldilocks → sensed → armed security state machine, and read/sense/arm/program sequence diagrams.
+- **[Design Specification (`BURN_SPEC.md`)](BURN_SPEC.md)** — original design specification and safety invariants.
 
 ---
 
-## Offline Verification & Simulation (Safe — No GPU Touched)
-
-```bash
-# Run the full offline test suite (103 tests):
-python3 -m unittest discover -s tests -v
-
-# Set up a private mode-0700 working directory:
-mkdir -m 700 -p private
-cp examples/plan.example.json private/plan.json
-cp examples/fake.example.json private/fake.json
-cp examples/cold.example.json private/cold.json
-chmod 600 private/*.json
-
-# Decode any 32-bit GA100 FF record word:
-python3 -m vfi_burn decode 0x0fe805c1
-
-# Review a plan offline:
-python3 -m vfi_burn plan --plan private/plan.json
-
-# Inspect and simulate Stage 1 (test row) -> cold verify -> Stage 2 (real):
-python3 -m vfi_burn inspect --plan private/plan.json --fake private/fake.json --sense --journal private/session.jsonl
-python3 -m vfi_burn simulate --plan private/plan.json --fake private/fake.json --stage test --journal private/session.jsonl --save-fake private/after-test.json
-python3 -m vfi_burn verify-cold --plan private/plan.json --cold private/cold.json --stage test --journal private/session.jsonl --receipt-out private/test.receipt
-python3 -m vfi_burn simulate --plan private/plan.json --fake private/after-test.json --stage real --receipt private/test.receipt --journal private/session.jsonl --save-fake private/after-real.json
-```
-
----
-
-## Bench Workflow (Live Hardware — Untested, Proceed With Extreme Caution)
-
-```bash
-# 1. Import a cmp170hx-ffcalc plan + 512-row card dump (prepends a safe no-op test row):
-python3 -m vfi_burn import-ffcalc \
-  --burn-plan private/card.burn.json \
-  --dump private/card.dump.json \
-  --base-sm <YOUR_REVIEWED_SM_CEILING> \
-  --prepend-noop-test \
-  --out private/plan.json
-#   --base-sm is REQUIRED (operator/community knowledge, e.g. 122; the card cannot supply it).
-#   Optionally pass --link-cap2-before/--link-cap2-after with values you read from your card.
-#   The importer refuses stale/partial dumps, non-contiguous or colliding rows, wrong `old`
-#   values, and dumps whose fused masks disagree with the FF replay.
-
-# 2. Review every decoded record, die ID row (8..15), and defect mask offline:
-python3 -m vfi_burn plan --plan private/plan.json
-
-# 3. After holding a Goldilocks frame with your glitcher, inspect (passive first):
-sudo python3 -m vfi_burn inspect --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 --journal private/session.jsonl
-
-# 4. Passive dry-run preview (does NOT run SENSE_CTRL or write fuses):
-sudo python3 -m vfi_burn burn --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --stage all --journal private/session.jsonl
-
-# 5A. SINGLE-WINDOW BURN (recommended when re-glitching is slow/hard — keeps your glitch!):
-#     - Runs SENSE_CTRL once (prompts 'SENSE'), burns the no-op test row first and verifies
-#       read-back + CRC=0x55 + PLM/VRM health.
-#     - Then pauses at an explicit checkpoint: type 'CONTINUE SAME WINDOW' to burn the real
-#       records in the same Goldilocks window (confirming each record with 'YES <row> <0xword>'),
-#       OR press Enter to stop cleanly and cold-boot verify the test row first.
-#     IMPORTANT: Burn all SM/HBM records (GPC/TPC/PES/FBP/FBPA/FBIO/ROP_L2) in ONE window;
-#     do NOT power-cycle with SMs unlocked while PES/ROP_L2 remain masked (GSP boot will fail).
-sudo python3 -m vfi_burn burn --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --stage all --journal private/session.jsonl --execute
-
-# 5B. OPTIONAL SPLIT-WINDOW BURN (if your card re-glitches easily and you want a cold boot
-#     after the test row before touching real unlock records):
-#   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
-#     --port /dev/ttyACM0 --stage test --journal private/session.jsonl --execute
-#   # Cold power-cycle (~30 s off), then snapshot + verify-cold --stage test --receipt-out private/test.receipt
-#   # Re-glitch to Goldilocks, then run:
-#   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
-#     --port /dev/ttyACM0 --stage real --receipt private/test.receipt \
-#     --journal private/session.jsonl --execute
-
-# 6. Cold power-cycle (~30 s off), capture final cold snapshot, and verify:
-sudo setpci -s 0000:05:00.0 COMMAND=0x0002:0x0002   # only if BAR0 reads 0xFFFFFFFF
-sudo python3 -m vfi_burn snapshot --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --previous-boot-id <BOOT_ID_FROM_JOURNAL> --out private/cold-final.json
-python3 -m vfi_burn verify-cold --plan private/plan.json \
-  --cold private/cold-final.json --stage real --journal private/session.jsonl
-```
-
-> **Without a Pico `--port`**: omit `--port` and pass `--assume-vout-mv 787.5` after verifying stock NVVDD externally.
-
----
-
-## Manual Console & Overrides
-
-Read-only manual commands (`status`, `read-row`, `read-rows`, `read-reg`, `read-field`, `console`) work even on cold, poisoned, or latched cards (refusing only if `nvidia`/`nouveau` is loaded/bound):
-
-```bash
-sudo python3 -m vfi_burn manual --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --journal private/session.jsonl console
-```
+## Safety Model
 
 ### Hard Invariants (NEVER overrideable)
 - Single aligned 32-bit MMIO stores (`AlignedMMIO`); `DEBUGCTRL` never written implicitly
