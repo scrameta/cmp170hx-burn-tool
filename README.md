@@ -52,6 +52,8 @@ Key protocol details implemented:
 - **Single-Record Program (`CMD_PROGRAM = 2`)**:
   - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/PMBus/host gate → second `CMD_READ`.
 
+For a full walkthrough of the fuse controller (register map, `FUSECTRL` command state machine, the locked → Goldilocks → sensed → armed security state machine, and sequence diagrams for read / sense / arm / program), see [`docs/FUSE_CONTROLLER.md`](docs/FUSE_CONTROLLER.md).
+
 ---
 
 ## Repository Layout
@@ -75,6 +77,7 @@ tests/
   test_cli_console.py  # CLI, faulted-card read diagnostics, dry-run, interactive console tests
   test_menu.py         # High-level interactive menu workflow, Live Execute guard & CLI entry tests
 examples/              # Synthetic-only example plan/fake/cold files (NEVER put real die IDs here)
+docs/FUSE_CONTROLLER.md # How the GA100 fuse controller works (state machines + programming sequence)
 docs/screenshots/      # Terminal screenshots captured in offline simulation mode
 BURN_SPEC.md           # Original design spec and safety invariants
 adapter_template.py    # Template for custom hardware adapters
