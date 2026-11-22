@@ -72,7 +72,7 @@ On live hardware (`--execute`), each record additionally requires typing the exa
 ![vfi_burn Single-Window Burn Walkthrough](screenshots/04-single-window-burn.png)
 
 ### 5. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
-See the [README's Safety Model](../README.md#granular-manual-overrides-no-blanket---force) for the full list of overrides and their typed confirmation phrases.
+See [`cmd_line.md`](cmd_line.md#granular-manual-overrides-no-blanket---force) for the full list of granular overrides and their typed confirmation phrases.
 ![vfi_burn Manual Overrides and FF Word Decoder](screenshots/05-overrides-and-decode.png)
 
 ### 6. `[9]` Manual Low-Level Console — Fuse Controller State, Exact PCIe BAR0 Writes & Staged `preview` → `apply`
