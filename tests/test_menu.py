@@ -214,6 +214,134 @@ class TestBurnMenu(unittest.TestCase):
             self.assertIn("vfi_burn — CMP 170HX 8 GB FF Fuse-Burn Safety Controller", out.getvalue())
             self.assertIn("Exiting vfi_burn menu.", out.getvalue())
 
+    def test_plan_review_outcome_unknown_fuses_and_ff_row_capacity(self):
+        from vfi_burn.ffrecord import analyze_ff_block, encode_ff
+
+        # 1. Verify analyze_ff_block distinguishes well-known Gen4 bit vs experimental magic_d bits
+        # Chain 2 block 47 bit 3 is pcie_magic_gen4_dis (well understood); bit 4 is experimental magic_d.
+        clean_gen4 = analyze_ff_block(2, 47, 0x0000, old_data=0x0008)
+        self.assertEqual(clean_gen4["warnings"], [])
+        exp_magic = analyze_ff_block(2, 47, 0x0010, old_data=0x0000)
+        self.assertTrue(any("EXPERIMENTAL" in w for w in exp_magic["warnings"]))
+
+        # Unmapped bit 371 in chain 1 block 23 (bit 3 within block 23: between nvlink 368..370 and sys_pipe 372..379)
+        unmapped = analyze_ff_block(1, 23, 0x0008, old_data=0x0000)
+        self.assertIn(371, unmapped["changed_unmapped_bits"])
+        self.assertTrue(any("UNMAPPED" in w for w in unmapped["warnings"]))
+
+        # 2. Build a realistic synthetic GA100 FF plan + fake snapshot and test Menu [2] Review Plan
+        # Existing FF rows:
+        #   row 222: chain 1 block 8 (gpc_disable bits 131..138 -> bits 3..10 in blk 8) = 0x0428 (gpc_disable=0x85)
+        #   row 223: chain 2 block 47 (pcie_magic_gen4_dis bit 3) = 0x0008
+        #   row 224: chain 1 block 23 (nvlink 368..370 + unmapped 371 + sys_pipe 372..379) = 0x0ff7
+        w_gpc_old = encode_ff(1, 8, 0x0428)
+        w_pcie_old = encode_ff(2, 47, 0x0008)
+        w_sys_old = encode_ff(1, 23, 0x0FF7)
+
+        w_noop = encode_ff(1, 8, 0x0428)         # exact rewrite -> NO-OP
+        w_gpc_new = encode_ff(1, 8, 0x0420)      # clears GPC0 disable bit (0x85 -> 0x84)
+        w_pcie_new = encode_ff(2, 47, 0x0000)    # clears Gen4 disable bit only (well-understood)
+        w_sys_new = encode_ff(1, 23, 0x000F)     # clears sys_pipe_disable (experimental) + flips unmapped bit 371!
+        w_unknown = encode_ff(1, 99, 0x1234)     # unknown block not in GA100 option map
+
+        plan_dict = {
+            "schema_version": 1,
+            "card": {
+                "pci_id": "10de:20c2",
+                "die_rows": {str(i): f"0x100{i:x}" for i in range(8, 16)},
+                "expected_masks": {"GPC_DISABLE": "0x85"},
+                "defect_masks": {"GPC_DISABLE": "0x04"},
+            },
+            "fpf": {"first_row": 222, "last_row": 486, "empty_word": "0x00000000"},
+            "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
+            "ceiling": {"base_sm": 122, "override_sm": 128},
+            "records": [
+                {
+                    "name": "NOOP_TEST",
+                    "kind": "test",
+                    "target": "NOOP_CHAIN1_BLK8",
+                    "word": f"0x{w_noop:08x}",
+                    "decode": "No-op rewrite of chain 1 block 8",
+                    "defect_sensitive": False,
+                    "expected_cold": {"GPC_DISABLE": "0x85"},
+                },
+                {
+                    "name": "UNLOCK_GPC0",
+                    "kind": "regular",
+                    "target": "GPC_DISABLE",
+                    "word": f"0x{w_gpc_new:08x}",
+                    "decode": "Enable GPC0 (0x85 -> 0x84)",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "GPC_DISABLE", "from": "0x85", "to": "0x84"},
+                    "resulting_sm_count": 112,
+                    "expected_cold": {"GPC_DISABLE": "0x84"},
+                },
+                {
+                    "name": "UNLOCK_PCIE_GEN4",
+                    "kind": "pcie",
+                    "target": "PCIE_GEN4",
+                    "word": f"0x{w_pcie_new:08x}",
+                    "decode": "Clear Gen4 disable flag",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x00000002",
+                    "link_cap2_after": "0x0000001e",
+                    "expected_cold": {},
+                },
+                {
+                    "name": "EXP_SYS_PIPE",
+                    "kind": "regular",
+                    "target": "SYS_PIPE_DISABLE",
+                    "word": f"0x{w_sys_new:08x}",
+                    "decode": "Enable sys_pipe (experimental) + bit 371",
+                    "defect_sensitive": False,
+                    "expected_cold": {},
+                },
+                {
+                    "name": "UNKNOWN_BLK99",
+                    "kind": "regular",
+                    "target": "UNKNOWN_FUSE",
+                    "word": f"0x{w_unknown:08x}",
+                    "decode": "Unmapped chain 1 block 99",
+                    "defect_sensitive": False,
+                    "expected_cold": {},
+                },
+            ],
+        }
+        fake_dict = json.loads(self.fake_path.read_text())
+        fake_dict["rows"] = {str(r): "0x00000000" for r in range(222, 487)}
+        fake_dict["rows"]["222"] = f"0x{w_gpc_old:08x}"
+        fake_dict["rows"]["223"] = f"0x{w_pcie_old:08x}"
+        fake_dict["rows"]["224"] = f"0x{w_sys_old:08x}"
+        r_plan = self.work / "rich_plan.json"
+        r_fake = self.work / "rich_fake.json"
+        r_plan.write_text(json.dumps(plan_dict))
+        r_fake.write_text(json.dumps(fake_dict))
+        r_plan.chmod(0o600)
+        r_fake.chmod(0o600)
+
+        session = MenuSession(
+            plan_path=str(r_plan),
+            fake_path=str(r_fake),
+            journal_path=str(self.journal_path),
+        )
+        rc, out, _ = self._run_menu(session, ["2", "0"])
+        self.assertEqual(rc, 0, out)
+        # Capacity checks: 3 used (222..224), 5 to take (225..229), 257 / 265 remaining
+        self.assertIn("Currently Used  : 3 / 265 rows (rows 222..224)", out)
+        self.assertIn("Rows To Take    : 5 (1 test + 4 real) -> rows 225..229", out)
+        self.assertIn("Remaining After : 257 / 265 free rows remaining", out)
+        # Outcome checks
+        self.assertIn("ENABLED GPC0 (defects 0x00000004 preserved)", out)
+        self.assertIn("PCIe Speed Flags : ENABLED (cleared pcie_magic_gen4_dis)", out)
+        self.assertIn("NO-OP (0 effective fuse bits changed", out)
+        # Unknown / unmapped / experimental fuse audit checks
+        self.assertIn("UNMAPPED / UNDOCUMENTED BITS CHANGING", out)
+        self.assertIn("371", out)
+        self.assertIn("NV_FUSE_OPT_SYS_PIPE_DISABLE", out)
+        self.assertIn("UNKNOWN FF BLOCK (chain=1, block=99", out)
+        # Well-understood Gen4 bit should NOT trigger a warning
+        self.assertNotIn("[row 227 / UNLOCK_PCIE_GEN4]", out)
+
 
 if __name__ == "__main__":
     unittest.main()

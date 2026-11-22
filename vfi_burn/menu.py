@@ -19,7 +19,7 @@ from .backend import (
     snapshot_data,
     write_private_json,
 )
-from .console import ManualConsole, format_status_report
+from .console import ManualConsole, format_plan_review, format_status_report
 from .engine import (
     Journal,
     Overrides,
@@ -174,7 +174,7 @@ class BurnMenu:
         self.show(f"  Overrides : {ov_str}")
         self.show("-" * 72)
         self.show("   [1] Setup / Load Plan, Import ffcalc, Target BDF/Port & Mode")
-        self.show("   [2] Review Plan Offline (decode FF words, Die ID, defect masks)")
+        self.show("   [2] Review Plan & Expected Outcome (enabled/disabled, unknown fuses, FF rows)")
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
         self.show("   [5] Dry-Run Burn Preview (passive preflight + row plan, NO writes)")
@@ -307,24 +307,21 @@ class BurnMenu:
     # ------------------------------------------------------------------ [2] Review Plan
     def _menu_review_plan(self) -> None:
         p = self._load_plan()
-        final_masks = check_plan(p)
-        self.show(f"\n=== PLAN REVIEW | SHA256: {p.content_hash} ===")
-        self.show(f"  SKU          : {p.pci_id} | FF rows {p.first_row}..{p.last_row} | empty={hex32(p.empty_word)}")
-        self.show(f"  Rail         : {p.stock_mv} +/- {p.vout_tolerance_mv} mV | SM base={p.base_sm_ceiling} override={p.override_sm_ceiling}")
-        self.show("  Die ID (8-15): " + " ".join(f"{k}:{hex32(v)}" for k, v in sorted(p.die_rows.items())))
-        self.show("  Defect Masks : " + (", ".join(f"{k}={hex32(v)}" for k, v in sorted(p.defect_masks.items())) or "none"))
-        self.show("  Mask Plan    : " + ", ".join(
-            f"{k}: {hex32(p.expected_masks[k])} -> {hex32(final_masks[k])}"
-            for k in sorted(p.expected_masks)
-        ))
-        self.show(f"  Records ({len(p.records)}):")
-        for i, r in enumerate(p.records):
+        backend = None
+        owned = False
+        has_target = bool(self.s.fake_path or self.s.bdf or self.s.adapter_spec)
+        if has_target:
             try:
-                ff = decode_ff(r.word)
-                ff_tag = f" (c{ff.chain}/b{ff.block}=0x{ff.data:04x})"
-            except BurnError:
-                ff_tag = " [WARNING: IFF bit 5 SET!]"
-            self.show(f"    {i:2d}: {r.kind:8} {r.name:20} target={r.target:16} word={hex32(r.word)}{ff_tag} | {r.decode}")
+                backend, owned = self._open_backend(writable=False)
+            except Exception as exc:
+                self.show(f"\nNOTE: target unavailable for FF row scan ({exc}); showing offline review.")
+                backend, owned = None, False
+        try:
+            self.show("")
+            for line in format_plan_review(p, reader=backend, override_slot=self.s.overrides.slot):
+                self.show(line)
+        finally:
+            self._close_if_owned(backend, owned)
 
     # ------------------------------------------------------------------ [3] Status & Inspect
     def _menu_status_inspect(self) -> None:

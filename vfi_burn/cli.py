@@ -25,7 +25,7 @@ from .backend import (
     snapshot_data,
     write_private_json,
 )
-from .console import ManualConsole, format_status_report
+from .console import ManualConsole, format_plan_review, format_status_report
 from .engine import (
     Journal,
     Overrides,
@@ -562,7 +562,12 @@ def main(argv=None) -> int:
         final_masks = check_plan(p)
 
         if args.cmd == "plan":
-            _print_plan_summary(p, final_masks)
+            if getattr(args, "fake", None) or getattr(args, "bdf", None) or getattr(args, "adapter", None):
+                backend = _open_backend(args, writable=False)
+            for line in format_plan_review(p, reader=backend):
+                print(line)
+            if backend is None:
+                print("OFFLINE PLAN REVIEW — OFFLINE ONLY: no hardware contacted.")
             return 0
 
         if args.cmd in ("inspect", "burn", "manual", "simulate"):

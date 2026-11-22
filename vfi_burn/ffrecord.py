@@ -172,6 +172,137 @@ def fields_in_block(chain: int, block: int) -> list[OptionField]:
     return [f for f in OPTION_FIELDS if f.chain == chain and block in f.blocks]
 
 
+def _field_local_mask(f: OptionField, block: int) -> int:
+    base = block * 16
+    mask = 0
+    for i in range(16):
+        bit = base + i
+        if f.bit <= bit < f.bit + f.width:
+            mask |= 1 << i
+    return mask
+
+
+def _compact_bit_list(bits: list[int]) -> str:
+    if not bits:
+        return "none"
+    ranges: list[str] = []
+    start = prev = bits[0]
+    for b in bits[1:]:
+        if b == prev + 1:
+            prev = b
+        else:
+            ranges.append(f"{start}" if start == prev else f"{start}..{prev}")
+            start = prev = b
+    ranges.append(f"{start}" if start == prev else f"{start}..{prev}")
+    return ", ".join(ranges)
+
+
+def analyze_ff_block(
+    chain: int,
+    block: int,
+    new_data: int,
+    old_data: int | None = None,
+) -> dict:
+    """Inspect a 16-bit GA100 FF block write for known, unmapped, and poorly-understood bits."""
+    base = block * 16
+    new_data &= 0xFFFF
+    fields = fields_in_block(chain, block)
+    known_mask = 0
+    for f in fields:
+        known_mask |= _field_local_mask(f, block)
+    unmapped_bits = [base + i for i in range(16) if not ((known_mask >> i) & 1)]
+
+    # Well-understood sub-bit inside opt-in magic_d (Gen4 disable flag, chain 2 bit 755).
+    gen4_bit_mask = (
+        _field_local_mask(FIELDS_BY_KEY["pcie_magic_gen4_dis"], block)
+        if chain == 2 and "pcie_magic_gen4_dis" in FIELDS_BY_KEY
+        else 0
+    )
+
+    warnings: list[str] = []
+    changed_fields: list[OptionField] = []
+    preserved_fields: list[OptionField] = []
+    changed_unmapped_bits: list[int] = []
+    changed_mask: int | None = None
+    is_noop: bool | None = None
+
+    if old_data is not None:
+        old_data &= 0xFFFF
+        changed_mask = (old_data ^ new_data) & 0xFFFF
+        is_noop = changed_mask == 0
+        changed_unmapped_bits = [
+            base + i
+            for i in range(16)
+            if ((changed_mask >> i) & 1) and not ((known_mask >> i) & 1)
+        ]
+        for f in fields:
+            lmask = _field_local_mask(f, block)
+            eff_mask = lmask & ~gen4_bit_mask if f.key == "magic_d" else lmask
+            if changed_mask & eff_mask:
+                changed_fields.append(f)
+            elif lmask:
+                preserved_fields.append(f)
+
+        if not is_noop:
+            if not fields:
+                warnings.append(
+                    f"UNKNOWN FF BLOCK (chain={chain}, block={block}, 0x{old_data:04x}->0x{new_data:04x}): "
+                    "not in known GA100 option map"
+                )
+            elif changed_unmapped_bits:
+                warnings.append(
+                    f"UNMAPPED / UNDOCUMENTED BITS CHANGING in chain={chain} block={block} "
+                    f"(0x{old_data:04x}->0x{new_data:04x}): chain bits {_compact_bit_list(changed_unmapped_bits)}"
+                )
+            for f in changed_fields:
+                if not f.burnable:
+                    warnings.append(
+                        f"READ-ONLY FIELD CHANGING: {f.name} ({f.note or 'not expected to be burned'})"
+                    )
+                elif f.opt_in:
+                    warnings.append(
+                        f"EXPERIMENTAL / POORLY UNDERSTOOD FIELD CHANGING: {f.name} — {f.note}"
+                    )
+                elif f.category in ("mig", "nvlink"):
+                    warnings.append(
+                        f"CAUTION / PARTIALLY UNDERSTOOD FIELD CHANGING: {f.name} — {f.note}"
+                    )
+    else:
+        if not fields:
+            warnings.append(
+                f"UNKNOWN FF BLOCK (chain={chain}, block={block}, data=0x{new_data:04x}): "
+                "not in known GA100 option map"
+            )
+        else:
+            if unmapped_bits:
+                warnings.append(
+                    f"SHARED BLOCK HAS UNMAPPED BITS (chain={chain}, block={block}): "
+                    f"chain bits {_compact_bit_list(unmapped_bits)} (connect target or dump to confirm preserved)"
+                )
+            for f in fields:
+                if not f.burnable:
+                    warnings.append(f"OVERLAPS READ-ONLY FIELD: {f.name} ({f.note})")
+                elif f.opt_in:
+                    warnings.append(f"OVERLAPS EXPERIMENTAL FIELD: {f.name} — {f.note}")
+                elif f.category in ("mig", "nvlink"):
+                    warnings.append(f"OVERLAPS CAUTION FIELD: {f.name} — {f.note}")
+
+    return {
+        "chain": chain,
+        "block": block,
+        "old_data": old_data,
+        "new_data": new_data,
+        "changed_mask": changed_mask,
+        "is_noop": is_noop,
+        "fields": fields,
+        "changed_fields": changed_fields,
+        "preserved_fields": preserved_fields,
+        "unmapped_bits": unmapped_bits,
+        "changed_unmapped_bits": changed_unmapped_bits,
+        "warnings": warnings,
+    }
+
+
 def replay_ff_rows(rows: dict[int, int]) -> dict[int, dict[int, int]]:
     """Replay FF rows in [222..486] ascending order into {chain: {block: data16}}."""
     blocks: dict[int, dict[int, int]] = {}

@@ -15,12 +15,23 @@ from .engine import (
     Journal,
     Overrides,
     check_host_readonly_safe,
+    check_plan,
     evaluate_health,
     evaluate_host,
     format_pmbus_status,
     hex32,
     process_records,
     scan_slots,
+)
+from .ffrecord import (
+    FF_ROW_MAX,
+    FF_ROW_MIN,
+    TOTAL_GPC,
+    analyze_ff_block,
+    compute_sm_count,
+    decode_all_fields,
+    decode_ff,
+    replay_ff_rows,
 )
 from .mmio import resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, u32
@@ -106,6 +117,351 @@ def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = Fals
         lines.append("  GATE SUMMARY : NOT WRITE-READY:")
         for issue in all_issues:
             lines.append(f"    - {issue}")
+    return lines
+
+
+def _bit_indices(mask: int) -> list[int]:
+    return [i for i in range(32) if (mask >> i) & 1]
+
+
+def _format_unit_list(prefix: str, bits: list[int]) -> str:
+    if not bits:
+        return "none"
+    parts: list[str] = []
+    start = prev = bits[0]
+    for b in bits[1:]:
+        if b == prev + 1:
+            prev = b
+        else:
+            parts.append(f"{prefix}{start}" if start == prev else f"{prefix}{start}..{prefix}{prev}")
+            start = prev = b
+    parts.append(f"{prefix}{start}" if start == prev else f"{prefix}{start}..{prefix}{prev}")
+    return ", ".join(parts)
+
+
+def _unit_prefix_for_mask(field_name: str) -> str:
+    up = field_name.upper()
+    if up.startswith("TPC_GPC") and up.endswith("_DISABLE"):
+        return "TPC"
+    if up.endswith("_DISABLE"):
+        return up[: -len("_DISABLE")]
+    return "bit"
+
+
+def _safe_replay_rows(rows: dict[int, int]) -> tuple[dict[int, dict[int, int]], int]:
+    """Replay valid GA100 FF rows into {chain: {block: data16}}, counting skipped non-FF rows."""
+    blocks: dict[int, dict[int, int]] = {}
+    skipped = 0
+    for r in sorted(rows):
+        if not (FF_ROW_MIN <= r <= FF_ROW_MAX):
+            continue
+        w = rows[r]
+        if w == 0:
+            continue
+        try:
+            rec = decode_ff(w)
+        except BurnError:
+            skipped += 1
+            continue
+        blocks.setdefault(rec.chain, {})[rec.block] = rec.data
+    return blocks, skipped
+
+
+def format_plan_review(
+    plan: Plan,
+    *,
+    reader=None,
+    override_slot: int | None = None,
+) -> list[str]:
+    """Build a complete pre-burn plan review: FF rows taken/remaining, enabled/disabled outcome,
+    and an audit of unknown, unmapped, or poorly understood fuse changes."""
+    final_masks = check_plan(plan)
+    lines: list[str] = []
+
+    # Optional read-only scan of current FF rows if a live or fake reader is attached.
+    current_rows: dict[int, int] | None = None
+    next_free_row: int | None = None
+    slot_error: str | None = None
+    if reader is not None:
+        check_host_readonly_safe(reader.host())
+        try:
+            rows: dict[int, int] = {}
+            for row_idx in range(plan.first_row, plan.last_row + 1):
+                val = reader.fuse_row(row_idx)
+                if is_poison(val):
+                    raise BurnError(f"row {row_idx} reads poisoned ({hex32(val)})")
+                rows[row_idx] = val
+            current_rows = rows
+            try:
+                next_free_row, _ = scan_slots(plan, reader, override_slot=override_slot)
+            except BurnError as exc:
+                slot_error = str(exc)
+        except BurnError as exc:
+            slot_error = str(exc)
+
+    total_slots = plan.last_row - plan.first_row + 1
+    n_total = len(plan.records)
+    n_test = sum(1 for r in plan.records if r.kind == "test")
+    n_real = n_total - n_test
+
+    # ------------------------------------------------------------------ 1. Header
+    mode_tag = "WITH TARGET FF SCAN (read-only)" if current_rows is not None else "OFFLINE ONLY"
+    lines.append(f"=== PLAN REVIEW & EXPECTED OUTCOME ({mode_tag}) ===")
+    lines.append(f"  Plan SHA256  : {plan.content_hash}")
+    lines.append(f"  Target SKU   : {plan.pci_id} (CMP 170HX 8 GB) | Rail: {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV")
+    lines.append(
+        f"  SM Ceilings  : base={plan.base_sm_ceiling} | override={plan.override_sm_ceiling} | "
+        f"reconfig_verified={plan.reconfig_semantics_verified}"
+    )
+    lines.append(
+        "  Die ID (8-15): "
+        + " ".join(f"{k}:{hex32(v)}" for k, v in sorted(plan.die_rows.items()))
+    )
+    lines.append(
+        "  Defect Masks : "
+        + (", ".join(f"{k}={hex32(v)}" for k, v in sorted(plan.defect_masks.items())) or "none")
+    )
+
+    # ------------------------------------------------------------------ 2. FF Capacity
+    lines.append("")
+    lines.append("=== FF REGION CAPACITY (ROWS TAKEN & REMAINING) ===")
+    lines.append(
+        f"  FF Window       : rows {plan.first_row}..{plan.last_row} ({total_slots} total slots, empty={hex32(plan.empty_word)})"
+    )
+    if current_rows is not None:
+        used_rows = [r for r, v in sorted(current_rows.items()) if v != plan.empty_word]
+        used_count = len(used_rows)
+        used_span = f"rows {used_rows[0]}..{used_rows[-1]}" if used_rows else "none (all empty)"
+        lines.append(f"  Currently Used  : {used_count} / {total_slots} rows ({used_span})")
+        if next_free_row is not None:
+            last_take = next_free_row + n_total - 1
+            remaining_after = plan.last_row - last_take
+            row_span = f"row {next_free_row}" if n_total == 1 else f"rows {next_free_row}..{last_take}"
+            lines.append(f"  Rows To Take    : {n_total} ({n_test} test + {n_real} real) -> {row_span}")
+            if remaining_after < 0:
+                lines.append(
+                    f"  Remaining After : WARNING — EXCEEDS FF WINDOW by {-remaining_after} row(s)! CANNOT BURN."
+                )
+            elif remaining_after < 16:
+                lines.append(
+                    f"  Remaining After : {remaining_after} / {total_slots} free rows (CAUTION: low spare capacity)"
+                )
+            else:
+                lines.append(f"  Remaining After : {remaining_after} / {total_slots} free rows remaining")
+        else:
+            lines.append(f"  Rows To Take    : {n_total} ({n_test} test + {n_real} real)")
+            lines.append(f"  Remaining After : WARNING — free-slot scan issue: {slot_error}")
+    else:
+        max_rem = total_slots - n_total
+        lines.append(f"  Rows To Take    : {n_total} consecutive empty rows ({n_test} test + {n_real} real)")
+        if slot_error:
+            lines.append(f"  Remaining After : <= {max_rem} / {total_slots} (target scan unavailable: {slot_error})")
+        else:
+            lines.append(
+                f"  Remaining After : <= {max_rem} / {total_slots} "
+                "(select a target or fake snapshot to prove exact starting row)"
+            )
+
+    # ------------------------------------------------------------------ 3. Simulate FF Replay & Block Audit
+    sim_blocks: dict[int, dict[int, int]] | None = None
+    before_ff_fields: dict[str, int] | None = None
+    after_ff_fields: dict[str, int] | None = None
+    if current_rows is not None:
+        sim_blocks, _ = _safe_replay_rows(current_rows)
+        before_ff_fields = decode_all_fields(sim_blocks)
+
+    record_analyses: list[tuple[int, Record, dict | None, str | None]] = []
+    audit_warnings: list[str] = []
+
+    for idx, rec in enumerate(plan.records):
+        row_label = f"row {next_free_row + idx}" if next_free_row is not None else f"slot +{idx}"
+        try:
+            ff = decode_ff(rec.word)
+        except BurnError as exc:
+            record_analyses.append((idx, rec, None, str(exc)))
+            audit_warnings.append(
+                f"[{row_label} / {rec.name}] INVALID FF WORD {hex32(rec.word)}: {exc}"
+            )
+            continue
+
+        old_blk = sim_blocks.get(ff.chain, {}).get(ff.block, 0) if sim_blocks is not None else None
+        analysis = analyze_ff_block(ff.chain, ff.block, ff.data, old_blk)
+        if sim_blocks is not None:
+            sim_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
+        record_analyses.append((idx, rec, analysis, None))
+
+        for w in analysis["warnings"]:
+            audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
+        if rec.kind == "reconfig" and not plan.reconfig_semantics_verified:
+            audit_warnings.append(
+                f"[{row_label} / {rec.name}] RECONFIG record semantics are NOT marked verified in plan"
+            )
+
+    if sim_blocks is not None:
+        after_ff_fields = decode_all_fields(sim_blocks)
+
+    # ------------------------------------------------------------------ 4. Expected Outcome (Enabled / Disabled)
+    lines.append("")
+    lines.append("=== EXPECTED OUTCOME (WHAT WILL BE ENABLED / DISABLED) ===")
+    outcome_lines: list[str] = []
+
+    # 4a. SM Count estimate (from full masks, FF replay, or declared resulting_sm_count)
+    sm_before: int | None = None
+    sm_after: int | None = None
+    tpc_keys = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
+    if "GPC_DISABLE" in plan.expected_masks and all(k in plan.expected_masks for k in tpc_keys):
+        sm_before = compute_sm_count(
+            plan.expected_masks["GPC_DISABLE"], [plan.expected_masks[k] for k in tpc_keys]
+        )
+        sm_after = compute_sm_count(
+            final_masks["GPC_DISABLE"], [final_masks[k] for k in tpc_keys]
+        )
+    elif before_ff_fields is not None and after_ff_fields is not None:
+        ff_tpc_keys = [f"tpc_gpc{i}_disable" for i in range(TOTAL_GPC)]
+        b_sm = compute_sm_count(before_ff_fields["gpc_disable"], [before_ff_fields[k] for k in ff_tpc_keys])
+        a_sm = compute_sm_count(after_ff_fields["gpc_disable"], [after_ff_fields[k] for k in ff_tpc_keys])
+        if b_sm != a_sm:
+            sm_before, sm_after = b_sm, a_sm
+    if sm_before is not None and sm_after is not None:
+        delta = sm_after - sm_before
+        sign = "+" if delta >= 0 else ""
+        outcome_lines.append(
+            f"  [+] Compute SMs      : {sm_before} -> {sm_after} SMs ({sign}{delta} SMs; "
+            f"base ceiling={plan.base_sm_ceiling})"
+        )
+    else:
+        declared_sms = [r.resulting_sm_count for r in plan.records if r.resulting_sm_count is not None]
+        if declared_sms:
+            outcome_lines.append(
+                f"  [+] Compute SMs      : target {declared_sms[-1]} SMs (declared in plan; "
+                f"base ceiling={plan.base_sm_ceiling})"
+            )
+
+    # 4b. Mask deltas from expected_masks -> final_masks
+    reported_fields_upper: set[str] = set()
+    for field in sorted(plan.expected_masks):
+        before_v = plan.expected_masks[field]
+        after_v = final_masks[field]
+        if before_v == after_v:
+            continue
+        reported_fields_upper.add(field.upper())
+        prefix = _unit_prefix_for_mask(field)
+        en_bits = _bit_indices(before_v & ~after_v)
+        dis_bits = _bit_indices(~before_v & after_v)
+        parts: list[str] = []
+        if en_bits:
+            parts.append(f"ENABLED {_format_unit_list(prefix, en_bits)}")
+        if dis_bits:
+            parts.append(f"DISABLED {_format_unit_list(prefix, dis_bits)}")
+        defect = plan.defect_masks.get(field, 0)
+        def_note = f" (defects {hex32(defect)} preserved)" if defect else ""
+        tag = "[+]" if en_bits and not dis_bits else ("[-]" if dis_bits and not en_bits else "[~]")
+        outcome_lines.append(
+            f"  {tag} {field:16} : {hex32(before_v)} -> {hex32(after_v)} | {'; '.join(parts)}{def_note}"
+        )
+
+    # 4c. FF-replay non-floorsweep or extra field deltas (PCIe, NVLink, MIG/SysPipe, etc.)
+    if before_ff_fields is not None and after_ff_fields is not None:
+        pcie_keys = (
+            "disable_gen3_speed_bit1",
+            "disable_gen3_speed_bit9",
+            "pcie_magic_gen4_dis",
+            "pcie_boot_gen23_dis",
+            "pcie_boot_gen3_dis",
+        )
+        pcie_en = [k for k in pcie_keys if before_ff_fields[k] == 1 and after_ff_fields[k] == 0]
+        pcie_dis = [k for k in pcie_keys if before_ff_fields[k] == 0 and after_ff_fields[k] == 1]
+        if pcie_en:
+            outcome_lines.append(f"  [+] PCIe Speed Flags : ENABLED (cleared {', '.join(pcie_en)})")
+        if pcie_dis:
+            outcome_lines.append(f"  [-] PCIe Speed Flags : RESTRICTED (set {', '.join(pcie_dis)})")
+
+        pcie_set = set(pcie_keys)
+        for key in sorted(before_ff_fields):
+            if key in pcie_set:
+                continue
+            bv, av = before_ff_fields[key], after_ff_fields[key]
+            if bv == av or key.upper() in reported_fields_upper:
+                continue
+            if key == "magic_d":
+                # Only report if bits outside bit 25 (Gen4 flag) changed
+                if ((bv ^ av) & ~(1 << 25)) == 0:
+                    continue
+                outcome_lines.append(
+                    f"  [!] PCIE_MAGIC_BITS_D: {hex32(bv)} -> {hex32(av)} (EXPERIMENTAL bits changed!)"
+                )
+            else:
+                prefix = _unit_prefix_for_mask(key)
+                en_bits = _bit_indices(bv & ~av)
+                dis_bits = _bit_indices(~bv & av)
+                parts = []
+                if en_bits:
+                    parts.append(f"ENABLED {_format_unit_list(prefix, en_bits)}")
+                if dis_bits:
+                    parts.append(f"DISABLED {_format_unit_list(prefix, dis_bits)}")
+                caution = ""
+                tag = "[+]" if en_bits and not dis_bits else ("[-]" if dis_bits and not en_bits else "[~]")
+                if key == "sys_pipe_disable":
+                    caution = " (EXPERIMENTAL / UNTESTED)"
+                    tag = "[!]"
+                elif key == "nvlink_disable":
+                    caution = " (needs U11 bridge mod)"
+                    tag = "[!]"
+                outcome_lines.append(
+                    f"  {tag} {key.upper():16} : {hex32(bv)} -> {hex32(av)} | {'; '.join(parts)}{caution}"
+                )
+
+    # 4d. Declared PCIe LnkCap2 / Reconfig / No-op Test summaries
+    for idx, rec, analysis, _ in record_analyses:
+        if rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
+            outcome_lines.append(
+                f"  [+] PCIe Link Cap2   : {hex32(rec.link_cap2_before)} -> {hex32(rec.link_cap2_after)} ({rec.decode})"
+            )
+        elif rec.kind == "test":
+            if analysis is not None and analysis["is_noop"] is True:
+                outcome_lines.append(
+                    f"  [=] Test Row ({rec.name}): NO-OP (0 effective fuse bits changed; verifies burn/readback/CRC)"
+                )
+            else:
+                outcome_lines.append(f"  [=] Test Row ({rec.name}): {rec.decode}")
+        elif rec.kind == "reconfig":
+            outcome_lines.append(f"  [!] Reconfig ({rec.name}): {rec.decode}")
+
+    if outcome_lines:
+        lines.extend(outcome_lines)
+    else:
+        lines.append("  (No mask or FF-field state changes detected.)")
+
+    # ------------------------------------------------------------------ 5. Unknown / Poorly Understood Fuse Audit
+    lines.append("")
+    lines.append("=== UNKNOWN / UNMAPPED / POORLY UNDERSTOOD FUSE AUDIT ===")
+    if audit_warnings:
+        for w in audit_warnings:
+            lines.append(f"  WARNING: {w}")
+    else:
+        lines.append(
+            "  PASS: All planned changes map to well-understood GA100 fields; "
+            "no unmapped, unknown, or experimental bits change."
+        )
+
+    # ------------------------------------------------------------------ 6. Per-Record Write Plan
+    lines.append("")
+    lines.append(f"=== PER-RECORD WRITE PLAN ({n_total} records) ===")
+    for idx, rec, analysis, decode_err in record_analyses:
+        slot_str = f"row {next_free_row + idx:3d}" if next_free_row is not None else f"slot +{idx:<2d}"
+        if decode_err is not None:
+            ff_tag = "INVALID/IFF!"
+        else:
+            c, b, nd, od = analysis["chain"], analysis["block"], analysis["new_data"], analysis["old_data"]
+            if od is not None:
+                delta_s = "NO-OP" if od == nd else f"0x{od:04x}->0x{nd:04x}"
+            else:
+                delta_s = f"0x{nd:04x}"
+            ff_tag = f"c{c}/b{b:<3d} {delta_s}"
+        lines.append(
+            f"  {slot_str} | {rec.kind:8} | {rec.name:18} | {hex32(rec.word)} ({ff_tag}) | {rec.decode}"
+        )
+
     return lines
 
 

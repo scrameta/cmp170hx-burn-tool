@@ -106,31 +106,35 @@ sudo python3 -m vfi_burn menu \
 
 The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JSONL journal, and typed confirmations:
 - **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6]` Single-Window `--stage all` or `[7]` Split-Window) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
-- **Full end-to-end bench flow in one place**: `[1]` Setup / import `cmp170hx-ffcalc` plan, `[2]` Offline Plan Review, `[3]` Live Status & Passive Inspection, `[4]` Active Sense (`SENSE_CTRL`), `[5]` Passive Dry-Run Preview, `[6]` Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records), `[7]` Split-Window Burn, `[8]` Granular Manual Overrides, `[9]` Manual Low-Level Console, `[10]` Offline FF Word Decoder, `[11]` Cold-Boot Snapshot & Verify.
+- **Full end-to-end bench flow in one place**: `[1]` Setup / import `cmp170hx-ffcalc` plan, `[2]` Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit), `[3]` Live Status & Passive Inspection, `[4]` Active Sense (`SENSE_CTRL`), `[5]` Passive Dry-Run Preview, `[6]` Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records), `[7]` Split-Window Burn, `[8]` Granular Manual Overrides, `[9]` Manual Low-Level Console, `[10]` Offline FF Word Decoder, `[11]` Cold-Boot Snapshot & Verify.
 
 ### Walkthrough Screenshots (Offline Simulation Mode)
 
-> All screenshots below were captured offline against synthetic [`examples/`](examples/) fixtures (no physical GPU contacted).
+> All screenshots below were captured offline against synthetic fixtures (no physical GPU contacted).
 
 #### 1. Main Menu & Live Status Header
 ![vfi_burn Main Interactive Menu](docs/screenshots/01-main-menu.png)
 
-#### 2. `[3]` Live Status, Passive Health Gates & Free-Slot Proof
-![vfi_burn Live Status and Passive Inspection](docs/screenshots/02-status-inspect.png)
+#### 2. `[2]` Review Plan & Expected Outcome (Enabled/Disabled, Unknown Fuses, FF Rows Taken & Remaining)
+Shows exact FF rows used/taken/remaining, what compute/PCIe/feature units are being enabled or disabled (with defect masks preserved), and flags any unknown FF blocks, unmapped bits, or experimental/untested fields before you ever touch a burn command.
+![vfi_burn Review Plan and Expected Outcome](docs/screenshots/02-review-plan.png)
 
-#### 3. `[6]` Single-Window Burn (`--stage all`) With `CONTINUE SAME WINDOW` Checkpoint
+#### 3. `[3]` Live Status, Passive Health Gates & Free-Slot Proof
+![vfi_burn Live Status and Passive Inspection](docs/screenshots/03-status-inspect.png)
+
+#### 4. `[6]` Single-Window Burn (`--stage all`) With `CONTINUE SAME WINDOW` Checkpoint
 On live hardware (`--execute`), each record additionally requires typing the exact row and hex word (`YES <row> <0xword>`), plus `SENSE` before `SENSE_CTRL`.
-![vfi_burn Single-Window Burn Walkthrough](docs/screenshots/03-single-window-burn.png)
+![vfi_burn Single-Window Burn Walkthrough](docs/screenshots/04-single-window-burn.png)
 
-#### 4. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
-![vfi_burn Manual Overrides and FF Word Decoder](docs/screenshots/04-overrides-and-decode.png)
+#### 5. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
+![vfi_burn Manual Overrides and FF Word Decoder](docs/screenshots/05-overrides-and-decode.png)
 
 ---
 
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (77 tests):
+# Run the full offline test suite (78 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:
