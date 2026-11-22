@@ -59,22 +59,34 @@ For a full walkthrough of the fuse controller (register map, `FUSECTRL` command 
 
 ```text
 vfi_burn/
-  mmio.py        # ReadOnlyMMIO & AlignedMMIO (single 32-bit aligned stores + DEBUGCTRL guard)
   model.py       # Strict mode-0600 Plan & Record schema validation
-  ffrecord.py    # GA100 FF codec, replay simulator, option map, no-op test builder, ffcalc importer
-  ga100.py       # GA100FuseController protocol & Linux sysfs BAR0 GA100LiveAdapter
-  backend.py     # Reader/Writer protocols, MissingWriter, FakeController, atomic 0600 JSON I/O
-  engine.py      # Fail-closed state machine, Overrides, flock Journal, verify_cold
-  console.py     # Interactive manual console & status formatter
+  fuses.py       # Unified GA100 fuse & register catalog (FF location, BAR0 addresses, types, FF-overridable flags)
+  fuse_rules.py  # Declarative fuse combination groups & cross-fuse coherence rules (compute/memory/PCIe)
+  interfaces.py  # Explicit abc.ABC contracts (MMIOReadBus, MMIOBus, FuseControllerHAL, FuseReader, FuseWriter)
+  mmio.py        # ReadOnlyMMIO & AlignedMMIO (single 32-bit aligned stores + DEBUGCTRL guard)
+  ffrecord.py    # GA100 FF codec, replay simulator, SM math, no-op test builder, ffcalc importer
+  ga100.py       # GA100FuseController HAL (fuse request -> PCIe BAR0) & Linux sysfs BAR0 GA100LiveAdapter
+  sim_pcie.py    # Simulated PCIe BAR0 MMIO bus, HAL transaction tracer, and HAL-backed SimulatedGA100Adapter
+  backend.py     # MissingWriter, FakeController, adapter loader, atomic 0600 JSON I/O
+  journal.py     # Append-only, fsynced, flock-locked mode-0600 JSONL audit journal & signal deferral
+  engine.py      # Fail-closed state machine, Overrides, preflight, burn loop, verify_cold
+  console.py     # Interactive manual console, plan/status reports, and HAL-traced PCIe write previews
   menu.py        # High-level numbered interactive menu (SSH/tmux-friendly, read-only by default)
-  cli.py         # CLI entry point (menu, plan, decode, import-ffcalc, snapshot, inspect, burn, simulate, manual, verify-cold)
+  commands.py    # Decoupled command execution layer (zero argparse dependency; injectable CommandIO)
+  cli.py         # Pure argparse CLI grammar and dispatcher
 tests/
+  test_fuses.py        # Unified fuse catalog invariants & BAR0 alignment
+  test_fuse_rules.py   # Declarative compute/memory/PCIe fuse combination coherence rules
+  test_interfaces.py   # abc.ABC contract enforcement & subclass conformance
+  test_sim_pcie.py     # Simulated PCIe execution, HAL BAR0 tracing, & HAL-backed end-to-end engine tests
+  test_commands.py     # Decoupled command execution (zero argparse) & CLI --sim-pcie tests
   test_engine.py       # Core state machine, gates, overrides, pre-trigger check, journal locking
   test_ga100.py        # Hardware-accurate GA100 fuse-controller FSM & end-to-end Goldilocks tests
   test_ffrecord.py     # FF codec, Kate/ffcalc vectors, replay, SM math, ffcalc importer tests
   test_mmio.py         # AlignedMMIO, ReadOnlyMMIO, DEBUGCTRL guard, mmap close tests
   test_cli_console.py  # CLI, faulted-card read diagnostics, dry-run, interactive console tests
   test_menu.py         # High-level interactive menu workflow, Live Execute guard & CLI entry tests
+  test_review_fixes.py / test_safety_review_fixes.py  # Safety regression suites (zero-CMD_PROGRAM invariants)
 examples/              # Synthetic-only example plan/fake/cold files (NEVER put real die IDs here)
 docs/
   menu_driven.md       # Interactive menu guide & offline screenshot walkthrough
@@ -82,7 +94,7 @@ docs/
   FUSE_CONTROLLER.md   # How the GA100 fuse controller works (state machines + programming sequence)
   screenshots/         # Terminal screenshots captured in offline simulation mode
 BURN_SPEC.md           # Original design spec and safety invariants
-adapter_template.py    # Template for custom hardware adapters
+adapter_template.py    # ABC-backed template for custom hardware adapters
 ```
 
 ---

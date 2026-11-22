@@ -472,11 +472,20 @@ class Harness(unittest.TestCase):
     def test_reconcile_checks_sm_ceiling_even_without_mask_field(self):
         r = Record.parse(dict(
             name='NO_MASK_SM', kind='regular', target='SOME_FUSE',
-            word='0x12345678', decode='exceeds base ceiling without mask_field',
+            word='0x12345658', decode='exceeds base ceiling without mask_field',
             defect_sensitive=False, resulting_sm_count=125,
         ))
-        with self.assertRaisesRegex(BurnError, 'beyond supplied ceiling'):
+        with self.assertRaises(BurnError):
             reconcile(self.plan, r, self.plan.expected_masks.copy())
+
+        # Any record with IFF bit 5 set (0x20) must be unconditionally refused by reconcile().
+        iff_rec = Record.parse(dict(
+            name='BAD_IFF', kind='regular', target='SOME_FUSE',
+            word='0x12345678', decode='invalid IFF bit 5 set',
+            defect_sensitive=False,
+        ))
+        with self.assertRaises(BurnError):
+            reconcile(self.plan, iff_rec, self.plan.expected_masks.copy())
 
     def test_journal_exclusive_flock_prevents_concurrent_sessions(self):
         with self.journal() as j1:

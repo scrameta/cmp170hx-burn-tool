@@ -413,60 +413,54 @@ def reconcile(
     if is_debugctrl_target(record.target) and not allow_manual_debugctrl:
         raise BurnError("DEBUGCTRL must never be included in an automatic plan")
 
-    # Word-derived checks: computed from the 32-bit FF word itself, so they cannot be
-    # bypassed by missing/incorrect plan metadata (multi-field shared blocks, manual
-    # console one-liners, hand-edited plans). Non-FF words (synthetic fixtures) skip
-    # this; live hardware refuses them separately in process_records/program_row.
-    word_masks: dict[str, int] = {}
-    word_mapped_fields: set[str] = set()
+    # Word-derived checks: unconditionally decode the 32-bit GA100 FF word (IFF bit 5 == 0)
+    # so checks cannot be bypassed by missing/incorrect plan metadata or synthetic fixtures.
     prior_masks = dict(assumed_masks)
     old_block: int | None = None
     touches_pcie = record.kind == "pcie"
     try:
         ff = decode_ff(record.word)
-        is_ff = True
-    except BurnError:
-        ff = None
-        is_ff = False
-    if is_ff and ff is not None:
-        if baseline_blocks is not None:
-            old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
+    except BurnError as exc:
+        raise BurnError(f"{record.name}: not a valid GA100 FF record word ({exc})") from exc
 
-        # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
-        hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
-        if hard_denials:
-            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
-        if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
-            raise BurnError(
-                f"{record.name}: REFUSED; "
-                + "; ".join(overridable_ff)
-                + " (use --override-unmapped-ff only after independent verification)"
-            )
+    if baseline_blocks is not None:
+        old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
 
-        # Independent no-op proof for test records whenever a verified baseline is available.
-        if record.kind == "test" and require_noop_test and baseline_blocks is not None:
-            verify_noop_test_record(record.word, baseline_blocks)
+    # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
+    hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
+    if hard_denials:
+        raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
+    if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
+        raise BurnError(
+            f"{record.name}: REFUSED; "
+            + "; ".join(overridable_ff)
+            + " (use --override-unmapped-ff only after independent verification)"
+        )
 
-        # Word-derived PCIe classification (cannot be evaded by setting kind="regular").
-        if ff_word_touches_pcie(record.word, old_block):
-            touches_pcie = True
+    # Independent no-op proof for test records whenever a verified baseline is available.
+    if record.kind == "test" and require_noop_test and baseline_blocks is not None:
+        verify_noop_test_record(record.word, baseline_blocks)
 
-        # Word-derived genuine defect audit. Known defects are NEVER overrideable; missing
-        # defect masks are NOT bypassed by --override-undetermined-ceiling.
-        violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
-        if violations:
-            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
-        if unknown and not allow_unmapped_ff:
-            raise BurnError(
-                f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
-                "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
-            )
-        word_mapped_fields = {
-            FFCALC_KEY_TO_FIELD[f.key]
-            for f in fields_in_block(ff.chain, ff.block)
-            if f.key in FFCALC_KEY_TO_FIELD
-        }
-        word_masks = apply_ff_word_to_masks(record.word, assumed_masks)
+    # Word-derived PCIe classification (cannot be evaded by setting kind="regular").
+    if ff_word_touches_pcie(record.word, old_block):
+        touches_pcie = True
+
+    # Word-derived genuine defect audit. Known defects are NEVER overrideable; missing
+    # defect masks are NOT bypassed by --override-undetermined-ceiling.
+    violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
+    if violations:
+        raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
+    if unknown and not allow_unmapped_ff:
+        raise BurnError(
+            f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
+            "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
+        )
+    word_mapped_fields = {
+        FFCALC_KEY_TO_FIELD[f.key]
+        for f in fields_in_block(ff.chain, ff.block)
+        if f.key in FFCALC_KEY_TO_FIELD
+    }
+    word_masks = apply_ff_word_to_masks(record.word, assumed_masks)
 
     if record.mask_field is not None:
         field = record.mask_field
@@ -491,7 +485,7 @@ def reconcile(
                 f"{record.name}: REFUSED; declared {field} end state {hex32(record.to_disable)} "
                 f"leaves genuinely defective bits {hex32(genuine & ~record.to_disable)} enabled"
             )
-        if is_ff and field not in word_mapped_fields:
+        if field not in word_mapped_fields:
             raise BurnError(
                 f"{record.name}: mask_update targets {field} but the FF word writes "
                 f"{', '.join(sorted(word_mapped_fields)) or 'no known option field'}"
@@ -558,7 +552,7 @@ def reconcile(
             "PCIe record (or FF word modifying PCIe speed/boot fuses) must declare reviewed LnkCap2 before/after"
         )
 
-    if baseline_blocks is not None and is_ff and ff is not None:
+    if baseline_blocks is not None:
         baseline_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
 
 
@@ -860,13 +854,6 @@ def process_records(
         allow_undetermined_ceiling=ov.undetermined_ceiling,
         allow_unmapped_ff=ov.unmapped_ff,
     )
-    if is_live:
-        # Refuse non-FF payloads before preflight/SENSE_CTRL, not inside the write block.
-        for r in plan.records:
-            try:
-                decode_ff(r.word)
-            except BurnError as exc:
-                raise BurnError(f"{r.name}: not a valid GA100 FF record word ({exc})") from exc
 
     receipt: dict | None = None
     if stage == "real":
