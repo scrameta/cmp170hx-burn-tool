@@ -131,6 +131,16 @@ Inside the console, run `preview <word>` (or `preview <target> <word> <descripti
 
 ---
 
-## Granular Manual Override Flags
+## Granular Manual Overrides (No blanket `--force`)
 
-The `menu`, `burn`, `simulate`, `manual console`, `manual write-record`, and `manual simulate-write-record` commands accept the granular override flags listed in the [README's Safety Model](../README.md#granular-manual-overrides-no-blanket---force). Every override is off by default, prints a loud banner, requires its own distinct typed confirmation phrase, and is logged in the journal. `--override-allow-debugctrl` is accepted only by `menu` and the `manual` commands (where it applies to manual-mode writes only).
+Every override is off by default, prints a loud banner, requires its own distinct typed confirmation phrase, and is logged in the journal (accepted by `menu`, `burn`, `simulate`, `manual console`, `manual write-record`, and `manual simulate-write-record`):
+
+| Flag | Purpose | Typed confirmation |
+|---|---|---|
+| `--override-slot ROW` | Target a specific **empty** FF row when contiguous scan is ambiguous | `OVERRIDE SLOT <ROW>` |
+| `--override-skip-sense` | Skip `SENSE_CTRL` (passive goldilocks checks remain) | `OVERRIDE SKIP SENSE` |
+| `--override-no-test-receipt` | Run `real` stage when test row was verified outside `vfi_burn` | `OVERRIDE NO TEST RECEIPT` |
+| `--override-mask-mismatch` | Skip initial live mask equality check | `OVERRIDE MASK MISMATCH` |
+| `--override-vout-range` | Allow VOUT outside `stock_mv ± tolerance_mv` (within hard `400..1500 mV`) | `OVERRIDE VOUT <mV>` |
+| `--override-undetermined-ceiling` | Override undetermined/exceeded SM ceiling (genuine defects remain refused) | `OVERRIDE CEILING` |
+| `--override-allow-debugctrl` | **Manual mode only**: permit `DEBUGCTRL` (`0x820060`) target | `REVIEW DEBUGCTRL` + `CONFIRM DEBUGCTRL` |
