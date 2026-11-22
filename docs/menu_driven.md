@@ -58,7 +58,7 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 
 ## Walkthrough Screenshots (Offline Simulation Mode)
 
-> All screenshots below were captured offline against synthetic fixtures (no physical GPU contacted). Note that the captured screenshots show an earlier menu layout before `[6]`/`[7]` were unified into a single `[6] Burn Plan` and `[11] Experimental Registers` was added.
+> All screenshots below were captured offline against synthetic fixtures (no physical GPU contacted).
 
 ### 1. Main Menu & Live Status Header
 ![vfi_burn Main Interactive Menu](screenshots/01-main-menu.png)
