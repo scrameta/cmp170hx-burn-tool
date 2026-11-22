@@ -1,66 +1,37 @@
-"""Standalone CLI for vfi_burn.
+"""Standalone CLI argument parser and dispatcher for vfi_burn.
 
-Supports:
-  - Direct Linux GA100 hardware access via ``--bdf``
-  - Custom owner-supplied adapters via ``--adapter module:factory``
-  - Offline simulation via ``--fake``
-  - ``cmp170hx-ffcalc`` plan import, FF record decoding, and cold-boot snapshot capture
+Responsibilities of this module are strictly limited to:
+  1. Command-line grammar definition via ``argparse`` (``build_parser``)
+  2. Mapping parsed ``argparse.Namespace`` objects to typed requests (``dispatch_args``)
+  3. Top-level exit-code and error handling (``main``)
 
-Physical burning is passive DRY-RUN by default; live writes require ``--execute``
-on an interactive TTY plus explicit per-record row+word confirmation.
+All command execution, backend lifecycle, and hardware/simulation logic lives in
+``vfi_burn.commands``.
 """
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
-import hashlib
 import json
 import sys
 
-from .backend import (
-    MissingWriter,
-    fake_from_file,
-    has_verified_writer,
-    load_adapter,
-    snapshot_data,
-    write_private_json,
+from .commands import (
+    CommandIO,
+    TargetSpec,
+    default_prompt_confirm as prompt_confirm,
+    execute_burn,
+    execute_decode,
+    execute_import_ffcalc,
+    execute_inspect,
+    execute_manual,
+    execute_menu,
+    execute_plan_review,
+    execute_simulate,
+    execute_snapshot,
+    execute_verify_cold,
 )
-from .console import (
-    ManualConsole,
-    format_experimental_report,
-    format_plan_review,
-    format_status_report,
-    read_experimental_registers,
-)
-from .engine import (
-    Journal,
-    Overrides,
-    check_host_readonly_safe,
-    check_plan,
-    evaluate_health,
-    hex32,
-    preflight,
-    process_records,
-    scan_slots,
-    verify_cold_snapshot,
-)
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
-from .fuses import (
-    EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
-    EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
-    decode_experimental_register,
-)
-from .ga100 import GA100LiveAdapter
-from .menu import BurnMenu, MenuSession
-from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
-
-
-def prompt_confirm(prompt: str, token: str) -> bool:
-    try:
-        return input(prompt).strip() == token
-    except (EOFError, KeyboardInterrupt):
-        return False
+from .engine import Overrides
+from .menu import MenuSession
+from .model import BurnError
 
 
 def _add_override_args(parser: argparse.ArgumentParser, *, allow_debugctrl: bool = False) -> None:
@@ -125,89 +96,13 @@ def _overrides_from_args(args: argparse.Namespace) -> Overrides:
     )
 
 
-def _require_live_execute_ready(backend) -> None:
-    if not sys.stdin.isatty():
-        raise BurnError(
-            "REFUSED --execute without an interactive TTY; unattended/piped burns are forbidden"
-        )
-    if not has_verified_writer(backend):
-        raise BurnError(
-            "REFUSED --execute: supplied adapter does not have write capability armed "
-            "(must define write_one_record(row, word) AND set write_enabled = True or legacy writer_verified = True)"
-        )
-
-
-def _open_backend(args: argparse.Namespace, *, writable: bool = False):
-    fake_path = getattr(args, "fake", None)
-    if fake_path:
-        return fake_from_file(fake_path)
-    bdf = getattr(args, "bdf", None)
-    if bdf:
-        return GA100LiveAdapter(
-            bdf,
-            writable=writable,
-        )
-    return load_adapter(args.adapter)
-
-
-def _print_plan_summary(p: Plan, final_masks: dict[str, int]) -> None:
-    print(f"OFFLINE PLAN REVIEW | SHA256: {p.content_hash}")
-    print(f"  SKU          : {p.pci_id} (CMP 170HX 8 GB)")
-    print(
-        f"  FF Window    : rows {p.first_row}..{p.last_row} "
-        f"({p.last_row - p.first_row + 1} slots) | empty_word={hex32(p.empty_word)}"
+def _target_from_args(args: argparse.Namespace) -> TargetSpec:
+    return TargetSpec(
+        bdf=getattr(args, "bdf", None),
+        adapter=getattr(args, "adapter", None),
+        fake=getattr(args, "fake", None),
+        sim_pcie=getattr(args, "sim_pcie", None),
     )
-    print(
-        f"  SM Ceilings  : base={p.base_sm_ceiling} | override={p.override_sm_ceiling} | "
-        f"reconfig_verified={p.reconfig_semantics_verified}"
-    )
-    print(
-        "  Die ID (8-15): "
-        + " ".join(f"{k}:{hex32(v)}" for k, v in sorted(p.die_rows.items()))
-    )
-    print(
-        "  Defect Masks : "
-        + (", ".join(f"{k}={hex32(v)}" for k, v in sorted(p.defect_masks.items())) or "none")
-    )
-    print(
-        "  Mask Plan    : "
-        + ", ".join(
-            f"{k}: {hex32(p.expected_masks[k])} -> {hex32(final_masks[k])}"
-            for k in sorted(p.expected_masks)
-        )
-    )
-    print(f"  Records ({len(p.records)}):")
-    for i, r in enumerate(p.records):
-        extra = ""
-        if r.mask_field is not None:
-            extra = f" [{r.mask_field}: {hex32(r.from_disable)}->{hex32(r.to_disable)}"
-            if r.resulting_sm_count is not None:
-                extra += f", {r.resulting_sm_count} SM"
-            extra += "]"
-        elif r.kind == "pcie":
-            extra = f" [LnkCap2: {hex32(r.link_cap2_before)}->{hex32(r.link_cap2_after)}]"
-        try:
-            ff = decode_ff(r.word)
-            ff_tag = f" (c{ff.chain}/b{ff.block}=0x{ff.data:04x})"
-        except BurnError:
-            ff_tag = " [WARNING: IFF bit 5 SET — not a valid GA100 FF record!]"
-        print(
-            f"    {i:2d}: {r.kind:8} {r.name:22} target={r.target:18} "
-            f"word={hex32(r.word)}{ff_tag}{extra} | {r.decode}"
-        )
-    print("OFFLINE ONLY: no hardware contacted.")
-
-
-def _warn_if_unhealthy_readonly(plan: Plan, backend) -> None:
-    try:
-        issues = evaluate_health(backend.health(), plan)
-    except Exception as exc:
-        print(f"NOTE: health read failed ({exc}); proceeding with read-only diagnostic", file=sys.stderr)
-        return
-    if issues:
-        print("NOTE: card is NOT in a write-ready goldilocks state:", file=sys.stderr)
-        for issue in issues:
-            print(f"  - {issue}", file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -298,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_plan(inspect_p)
     ig = inspect_p.add_mutually_exclusive_group(required=True)
     ig.add_argument("--fake", help="synthetic JSON controller snapshot")
+    ig.add_argument("--sim-pcie", help="mode-0600 JSON snapshot run through simulated PCIe BAR0 + GA100 HAL")
     ig.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     ig.add_argument("--adapter", help="custom owner-supplied live module:factory")
     inspect_p.add_argument(
@@ -349,9 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_override_args(burn_p, allow_debugctrl=False)
 
-    sim_p = sub.add_parser("simulate", help="exercise the exact write loop on FAKE data only")
+    sim_p = sub.add_parser("simulate", help="exercise the exact write loop on FAKE or simulated PCIe data only")
     add_plan(sim_p)
-    sim_p.add_argument("--fake", required=True, help="synthetic mode-0600 JSON snapshot")
+    sg = sim_p.add_mutually_exclusive_group(required=True)
+    sg.add_argument("--fake", help="synthetic mode-0600 JSON snapshot (lightweight fake controller)")
+    sg.add_argument("--sim-pcie", help="mode-0600 JSON snapshot executed through simulated PCIe BAR0 + GA100 HAL")
     sim_p.add_argument("--stage", required=True, choices=("test", "real", "all"))
     sim_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
     sim_p.add_argument("--receipt", help="cold-verified test receipt (required for --stage real)")
@@ -368,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     manual_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
     mg = manual_p.add_mutually_exclusive_group(required=True)
     mg.add_argument("--fake", help="synthetic JSON controller snapshot")
+    mg.add_argument("--sim-pcie", help="mode-0600 JSON snapshot executed through simulated PCIe BAR0 + GA100 HAL")
     mg.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     mg.add_argument("--adapter", help="custom owner-supplied live module:factory")
     man_sub = manual_p.add_subparsers(dest="action", required=True)
@@ -429,92 +328,17 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def _handle_manual_write(args, p: Plan, backend, *, allow_live: bool) -> int:
-    is_fake = bool(args.fake)
-    if not is_fake and not allow_live:
-        raise BurnError("manual physical writes require 'manual write-record --execute' with a verified writer")
+def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> int:
+    """Translate parsed CLI arguments into decoupled command execution calls."""
+    io = io or CommandIO()
+    cmd = args.cmd
 
-    record_path = require_private_file(args.record, "manual record file")
-    try:
-        record = Record.parse(json.loads(record_path.read_text(encoding="utf-8")))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in manual record {record_path}: {exc}") from exc
-    if record.kind == "test":
-        raise BurnError("manual write-record cannot insert a 'test' record; use stage=test")
+    if cmd is None:
+        return execute_menu(MenuSession())
 
-    overrides = _overrides_from_args(args)
-    if not allow_live:
-        overrides = replace(overrides, allow_manual_debugctrl=True)
-
-    execute_live = (not is_fake) and bool(getattr(args, "execute", False))
-    dry_run = bool(getattr(args, "dry_run", False)) or ((not is_fake) and (not execute_live))
-    if execute_live and not dry_run:
-        _require_live_execute_ready(backend)
-
-    writer = backend if (is_fake or execute_live) else MissingWriter()
-    rec_hash = hashlib.sha256(record_path.read_bytes()).hexdigest()
-    single = replace(p, records=(p.records[0], record))
-    with Journal(args.journal) as j:
-        j.append(
-            event="manual_selected_record",
-            source_file_sha256=rec_hash,
-            record=record.name,
-            target=record.target,
-            word=hex32(record.word),
-            original_card_plan_sha256=p.content_hash,
-            dry_run=dry_run,
-            note="manual record is not part of the original approved list",
-        )
-        process_records(
-            single,
-            backend,
-            writer,
-            j,
-            stage="real",
-            confirm=prompt_confirm,
-            test_receipt=args.receipt,
-            overrides=overrides,
-            dry_run=dry_run,
-            strict_confirm=execute_live,
-            confirm_active_sense=execute_live,
-            run_active_sense=not dry_run,
-            manual_record_sha256=rec_hash,
-            is_manual_single=True,
-        )
-    if is_fake and getattr(args, "save_fake", None) and not dry_run:
-        write_private_json(args.save_fake, snapshot_data(backend))
-    if dry_run:
-        print("DRY-RUN COMPLETE: no fuses written.")
-    elif is_fake:
-        print("SIMULATION ONLY: fake record updated; no GPU contacted.")
-    else:
-        print("READ-BACK VERIFIED (NOT cold-boot verified). Cold boot and verify before trusting unlock.")
-    return 0
-
-
-def _capture_inspect_snapshot(backend) -> tuple[dict | None, dict | None]:
-    health_snap, host_snap = None, None
-    try:
-        health_snap = backend.health().serializable()
-    except Exception:
-        pass
-    try:
-        host_snap = backend.host().serializable()
-    except Exception:
-        pass
-    return health_snap, host_snap
-
-
-def main(argv=None) -> int:
-    ap = build_parser()
-    args = ap.parse_args(argv)
-    backend = None
-    try:
-        if args.cmd is None:
-            return BurnMenu(MenuSession()).run()
-
-        if args.cmd == "menu":
-            session = MenuSession(
+    if cmd == "menu":
+        return execute_menu(
+            MenuSession(
                 plan_path=args.plan,
                 bdf=args.bdf,
                 adapter_spec=args.adapter,
@@ -524,336 +348,122 @@ def main(argv=None) -> int:
                 execute_live=bool(args.execute),
                 overrides=_overrides_from_args(args),
             )
-            return BurnMenu(session).run()
+        )
 
-        if args.cmd == "decode":
-            word = u32(args.word, "word")
-            ff = decode_ff(word)
-            print(f"FF word {hex32(word)}: chain={ff.chain} block={ff.block} data=0x{ff.data:04x} (IFF bit5=0)")
-            overlapping = fields_in_block(ff.chain, ff.block)
-            if overlapping:
-                print("Overlapping GA100 option fields:")
-                for f in overlapping:
-                    print(f"  - {f.key:24} ({f.name}) bits {f.bit}..{f.bit + f.width - 1} [{f.category}]")
-            else:
-                print("Overlapping GA100 option fields: none in known map")
-            return 0
+    if cmd == "decode":
+        return execute_decode(args.word, io=io)
 
-        if args.cmd == "import-ffcalc":
-            plan_dict = import_ffcalc_plan(
-                args.burn_plan,
-                args.dump,
-                base_sm_ceiling=args.base_sm,
-                override_sm_ceiling=args.override_sm,
-                prepend_noop_test=args.prepend_noop_test,
-                link_cap2_before=args.link_cap2_before,
-                link_cap2_after=args.link_cap2_after,
-            )
-            write_private_json(args.out, plan_dict)
-            # Validate the written plan immediately with Plan.load + check_plan!
-            loaded = Plan.load(args.out)
-            final_masks = check_plan(loaded)
-            print(f"Imported ffcalc plan to {args.out} (mode 0600):")
-            _print_plan_summary(loaded, final_masks)
-            return 0
+    if cmd == "import-ffcalc":
+        return execute_import_ffcalc(
+            burn_plan=args.burn_plan,
+            dump=args.dump,
+            out=args.out,
+            base_sm=args.base_sm,
+            override_sm=args.override_sm,
+            prepend_noop_test=args.prepend_noop_test,
+            link_cap2_before=args.link_cap2_before,
+            link_cap2_after=args.link_cap2_after,
+            io=io,
+        )
 
-        if args.cmd == "snapshot":
-            backend = GA100LiveAdapter(
-                args.bdf,
-                writable=False,
-            )
-            check_host_readonly_safe(backend.host())
-            snap = backend.capture_cold_snapshot(
-                previous_boot_id=args.previous_boot_id,
-                read_rows=not args.no_rows,
-            )
-            write_private_json(args.out, snap)
-            print(
-                f"Saved cold snapshot {args.out} (mode 0600) | boot_id={snap['boot_id']} "
-                f"rows_nonzero={len(snap['fpf_rows'])} SM_COUNT={snap['fields']['SM_COUNT']}"
-            )
-            return 0
+    if cmd == "snapshot":
+        return execute_snapshot(
+            bdf=args.bdf,
+            previous_boot_id=args.previous_boot_id,
+            out=args.out,
+            read_rows=not args.no_rows,
+            io=io,
+        )
 
-        p = Plan.load(args.plan)
-        final_masks = check_plan(p)
+    if cmd == "plan":
+        return execute_plan_review(
+            plan_path=args.plan,
+            target=_target_from_args(args),
+            io=io,
+        )
 
-        if args.cmd == "plan":
-            if getattr(args, "fake", None) or getattr(args, "bdf", None) or getattr(args, "adapter", None):
-                backend = _open_backend(args, writable=False)
-            for line in format_plan_review(p, reader=backend):
-                print(line)
-            if backend is None:
-                print("OFFLINE PLAN REVIEW — OFFLINE ONLY: no hardware contacted.")
-            return 0
+    if cmd == "inspect":
+        return execute_inspect(
+            plan_path=args.plan,
+            target=_target_from_args(args),
+            sense=bool(args.sense),
+            experimental=bool(args.experimental),
+            journal_path=args.journal,
+            io=io,
+        )
 
-        if args.cmd in ("inspect", "burn", "manual", "simulate"):
-            want_write = (
-                (args.cmd == "burn" and bool(args.execute))
-                or (
-                    args.cmd == "manual"
-                    and args.action in ("write-record", "console")
-                    and bool(getattr(args, "execute", False))
-                    and not getattr(args, "fake", None)
-                )
-            )
-            backend = _open_backend(args, writable=want_write)
+    if cmd == "burn":
+        return execute_burn(
+            plan_path=args.plan,
+            target=_target_from_args(args),
+            stage=args.stage,
+            journal_path=args.journal,
+            receipt=args.receipt,
+            max_records=args.max_records,
+            sense=bool(args.sense),
+            execute=bool(args.execute),
+            overrides=_overrides_from_args(args),
+            io=io,
+        )
 
-        if args.cmd == "inspect":
-            for line in format_status_report(p, backend):
-                print(line)
-            exp_readings: dict[str, int] | None = None
-            if args.experimental:
-                exp_readings, exp_poisoned = read_experimental_registers(backend)
-                for line in format_experimental_report(
-                    backend, readings=exp_readings, poisoned=exp_poisoned
-                ):
-                    print(line)
-            journal = Journal(args.journal) if args.journal else None
-            try:
-                if args.sense and not args.fake:
-                    print(
-                        "ACTIVE SENSE: active_sense_readonly() (SENSE_CTRL) does not burn fuses, "
-                        "but can collapse a too-deep held goldilocks frame (forcing power cycle + re-hunt)."
-                    )
-                    if not prompt_confirm("Type 'SENSE' to run active_sense_readonly(): ", "SENSE"):
-                        if journal is not None:
-                            journal.append(
-                                event="declined",
-                                command="inspect",
-                                plan_sha256=p.content_hash,
-                                reason="SENSE",
-                            )
-                        raise BurnError("active sense declined by operator")
-                    if journal is not None:
-                        journal.append(
-                            event="active_sense_confirmed",
-                            command="inspect",
-                            plan_sha256=p.content_hash,
-                        )
-                boot = preflight(p, backend, active_sense=args.sense)
-                row, surrounding = scan_slots(p, backend)
-                if journal is not None:
-                    h_snap, host_snap = _capture_inspect_snapshot(backend)
-                    extra_j = (
-                        {"experimental_registers": {k: hex32(v) for k, v in exp_readings.items()}}
-                        if exp_readings is not None
-                        else {}
-                    )
-                    journal.append(
-                        event="inspect_result",
-                        plan_sha256=p.content_hash,
-                        boot_id=boot,
-                        active_sense=args.sense,
-                        proved_pointer=row,
-                        health=h_snap,
-                        host=host_snap,
-                        status="PASS",
-                        **extra_j,
-                    )
-            except Exception as exc:
-                if journal is not None:
-                    h_snap, host_snap = _capture_inspect_snapshot(backend)
-                    journal.append(
-                        event="inspect_failed",
-                        plan_sha256=p.content_hash,
-                        active_sense=args.sense,
-                        health=h_snap,
-                        host=host_snap,
-                        status="FAIL",
-                        error=str(exc),
-                    )
-                raise
-            finally:
-                if journal is not None:
-                    journal.close()
-            print(f"{'FAKE' if args.fake else 'LIVE READ-ONLY'} | boot {boot}; first free row {row}")
-            for i, v in surrounding:
-                tag = "EMPTY" if v == p.empty_word else "WRITTEN"
-                print(f"  row {i:4d}: {hex32(v)}  [{tag}]")
-            print(
-                "FULL write-capable preflight NOT established (re-run with --sense to test active sense)"
-                if not args.sense
-                else "Active-sense checks passed; frame is write-capable (no write issued)"
-            )
-            return 0
+    if cmd == "simulate":
+        return execute_simulate(
+            plan_path=args.plan,
+            target=_target_from_args(args),
+            stage=args.stage,
+            journal_path=args.journal,
+            receipt=args.receipt,
+            max_records=args.max_records,
+            dry_run=bool(args.dry_run),
+            save_fake=args.save_fake,
+            overrides=_overrides_from_args(args),
+            io=io,
+        )
 
-        if args.cmd == "burn":
-            overrides = _overrides_from_args(args)
-            dry_run = not args.execute
-            if not dry_run:
-                _require_live_execute_ready(backend)
-            run_sense = (not dry_run) or bool(args.sense)
-            writer = backend if not dry_run else MissingWriter()
-            with Journal(args.journal) as j:
-                process_records(
-                    p,
-                    backend,
-                    writer,
-                    j,
-                    stage=args.stage,
-                    confirm=prompt_confirm,
-                    test_receipt=args.receipt,
-                    overrides=overrides,
-                    max_records=args.max_records,
-                    dry_run=dry_run,
-                    strict_confirm=not dry_run,
-                    confirm_active_sense=True,
-                    run_active_sense=run_sense,
-                )
-            if dry_run:
-                sense_note = (
-                    "active-sense & slot proof passed"
-                    if run_sense and not overrides.skip_active_sense
-                    else "passive preflight & slot proof passed (add --sense to test active sense)"
-                )
-                print(f"DRY-RUN COMPLETE: {sense_note}; no fuses written. Pass --execute to burn.")
-            else:
-                print("READ-BACK VERIFIED (NOT cold-boot verified). Cold boot and run verify-cold.")
-            return 0
+    if cmd == "manual":
+        return execute_manual(
+            plan_path=args.plan,
+            target=_target_from_args(args),
+            action=args.action,
+            journal_path=args.journal,
+            row=getattr(args, "row", None),
+            start=getattr(args, "start", None),
+            end=getattr(args, "end", None),
+            address=getattr(args, "address", None),
+            field_name=getattr(args, "name", None),
+            record_file=getattr(args, "record", None),
+            receipt=getattr(args, "receipt", None),
+            execute=bool(getattr(args, "execute", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            save_fake=getattr(args, "save_fake", None),
+            overrides=_overrides_from_args(args),
+            io=io,
+        )
 
-        if args.cmd == "simulate":
-            overrides = _overrides_from_args(args)
-            with Journal(args.journal) as j:
-                process_records(
-                    p,
-                    backend,
-                    backend,
-                    j,
-                    stage=args.stage,
-                    confirm=prompt_confirm,
-                    test_receipt=args.receipt,
-                    overrides=overrides,
-                    max_records=args.max_records,
-                    dry_run=args.dry_run,
-                )
-            if args.save_fake and not args.dry_run:
-                write_private_json(args.save_fake, snapshot_data(backend))
-            print(
-                "SIMULATION DRY-RUN ONLY: no fake rows modified."
-                if args.dry_run
-                else "SIMULATION ONLY: fake records updated; no GPU contacted."
-            )
-            return 0
+    if cmd == "verify-cold":
+        return execute_verify_cold(
+            plan_path=args.plan,
+            cold_path=args.cold,
+            stage=args.stage,
+            journal_path=args.journal,
+            receipt_out=args.receipt_out,
+            io=io,
+        )
 
-        if args.cmd == "manual":
-            if args.action == "simulate-write-record":
-                return _handle_manual_write(args, p, backend, allow_live=False)
-            if args.action == "write-record":
-                return _handle_manual_write(args, p, backend, allow_live=True)
-            if args.action == "console":
-                overrides = _overrides_from_args(args)
-                is_fake = bool(args.fake)
-                execute_live = (not is_fake) and bool(args.execute)
-                if execute_live:
-                    _require_live_execute_ready(backend)
-                writer = backend if (is_fake or execute_live) else MissingWriter()
-                with Journal(args.journal) as j:
-                    return ManualConsole(
-                        p,
-                        backend,
-                        writer,
-                        j,
-                        execute=execute_live,
-                        test_receipt=args.receipt,
-                        overrides=overrides,
-                        strict_confirm=execute_live,
-                    ).run()
+    return 2
 
-            check_host_readonly_safe(backend.host())
-            if args.action == "status":
-                for line in format_status_report(p, backend):
-                    print(line)
-                with Journal(args.journal) as j:
-                    j.append(event="manual_status", pci_id=backend.pci_id())
-                return 0
-            if args.action == "experimental":
-                readings, poisoned = read_experimental_registers(backend)
-                for line in format_experimental_report(
-                    backend, readings=readings, poisoned=poisoned
-                ):
-                    print(line)
-                with Journal(args.journal) as j:
-                    j.append(
-                        event="manual_experimental_read",
-                        pci_id=backend.pci_id(),
-                        skipped_poison=poisoned,
-                        registers={k: hex32(v) for k, v in readings.items()},
-                    )
-                return 0
 
-            _warn_if_unhealthy_readonly(p, backend)
-            if args.action == "read-row":
-                value = backend.fuse_row(args.row)
-                warn = "  [POISON!]" if is_poison(value) else ""
-                print(f"row {args.row} = {hex32(value)}{warn}")
-                with Journal(args.journal) as j:
-                    j.append(event="manual_read_row", row=args.row, value=hex32(value))
-            elif args.action == "read-rows":
-                if args.end < args.start or (args.end - args.start) >= 128:
-                    raise BurnError("invalid row range (must satisfy start <= end and <= 128 rows)")
-                values = {}
-                for row_idx in range(args.start, args.end + 1):
-                    val = backend.fuse_row(row_idx)
-                    values[str(row_idx)] = hex32(val)
-                    warn = "  [POISON!]" if is_poison(val) else ""
-                    print(f"  row {row_idx:4d}: {hex32(val)}{warn}")
-                with Journal(args.journal) as j:
-                    j.append(event="manual_read_rows", start=args.start, end=args.end, values=values)
-            elif args.action == "read-reg":
-                addr = resolve_register_address(args.address)
-                value = backend.register(addr)
-                warn = "  [POISON!]" if is_poison(value) else ""
-                exp = _EXP_BY_ADDR.get(addr)
-                extra = (
-                    f"  [EXPERIMENTAL: {exp.name} — {decode_experimental_register(exp, value)}; "
-                    f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
-                    if exp is not None
-                    else ""
-                )
-                print(f"reg {hex32(addr)} = {hex32(value)}{warn}{extra}")
-                with Journal(args.journal) as j:
-                    j.append(event="manual_read_reg", address=hex32(addr), value=hex32(value))
-            elif args.action == "read-field":
-                value = backend.field(args.name)
-                warn = "  [POISON!]" if is_poison(value) else ""
-                exp = _EXP_BY_NAME.get(args.name.strip().upper())
-                extra = (
-                    f"  [EXPERIMENTAL: {decode_experimental_register(exp, value)}; "
-                    f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
-                    if exp is not None
-                    else ""
-                )
-                print(f"{args.name} = {hex32(value)}{warn}{extra}")
-                with Journal(args.journal) as j:
-                    j.append(event="manual_read_field", field=args.name, value=hex32(value))
-            return 0
-
-        if args.cmd == "verify-cold":
-            cold_path = require_private_file(args.cold, "cold snapshot")
-            try:
-                cold_data = json.loads(cold_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise BurnError(f"invalid JSON in cold snapshot {cold_path}: {exc}") from exc
-            with Journal(args.journal) as j:
-                receipt = verify_cold_snapshot(p, cold_data, stage=args.stage, journal=j)
-            if args.receipt_out:
-                write_private_json(args.receipt_out, receipt)
-            print(
-                "PASS: supplied cold snapshot matches declared expectations; "
-                "evidence is not independently authenticated"
-            )
-            return 0
-
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    try:
+        return dispatch_args(args)
     except KeyboardInterrupt:
         print("\nABORTED by operator (Ctrl-C).", file=sys.stderr)
         return 130
     except (BurnError, ValueError, KeyError, NotImplementedError, OSError, json.JSONDecodeError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
-    finally:
-        if backend is not None and callable(getattr(backend, "close", None)):
-            backend.close()
-    return 2
 
 
 if __name__ == "__main__":
