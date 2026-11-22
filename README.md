@@ -8,7 +8,7 @@
 > Fuse programming is **physically irreversible**, and the worst-case failure is a **permanently bricked card**. Treat your first real run as untested code:
 > - Inspect everything read-only first (`plan`, `inspect`, `manual status/read-rows`).
 > - Cross-check every decoded FF word, row number, and defect mask by hand against independent tools (`cmp170hx-ffcalc` / `ga100-ff-tools`).
-> - Always start with a single **no-op test row** (`--prepend-noop-test`, Stage 1), cold-boot verify it, and only then attempt real unlock records.
+> - Always burn a single **no-op test row** (`--prepend-noop-test`) first and verify read-back + `CRC=0x55` before burning real unlock records (you can either continue in the **same Goldilocks window** with `--stage all` so you don't lose a hard-won glitch, or split across a cold boot with `--stage test` / `--stage real`).
 > - Use entirely at your own risk.
 
 ---
@@ -127,28 +127,36 @@ sudo python3 -m vfi_burn inspect --plan private/plan.json \
 # 4. Passive dry-run preview (does NOT run SENSE_CTRL or write fuses):
 sudo python3 -m vfi_burn burn --plan private/plan.json \
   --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --stage test --journal private/session.jsonl
+  --stage all --journal private/session.jsonl
 
-# 5. Stage 1 — burn single no-op test row (requires interactive TTY, 'SENSE', and 'YES <row> <0xword>'):
+# 5A. SINGLE-WINDOW BURN (recommended when re-glitching is slow/hard — keeps your glitch!):
+#     - Runs SENSE_CTRL once (prompts 'SENSE'), burns the no-op test row first and verifies
+#       read-back + CRC=0x55 + PLM/VRM health.
+#     - Then pauses at an explicit checkpoint: type 'CONTINUE SAME WINDOW' to burn the real
+#       records in the same Goldilocks window (confirming each record with 'YES <row> <0xword>'),
+#       OR press Enter to stop cleanly and cold-boot verify the test row first.
+#     IMPORTANT: Burn all SM/HBM records (GPC/TPC/PES/FBP/FBPA/FBIO/ROP_L2) in ONE window;
+#     do NOT power-cycle with SMs unlocked while PES/ROP_L2 remain masked (GSP boot will fail).
 sudo python3 -m vfi_burn burn --plan private/plan.json \
   --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --stage test --journal private/session.jsonl --execute
+  --stage all --journal private/session.jsonl --execute
 
-# 6. Cold power-cycle (~30 s off), capture cold snapshot, and verify Stage 1 receipt:
+# 5B. OPTIONAL SPLIT-WINDOW BURN (if your card re-glitches easily and you want a cold boot
+#     after the test row before touching real unlock records):
+#   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
+#     --port /dev/ttyACM0 --stage test --journal private/session.jsonl --execute
+#   # Cold power-cycle (~30 s off), then snapshot + verify-cold --stage test --receipt-out private/test.receipt
+#   # Re-glitch to Goldilocks, then run:
+#   sudo python3 -m vfi_burn burn --plan private/plan.json --bdf 0000:05:00.0 \
+#     --port /dev/ttyACM0 --stage real --receipt private/test.receipt \
+#     --journal private/session.jsonl --execute
+
+# 6. Cold power-cycle (~30 s off), capture final cold snapshot, and verify:
 sudo setpci -s 0000:05:00.0 COMMAND=0x0002:0x0002   # only if BAR0 reads 0xFFFFFFFF
 sudo python3 -m vfi_burn snapshot --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --previous-boot-id <BOOT_ID_FROM_JOURNAL> --out private/cold-test.json
+  --previous-boot-id <BOOT_ID_FROM_JOURNAL> --out private/cold-final.json
 python3 -m vfi_burn verify-cold --plan private/plan.json \
-  --cold private/cold-test.json --stage test \
-  --journal private/session.jsonl --receipt-out private/test.receipt
-
-# 7. Re-glitch to Goldilocks, then burn Stage 2 (real records):
-# IMPORTANT: Burn all SM/HBM records (GPC/TPC/PES/FBP/FBPA/FBIO/ROP_L2) in ONE window;
-# do NOT power-cycle with SMs unlocked while PES/ROP_L2 remain masked (GSP boot will fail).
-sudo python3 -m vfi_burn burn --plan private/plan.json \
-  --bdf 0000:05:00.0 --port /dev/ttyACM0 \
-  --stage real --receipt private/test.receipt \
-  --journal private/session.jsonl --execute
+  --cold private/cold-final.json --stage real --journal private/session.jsonl
 ```
 
 > **Without a Pico `--port`**: omit `--port` and pass `--assume-vout-mv 787.5` after verifying stock NVVDD externally.

@@ -603,8 +603,8 @@ def process_records(
     Never catches a failed write and continues. Pointer advances ONLY after
     mandatory read-back AND full post-write health/host gate pass.
     """
-    if stage not in ("test", "real"):
-        raise BurnError("stage must be 'test' or 'real'")
+    if stage not in ("test", "real", "all"):
+        raise BurnError("stage must be 'test', 'real', or 'all'")
     if max_records is not None and (isinstance(max_records, bool) or max_records < 1):
         raise BurnError("max_records must be a positive integer")
 
@@ -751,6 +751,8 @@ def process_records(
     assumed = plan.expected_masks.copy()
     if stage == "test":
         pending = list(plan.records[:1])
+    elif stage == "all":
+        pending = list(plan.records)
     else:
         reconcile(
             plan,
@@ -887,16 +889,13 @@ def process_records(
             allow_undetermined_ceiling=ov.undetermined_ceiling,
         )
         if idx > 0:
-            if use_active_sense and confirm_active_sense:
-                _confirm_active_sense(
-                    confirm, journal, show, stage=stage, phase=f"before_record:{record.name}"
-                )
-            # Repeat full live preflight immediately before every subsequent record.
+            # Repeat live health, host, die ID, and slot-scan checks before every subsequent record.
+            # SENSE_CTRL already ran once for this window (GA100 sets RESENSE_DISABLE=1 after it).
             try:
                 preflight(
                     plan,
                     reader,
-                    active_sense=use_active_sense,
+                    active_sense=False,
                     match_masks=False,
                     overrides=ov,
                 )
@@ -916,7 +915,7 @@ def process_records(
                     stage=stage,
                     plan_sha256=plan.content_hash,
                     phase=f"before_record:{record.name}",
-                    active_sense=use_active_sense,
+                    active_sense=False,
                     health=h_snap,
                     host=host_snap,
                     error=str(exc),
@@ -1096,6 +1095,40 @@ def process_records(
         )
         pointer += 1  # The ONLY advance, after read-back AND healthy gate.
 
+        if stage == "all" and record.kind == "test" and idx + 1 < len(pending):
+            show(
+                f"\nTEST ROW READ-BACK VERIFIED (row {pointer - 1} = {hex32(readback)}, "
+                f"CRC={hex32(health.crc)}, FUSECTRL={hex32(health.fusectrl)})."
+            )
+            show(
+                "NOTE: Read-back confirms the test write landed in the fuse array, NOT a cold-boot re-parse.\n"
+                "Continuing keeps your current Goldilocks glitch window (no re-glitch required)."
+            )
+            if not _confirm_token(
+                confirm,
+                "Type 'CONTINUE SAME WINDOW' to proceed to real records now "
+                "(or press Enter to stop and cold-boot verify first): ",
+                "CONTINUE SAME WINDOW",
+            ):
+                journal.append(
+                    event="stage_all_paused_after_test",
+                    test_row=pointer - 1,
+                    next_pointer=pointer,
+                    remaining_records=[r.name for r in pending[idx + 1 :]],
+                    cold_boot_verified=False,
+                )
+                show(
+                    "Paused cleanly after test row. Cold-boot, run verify-cold --stage test "
+                    "--receipt-out <file>, then resume with --stage real --receipt <file>."
+                )
+                return pointer
+            journal.append(
+                event="same_window_continue_confirmed",
+                test_row=pointer - 1,
+                next_pointer=pointer,
+                cold_boot_verified=False,
+            )
+
     journal.append(
         event="session_complete_readback_only",
         stage=stage,
@@ -1156,7 +1189,7 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
                 raise BurnError("no matching completed test-row write in this private journal")
             if not any(
                 item.get("event") == "session_start"
-                and item.get("stage") == "test"
+                and item.get("stage") in ("test", "all")
                 and item.get("boot_id") == cold["previous_boot_id"]
                 and item.get("plan_sha256") == plan.content_hash
                 for item in prior

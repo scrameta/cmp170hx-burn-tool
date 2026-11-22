@@ -373,6 +373,122 @@ class TestGA100Controller(unittest.TestCase):
             self.assertEqual(mmio2.sense_calls, 1)
             self.assertEqual(mmio2.program_calls, 2)
 
+    def test_stage_all_single_window_continue_and_pause(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        from vfi_burn.backend import Host
+        from vfi_burn.engine import Journal, process_records, verify_cold_snapshot
+        from vfi_burn.model import Plan
+
+        die = {i: 0x1000 + i for i in range(8, 16)}
+        noop_word = encode_ff(1, 7, 0x0123)
+        fbp_word = encode_ff(1, 19, 0x4200)
+        nvlink_word = encode_ff(1, 23, 0x0FE8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            work.chmod(0o700)
+            plan_path = work / "plan.json"
+            plan_path.write_text(json.dumps({
+                "schema_version": 1,
+                "card": {
+                    "pci_id": "10de:20c2",
+                    "die_rows": {str(k): f"0x{v:08x}" for k, v in die.items()},
+                    "expected_masks": {"FBP_DISABLE": "0x852"},
+                    "defect_masks": {"FBP_DISABLE": "0x840"},
+                },
+                "fpf": {"first_row": 222, "last_row": 230, "empty_word": "0x00000000"},
+                "environment": {"stock_mv": 787.5, "tolerance_mv": 25},
+                "ceiling": {"base_sm": 124},
+                "records": [
+                    {
+                        "name": "NOOP_TEST", "kind": "test", "target": "NOOP_C1_B7",
+                        "word": f"0x{noop_word:08x}", "decode": "no-op test row",
+                        "defect_sensitive": False, "expected_cold": {"FBP_DISABLE": "0x852"},
+                    },
+                    {
+                        "name": "UNLOCK_FBP", "kind": "regular", "target": "FBP_DISABLE",
+                        "word": f"0x{fbp_word:08x}", "decode": "FBP 0x852 -> 0x840",
+                        "defect_sensitive": True,
+                        "mask_update": {"field": "FBP_DISABLE", "from": "0x852", "to": "0x840"},
+                        "expected_cold": {"FBP_DISABLE": "0x840"},
+                    },
+                    {
+                        "name": "UNLOCK_NVLINK", "kind": "regular", "target": "NVLINK_DISABLE",
+                        "word": f"0x{nvlink_word:08x}", "decode": "NVLINK clear",
+                        "defect_sensitive": False,
+                    },
+                ],
+            }))
+            plan_path.chmod(0o600)
+            plan = Plan.load(plan_path)
+
+            def make_adapter(mmio_obj, boot_id):
+                ctl_obj = GA100FuseController(mmio_obj, read_only=False, sleep=lambda _: None)
+                class _Adapter:
+                    simulation = False
+                    writer_verified = True
+                    def pci_id(self): return "10de:20c2"
+                    def die_row(self, i): return ctl_obj.read_row(i)
+                    def fuse_row(self, i): return ctl_obj.read_row(i)
+                    def register(self, a): return ctl_obj.rd(a)
+                    def field(self, name): return {"FBP_DISABLE": 0x852}.get(name, 0)
+                    def health(self): return ctl_obj.read_health_registers(status_word=0, vout_mv=787.5)
+                    def host(self): return Host("pci-stub", False, False, "[none]", False, True, boot_id)
+                    def active_sense_readonly(self): ctl_obj.sense_ctrl()
+                    def write_one_record(self, row, word): ctl_obj.program_row(row, word)
+                return _Adapter()
+
+            # Case 1: Single-window --stage all with CONTINUE SAME WINDOW (no re-glitch, SENSE asked ONCE!)
+            mmio1 = FakeGA100MMIO(rows={**die, 222: noop_word}, goldilocks=True)
+            ad1 = make_adapter(mmio1, "boot-single-1")
+            j1 = work / "j1.jsonl"
+            tokens = []
+            def confirm_all(prompt, token):
+                tokens.append(token)
+                return True
+            with Journal(j1) as j:
+                ptr = process_records(
+                    plan, ad1, ad1, j, stage="all", confirm=confirm_all,
+                    strict_confirm=True, confirm_active_sense=True, show=lambda *_: None,
+                )
+            self.assertEqual(ptr, 226)
+            self.assertEqual(mmio1.sense_calls, 1)
+            self.assertEqual(mmio1.program_calls, 3)
+            self.assertEqual(tokens, [
+                "SENSE",
+                f"YES 223 0x{noop_word:08x}",
+                "CONTINUE SAME WINDOW",
+                f"YES 224 0x{fbp_word:08x}",
+                f"YES 225 0x{nvlink_word:08x}",
+            ])
+
+            # Case 2: --stage all where operator pauses after test row -> clean stop, verify-cold works!
+            mmio2 = FakeGA100MMIO(rows={**die, 222: noop_word}, goldilocks=True)
+            ad2 = make_adapter(mmio2, "boot-pause-1")
+            j2 = work / "j2.jsonl"
+            def pause_after_test(prompt, token):
+                return token != "CONTINUE SAME WINDOW"
+            with Journal(j2) as j:
+                ptr2 = process_records(
+                    plan, ad2, ad2, j, stage="all", confirm=pause_after_test,
+                    strict_confirm=True, confirm_active_sense=True, show=lambda *_: None,
+                )
+            self.assertEqual(ptr2, 224)
+            self.assertEqual(mmio2.rows[223], noop_word)
+            self.assertEqual(mmio2.rows[224], 0)
+            cold = {
+                "pci_id": "10de:20c2", "cold_boot": True,
+                "boot_id": "boot-pause-2", "previous_boot_id": "boot-pause-1",
+                "die_rows": {str(k): f"0x{v:08x}" for k, v in die.items()},
+                "fpf_rows": {"223": f"0x{noop_word:08x}"},
+                "fields": {"FBP_DISABLE": "0x852"},
+            }
+            with Journal(j2) as j:
+                rec = verify_cold_snapshot(plan, cold, stage="test", journal=j)
+            self.assertEqual(rec["status"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

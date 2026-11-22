@@ -282,9 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
     bg.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     bg.add_argument("--adapter", help="custom owner-supplied live module:factory")
     _add_live_hw_args(burn_p)
-    burn_p.add_argument("--stage", required=True, choices=("test", "real"))
+    burn_p.add_argument(
+        "--stage",
+        required=True,
+        choices=("test", "real", "all"),
+        help="'all' burns test row then asks CONTINUE SAME WINDOW to burn real records without losing the glitch; 'test'/'real' splits across a cold boot",
+    )
     burn_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
-    burn_p.add_argument("--receipt", help="cold-verified test receipt (required for real stage)")
+    burn_p.add_argument("--receipt", help="cold-verified test receipt (required for --stage real)")
     burn_p.add_argument(
         "--max-records",
         type=int,
@@ -306,9 +311,9 @@ def build_parser() -> argparse.ArgumentParser:
     sim_p = sub.add_parser("simulate", help="exercise the exact write loop on FAKE data only")
     add_plan(sim_p)
     sim_p.add_argument("--fake", required=True, help="synthetic mode-0600 JSON snapshot")
-    sim_p.add_argument("--stage", required=True, choices=("test", "real"))
+    sim_p.add_argument("--stage", required=True, choices=("test", "real", "all"))
     sim_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
-    sim_p.add_argument("--receipt", help="cold-verified test receipt (required for real stage)")
+    sim_p.add_argument("--receipt", help="cold-verified test receipt (required for --stage real)")
     sim_p.add_argument("--max-records", type=int, default=None, help="stop cleanly after N records")
     sim_p.add_argument("--dry-run", action="store_true", help="preview only; do not update fake rows")
     sim_p.add_argument("--save-fake", help="write updated fake snapshot to a NEW mode-0600 file")
