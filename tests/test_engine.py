@@ -369,7 +369,7 @@ class Harness(unittest.TestCase):
     def test_multi_record_stepping_and_resume_across_sessions(self):
         r2 = Record.parse(dict(
             name='FAKE_COMPUTE_2', kind='regular', target='GPC_DISABLE',
-            word='0x35792468', decode='second real record', defect_sensitive=True,
+            word='0x00200201', decode='second real record', defect_sensitive=True,
             mask_update=dict(field='GPC_DISABLE', from_='0x84', to='0x80') if False else {'field': 'GPC_DISABLE', 'from': '0x84', 'to': '0x80'},
             resulting_sm_count=90, expected_cold={'GPC_DISABLE': '0x80'},
         ))
@@ -547,7 +547,7 @@ class Harness(unittest.TestCase):
         with self.journal() as j:
             with self.assertRaisesRegex(BurnError, 'does not match written record'):
                 verify_cold_snapshot(full_plan, cold_real, stage='real', journal=j)
-        cold_real['fpf_rows']['224'] = '0x24681357'
+        cold_real['fpf_rows']['224'] = '0x04200201'
         with self.journal() as j:
             res = verify_cold_snapshot(full_plan, cold_real, stage='real', journal=j)
         self.assertEqual(res['status'], 'PASS')

@@ -138,7 +138,7 @@ Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (102 tests):
+# Run the full offline test suite (103 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:

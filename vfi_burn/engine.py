@@ -456,10 +456,10 @@ def reconcile(
                 f"{record.name}: REFUSED; declared {field} end state {hex32(record.to_disable)} "
                 f"leaves genuinely defective bits {hex32(genuine & ~record.to_disable)} enabled"
             )
-        if word_mapped_fields and field not in word_mapped_fields:
+        if is_ff and field not in word_mapped_fields:
             raise BurnError(
                 f"{record.name}: mask_update targets {field} but the FF word writes "
-                f"{', '.join(sorted(word_mapped_fields))} instead"
+                f"{', '.join(sorted(word_mapped_fields)) or 'no known option field'}"
             )
         if field in word_masks and word_masks[field] != record.to_disable:
             raise BurnError(

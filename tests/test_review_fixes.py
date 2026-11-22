@@ -120,6 +120,15 @@ class TestWordDerivedDefectCheck(Base):
         with self.assertRaisesRegex(BurnError, "mask_update targets GPC_DISABLE but the FF word writes"):
             reconcile(plan, rec, {"GPC_DISABLE": 0x85, "FBP_DISABLE": 0x852, "ROP_L2_DISABLE": 0})
 
+    def test_mask_update_on_unmapped_ff_block_is_refused(self):
+        plan = self.plan_with(defect_masks={"GPC_DISABLE": 0x04})
+        # Chain 1 block 99 maps no known option field, so it cannot back a GPC_DISABLE mask_update.
+        rec = _rec("UNMAPPED_BLOCK", encode_ff(1, 99, 0x0420), defect_sensitive=True,
+                   mask_field="GPC_DISABLE", from_disable=0x85, to_disable=0x84,
+                   resulting_sm_count=75)
+        with self.assertRaisesRegex(BurnError, "mask_update targets GPC_DISABLE but the FF word writes no known option field"):
+            reconcile(plan, rec, {"GPC_DISABLE": 0x85})
+
     def test_untracked_compute_field_missing_from_expected_masks_is_refused(self):
         # Block 15 (bits 240..255) carries TPC_GPC6[5..7], TPC_GPC7[0..7], and PES[0..4];
         # defect masks are present, but expected_masks lacks TPC_GPC6/TPC_GPC7.
