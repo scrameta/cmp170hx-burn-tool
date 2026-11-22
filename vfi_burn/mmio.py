@@ -21,7 +21,7 @@ KNOWN_REGISTERS: dict[str, int] = {
 
 
 def resolve_register_address(spec: str | int) -> int:
-    """Resolve a known register name or hex/decimal address into an aligned offset."""
+    """Resolve a known register name, experimental GA100 register name, or hex/decimal address."""
     if isinstance(spec, bool):
         raise BurnError("register address cannot be a boolean")
     if isinstance(spec, int):
@@ -31,13 +31,19 @@ def resolve_register_address(spec: str | int) -> int:
         if key in KNOWN_REGISTERS:
             addr = KNOWN_REGISTERS[key]
         else:
-            try:
-                addr = int(key, 0)
-            except ValueError as exc:
-                known = ", ".join(sorted(KNOWN_REGISTERS))
-                raise BurnError(
-                    f"unknown register {spec!r}; use a hex address or one of: {known}"
-                ) from exc
+            from .ga100 import EXPERIMENTAL_REGS_BY_NAME
+
+            if key in EXPERIMENTAL_REGS_BY_NAME:
+                addr = EXPERIMENTAL_REGS_BY_NAME[key]
+            else:
+                try:
+                    addr = int(key, 0)
+                except ValueError as exc:
+                    known = ", ".join(sorted(KNOWN_REGISTERS))
+                    raise BurnError(
+                        f"unknown register {spec!r}; use a hex address, one of: {known}, "
+                        "or an experimental GA100 register (e.g. FUSE_ECC_EN, FUSE_SS_DP, FEAT_READOUT_0)"
+                    ) from exc
     else:
         raise BurnError(f"invalid register specifier: {spec!r}")
     if addr < 0 or addr & 3:

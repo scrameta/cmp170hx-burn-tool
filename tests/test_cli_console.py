@@ -436,6 +436,150 @@ class TestCLIAndConsole(unittest.TestCase):
         self.assertEqual(ctl.fuse_row(224), w_pcie)
         self.assertEqual(ctl.fuse_row(225), 0)  # floorsweep word was refused!
 
+    def test_experimental_registers_cli_console_and_poison_guard(self):
+        from vfi_burn.backend import Health
+        from vfi_burn.console import format_experimental_report, read_experimental_registers
+
+        # Build a fake snapshot populated with empirical CMP 170HX experimental registers.
+        exp_fake = json.loads(self.fake_path.read_text())
+        exp_fake["registers"] = {
+            "0x00820228": "0x00000000",  # FUSE_ECC_EN (CMP=0, A100=1)
+            "0x008203f0": "0x00000000",  # FUSE_FEAT_OVR_DIS
+            "0x0082049c": "0x00000000",  # FUSE_HALF_FBPA_EN
+            "0x00820328": "0x00000000",  # FUSE_FB_CONFIG
+            "0x00821060": "0x00000068",  # FUSE_SKU_ID
+            "0x00820224": "0x00000001",  # FUSE_SS_DP
+            "0x0082059c": "0x00000005",  # FUSE_SS_FFMA
+            "0x008207d4": "0x00000005",  # FUSE_SS_FMLA16
+            "0x008207d8": "0x00000005",  # FUSE_SS_FMLA32
+            "0x008207dc": "0x00000005",  # FUSE_SS_IMLA0
+            "0x008207e0": "0x00000005",  # FUSE_SS_IMLA1
+            "0x008207e4": "0x00000005",  # FUSE_SS_IMLA2
+            "0x008207e8": "0x00000005",  # FUSE_SS_IMLA3
+            "0x008207ec": "0x00000005",  # FUSE_SS_IMLA4
+            "0x00823800": "0xffffff8f",  # FEAT_OVR_ECC_PLM
+            "0x00823814": "0x00000233",  # FEAT_READOUT_0
+            "0x00823818": "0x016db6ed",  # FEAT_READOUT_1
+            "0x00823828": "0x00000000",  # FEAT_READOUT_2
+            "0x009a0470": "0x00000000",  # FBPA_ECC_CTRL
+        }
+        exp_fake["fields"]["FUSE_ECC_EN"] = "0x00000000"
+        exp_path = self.work / "exp_fake.json"
+        exp_path.write_text(json.dumps(exp_fake))
+        exp_path.chmod(0o600)
+
+        # 1. inspect --experimental prints compact summary + full table and journals readings.
+        code, out, err = self._run_cli(
+            [
+                "inspect",
+                "--plan",
+                str(self.plan_path),
+                "--fake",
+                str(exp_path),
+                "--experimental",
+                "--journal",
+                str(self.journal_path),
+            ]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("Experimental : (read-only, NOT in FF burn plans", out)
+        self.assertIn("FUSE_ECC_EN=0x00000000 (DISABLED (CMP/consumer))", out)
+        self.assertIn("SM_SPEED_SELECT(DP=1, FMA/MLA(x8)=all 0x5 [MAX THROTTLE])", out)
+        self.assertIn("=== EXPERIMENTAL READ-ONLY REGISTERS", out)
+        self.assertIn("170HX=0x0 / A100=0x1", out)
+        self.assertIn("DRAM ECC OFF", out)
+        j_events = [json.loads(line) for line in self.journal_path.read_text().splitlines()]
+        self.assertEqual(j_events[-1]["experimental_registers"]["FUSE_ECC_EN"], "0x00000000")
+
+        # 2. manual experimental, read-reg FUSE_ECC_EN, and read-field FUSE_ECC_EN all decode cleanly.
+        code, out, err = self._run_cli(
+            [
+                "manual",
+                "--plan",
+                str(self.plan_path),
+                "--fake",
+                str(exp_path),
+                "--journal",
+                str(self.journal_path),
+                "experimental",
+            ]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("FUSE_SKU_ID", out)
+        self.assertIn("CMP 170HX (10GB ref)", out)
+
+        code, out, err = self._run_cli(
+            [
+                "manual",
+                "--plan",
+                str(self.plan_path),
+                "--fake",
+                str(exp_path),
+                "--journal",
+                str(self.journal_path),
+                "read-reg",
+                "FUSE_ECC_EN",
+            ]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("0x00820228", out)
+        self.assertIn("EXPERIMENTAL: FUSE_ECC_EN", out)
+        self.assertIn("DISABLED (CMP/consumer)", out)
+
+        code, out, err = self._run_cli(
+            [
+                "manual",
+                "--plan",
+                str(self.plan_path),
+                "--fake",
+                str(exp_path),
+                "--journal",
+                str(self.journal_path),
+                "read-field",
+                "FUSE_ECC_EN",
+            ]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("EXPERIMENTAL: DISABLED (CMP/consumer)", out)
+
+        # 3. ManualConsole 'exp' and 'reg FUSE_ECC_EN' work and journal.
+        plan = Plan.load(self.plan_path)
+        a100_ctl = FakeController(
+            fields={"GPC_DISABLE": 0x85, "FUSE_ECC_EN": 1},
+            rows={222: 0xABCD00DE, **{i: 0 for i in range(223, 228)}},
+            registers={
+                0x00820228: 0x00000001,  # FUSE_ECC_EN = 1 (A100)
+                0x00820224: 0x00000000,  # FUSE_SS_DP = 0
+                0x0082059C: 0x00000000,  # FUSE_SS_FFMA = 0
+                0x00823814: 0xEF8FF100,  # FEAT_READOUT_0 (A100 ECC active)
+                0x00823818: 0x00000000,  # FEAT_READOUT_1 (no throttle)
+                0x009A0470: 0x00000041,  # FBPA_ECC_CTRL (DRAM ECC active)
+            },
+        )
+        lines: list[str] = []
+        cmds = iter(["exp", "reg FUSE_ECC_EN", "quit"])
+        with Journal(self.journal_path) as j:
+            rc = ManualConsole(
+                plan, a100_ctl, a100_ctl, j, input_fn=lambda _="": next(cmds), show=lines.append
+            ).run()
+        self.assertEqual(rc, 0)
+        console_out = "\n".join(lines)
+        self.assertIn("ENABLED (A100/Pro)", console_out)
+        self.assertIn("ECC ACTIVE", console_out)
+        self.assertIn("NO ACTIVE THROTTLE", console_out)
+        self.assertIn("DRAM ECC ACTIVE", console_out)
+
+        # 4. Poisoned FUSECTRL must skip experimental BAR0 reads immediately.
+        poisoned_ctl = FakeController(
+            health=Health(0xBADF510E, 0, 0x55, 0xFFFFFFFF, 0xFFFFFFFF, 0, 787.5, 0),
+            registers={0x00820228: 0x00000001},
+        )
+        readings, skipped = read_experimental_registers(poisoned_ctl)
+        self.assertTrue(skipped)
+        self.assertEqual(readings, {})
+        report = "\n".join(format_experimental_report(poisoned_ctl))
+        self.assertIn("SKIPPED: FUSECTRL is poisoned", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,6 +70,11 @@ class TestMMIO(unittest.TestCase):
         self.assertEqual(resolve_register_address("FUSECTRL"), REG_FUSECTRL)
         self.assertEqual(resolve_register_address("debugctrl"), REG_DEBUGCTRL)
         self.assertEqual(resolve_register_address("plm_f8"), REG_PLM_F8)
+        self.assertEqual(resolve_register_address("FUSE_ECC_EN"), 0x00820228)
+        self.assertEqual(resolve_register_address("opt_ecc_en"), 0x00820228)
+        self.assertEqual(resolve_register_address("FUSE_SS_DP"), 0x00820224)
+        self.assertEqual(resolve_register_address("FEAT_READOUT_0"), 0x00823814)
+        self.assertEqual(resolve_register_address("FBPA_ECC_CTRL"), 0x009A0470)
         self.assertEqual(resolve_register_address("0x820000"), REG_FUSECTRL)
         self.assertEqual(resolve_register_address(0x8200F8), REG_PLM_F8)
         with self.assertRaisesRegex(BurnError, "aligned"):

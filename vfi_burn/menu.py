@@ -19,7 +19,13 @@ from .backend import (
     snapshot_data,
     write_private_json,
 )
-from .console import ManualConsole, format_plan_review, format_status_report
+from .console import (
+    ManualConsole,
+    format_experimental_report,
+    format_plan_review,
+    format_status_report,
+    read_experimental_registers,
+)
 from .engine import (
     Journal,
     Overrides,
@@ -184,6 +190,7 @@ class BurnMenu:
         self.show("   [9] Manual Low-Level Console (read rows/regs/fields, diff, single write)")
         self.show("  [10] Decode Any 32-Bit FF Word (offline)")
         self.show("  [11] Cold-Boot Snapshot & Verify (snapshot / verify-cold)")
+        self.show("  [12] Experimental Registers (read-only: ECC, SM speed select, SKU, readouts)")
         self.show("   [0] Quit")
         self.show("-" * 72)
 
@@ -191,7 +198,7 @@ class BurnMenu:
         while True:
             self._render_header()
             try:
-                choice = self.input_fn("Select [0-11]: ").strip()
+                choice = self.input_fn("Select [0-12]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 self.show("\nExiting vfi_burn menu.")
                 return 0
@@ -218,10 +225,11 @@ class BurnMenu:
             "9": self._menu_manual_console,
             "10": self._menu_decode_word,
             "11": self._menu_cold_verify,
+            "12": self._menu_experimental_registers,
         }
         fn = handlers.get(choice)
         if fn is None:
-            self.show(f"Unknown selection {choice!r}; pick 0-11.")
+            self.show(f"Unknown selection {choice!r}; pick 0-12.")
             return
         fn()
 
@@ -591,3 +599,24 @@ class BurnMenu:
                 if stage == "test":
                     self.s.receipt_path = receipt_out
             self.show("PASS: cold snapshot matches declared expectations (not independently authenticated).")
+
+    # ------------------------------------------------------------------ [12] Experimental Registers
+    def _menu_experimental_registers(self) -> None:
+        backend, owned = self._open_backend(writable=False)
+        try:
+            check_host_readonly_safe(backend.host())
+            readings, poisoned = read_experimental_registers(backend)
+            self.show("")
+            for line in format_experimental_report(
+                backend, readings=readings, poisoned=poisoned
+            ):
+                self.show(line)
+            with Journal(self.s.journal_path) as j:
+                j.append(
+                    event="manual_experimental_read",
+                    pci_id=backend.pci_id(),
+                    skipped_poison=poisoned,
+                    registers={k: hex32(v) for k, v in readings.items()},
+                )
+        finally:
+            self._close_if_owned(backend, owned)
