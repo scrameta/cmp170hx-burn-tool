@@ -14,6 +14,7 @@ from .fuses import (
     REG_FUSECTRL,
     REG_PLM_F8,
 )
+from .interfaces import MMIOBus, MMIOReadBus
 from .model import BurnError
 
 KNOWN_REGISTERS: dict[str, int] = {
@@ -53,7 +54,7 @@ def resolve_register_address(spec: str | int) -> int:
     return addr
 
 
-class ReadOnlyMMIO:
+class ReadOnlyMMIO(MMIOReadBus):
     """Read-only 32-bit aligned MMIO wrapper. Physically cannot issue MMIO writes."""
 
     def __init__(self, buf) -> None:
@@ -91,7 +92,7 @@ class ReadOnlyMMIO:
             base.release()
 
 
-class AlignedMMIO(ReadOnlyMMIO):
+class AlignedMMIO(ReadOnlyMMIO, MMIOBus):
     """Read/write 32-bit aligned MMIO wrapper with single-store and DEBUGCTRL guards.
 
     Uses ``memoryview(buf)[offset:offset+4].cast("I")[0] = value`` to emit a single

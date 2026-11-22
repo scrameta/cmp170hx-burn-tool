@@ -21,7 +21,6 @@ import stat
 import struct
 import time
 
-from .backend import Health, Host
 from .ffrecord import (
     FF_ROW_MAX,
     FF_ROW_MIN,
@@ -61,6 +60,7 @@ from .fuses import (
     ExperimentalRegister,
     decode_experimental_register,
 )
+from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, Health, Host, MMIOBus
 from .mmio import AlignedMMIO
 from .model import BurnError, PreTriggerRefusal, SKU_CMP170HX_8GB, is_poison
 
@@ -115,10 +115,10 @@ def parse_pcie_lnkcap2(cfg: bytes) -> int:
     raise BurnError("PCI Express capability (ID 0x10) not found in config space")
 
 
-class GA100FuseController:
-    """Low-level GA100 fuse-controller protocol over AlignedMMIO.
+class GA100FuseController(FuseControllerHAL):
+    """Low-level GA100 fuse-controller HAL over any MMIOBus (real BAR0 or simulated PCIe).
 
-    Works identically over real BAR0 mmap or an in-memory bytearray/mock for unit tests.
+    Works identically over real BAR0 mmap (``AlignedMMIO``) or a simulated PCIe MMIO bus.
     When ``read_only=True``, writes are strictly allowlisted to CMD_READ (and optionally
     CMD_SENSE_CTRL + volatile pre-sense latch); CMD_PROGRAM / FUSEWDATA(nonzero) /
     SBFE_SHADOW are physically blocked inside ``_wr``.
@@ -126,7 +126,7 @@ class GA100FuseController:
 
     def __init__(
         self,
-        mmio: AlignedMMIO,
+        mmio: MMIOBus,
         *,
         read_only: bool = True,
         sleep=time.sleep,
@@ -585,7 +585,7 @@ class BDFLock:
         self.release()
 
 
-class GA100LiveAdapter:
+class GA100LiveAdapter(FuseReader, FuseWriter):
     """Linux live hardware adapter for CMP 170HX 8 GB (10de:20c2) via sysfs BAR0.
 
     Read-only by default (``writable=False``). When ``writable=True`` is requested by

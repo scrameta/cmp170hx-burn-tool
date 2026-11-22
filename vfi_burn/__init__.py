@@ -12,6 +12,7 @@ from .fuse_rules import (
 )
 from .fuses import FFLocation, FUSE_CATALOG, FuseDefinition, FuseType
 from .ga100 import GA100FuseController, GA100LiveAdapter
+from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, MMIOBus, MMIOReadBus
 from .menu import BurnMenu, MenuSession
 from .mmio import AlignedMMIO, ReadOnlyMMIO
 from .model import BurnError, Plan, Record
@@ -30,14 +31,19 @@ __all__ = [
     "FUSE_GROUPS",
     "FakeController",
     "FuseCombinationRule",
+    "FuseControllerHAL",
     "FuseDefinition",
     "FuseGroup",
+    "FuseReader",
     "FuseType",
+    "FuseWriter",
     "GA100FuseController",
     "GA100LiveAdapter",
     "Health",
     "Host",
     "Journal",
+    "MMIOBus",
+    "MMIOReadBus",
     "MenuSession",
     "MissingWriter",
     "Overrides",
