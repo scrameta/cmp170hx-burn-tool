@@ -9,6 +9,8 @@ from vfi_burn.fuse_rules import (
     FUSE_GROUPS_BY_NAME,
     FuseCombinationRule,
     evaluate_fuse_combinations,
+    poweroff_domain_for_group,
+    poweroff_domains_for_groups,
 )
 from vfi_burn.fuses import FUSES_BY_KEY
 
@@ -18,12 +20,22 @@ class TestFuseGroupsAndRules(unittest.TestCase):
         self.assertGreaterEqual(len(FUSE_GROUPS), 5)
         for grp in FUSE_GROUPS:
             self.assertTrue(grp.member_keys, f"group {grp.name} has no members")
+            self.assertTrue(grp.poweroff_domain, f"group {grp.name} has no poweroff_domain")
             for k in grp.member_keys:
                 self.assertIn(k, FUSES_BY_KEY)
                 self.assertTrue(FUSES_BY_KEY[k].ff_overridable)
         self.assertIn("gpc_disable", FUSE_GROUPS_BY_NAME["compute"].member_keys)
         self.assertIn("fbp_disable", FUSE_GROUPS_BY_NAME["memory"].member_keys)
         self.assertIn("pcie_magic_gen4_dis", FUSE_GROUPS_BY_NAME["pcie"].member_keys)
+
+    def test_compute_and_memory_share_atomic_sm_hbm_poweroff_domain(self):
+        self.assertEqual(poweroff_domain_for_group("compute"), "sm_hbm")
+        self.assertEqual(poweroff_domain_for_group("memory"), "sm_hbm")
+        self.assertEqual(poweroff_domain_for_group("pcie"), "pcie")
+        self.assertEqual(
+            poweroff_domains_for_groups(["compute", "memory", "noop"]),
+            {"sm_hbm"},
+        )
 
     def test_combination_rule_abc_cannot_be_instantiated_incomplete(self):
         class IncompleteRule(FuseCombinationRule):

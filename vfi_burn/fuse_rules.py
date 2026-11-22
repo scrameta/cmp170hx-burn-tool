@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from .fuses import (
     FUSE_CATALOG,
@@ -26,6 +26,7 @@ class FuseGroup:
     description: str
     member_keys: tuple[str, ...]
     atomic_poweroff: bool = True
+    poweroff_domain: str = ""
 
 
 def _keys_for_group(group: str) -> tuple[str, ...]:
@@ -40,34 +41,57 @@ FUSE_GROUPS: tuple[FuseGroup, ...] = (
         description="Compute floorsweep hierarchy (GPC_DISABLE, TPC_GPC0..7_DISABLE, PES_DISABLE)",
         member_keys=_keys_for_group("compute"),
         atomic_poweroff=True,
+        poweroff_domain="sm_hbm",
     ),
     FuseGroup(
         name="memory",
         description="Memory partition hierarchy (FBP_DISABLE, FBPA_DISABLE, FBIO_DISABLE, ROP_L2_DISABLE)",
         member_keys=_keys_for_group("memory"),
         atomic_poweroff=True,
+        poweroff_domain="sm_hbm",
     ),
     FuseGroup(
         name="pcie",
-        description="PCIe Gen3/Gen4 speed & boot-speed fuses (chain 2 blocks 39, 47, 49)",
+        description="PCIe Gen3/Gen4 speed & boot-speed fuses (chain 2 blocks 39, 45-47, 49)",
         member_keys=_keys_for_group("pcie"),
         atomic_poweroff=True,
+        poweroff_domain="pcie",
     ),
     FuseGroup(
         name="nvlink",
         description="NVLink disable mask (requires U11 bridge mod + firmware bypass)",
         member_keys=_keys_for_group("nvlink"),
         atomic_poweroff=True,
+        poweroff_domain="nvlink",
     ),
     FuseGroup(
         name="mig",
         description="SYS_PIPE / MIG disable mask (experimental)",
         member_keys=_keys_for_group("mig"),
         atomic_poweroff=True,
+        poweroff_domain="mig",
     ),
 )
 
 FUSE_GROUPS_BY_NAME: dict[str, FuseGroup] = {g.name: g for g in FUSE_GROUPS}
+
+
+def poweroff_domain_for_group(group: str) -> str:
+    """Return the atomic power-off domain for functional group ``group``.
+
+    ``compute`` (GPC/TPC/PES) and ``memory`` (FBP/FBPA/FBIO/ROP_L2) share the
+    ``sm_hbm`` atomic power-off domain because power-cycling with SMs unlocked
+    while PES/ROP_L2 remain masked causes GSP boot failure.
+    """
+    fg = FUSE_GROUPS_BY_NAME.get(group)
+    if fg is not None and fg.poweroff_domain:
+        return fg.poweroff_domain
+    return group
+
+
+def poweroff_domains_for_groups(groups: Iterable[str]) -> set[str]:
+    """Map functional group names to their non-noop atomic power-off domains."""
+    return {poweroff_domain_for_group(g) for g in groups if g != "noop"}
 
 
 @dataclass(frozen=True)
