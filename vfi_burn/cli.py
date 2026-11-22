@@ -158,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help="REQUIRED operator-supplied non-defective SM ceiling for this SKU (e.g. 122); "
-        "the card cannot tell you this (BURN_SPEC §4)",
+        "the card cannot tell you this",
     )
     imp_p.add_argument("--override-sm", type=int, default=None)
     imp_p.add_argument(

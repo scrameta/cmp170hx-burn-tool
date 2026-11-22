@@ -190,7 +190,7 @@ class GA100FuseController(FuseControllerHAL):
             self._sleep(0.001)
 
     def read_health_registers(self) -> Health:
-        """Read health registers in BURN_SPEC order: FUSECTRL FIRST, stopping on poison."""
+        """Read health registers in safe order: FUSECTRL FIRST, stopping on poison."""
         ctrl = self._check_fusectrl_first()
         dsov = self.rd(REG_DSOV_STATUS)
         if is_poison(dsov):
@@ -390,7 +390,7 @@ class GA100FuseController(FuseControllerHAL):
         self._wr(REG_WDATA_WR_SECURE, 0)
         if self.rd(REG_WDATA_WR_SECURE) != 0:
             raise BurnError("WDATA_WR_SECURE did not clear to 0")
-        # BURN_SPEC §3/§6: a closed/partial PLM_f8 means the frame is too deep -> abort.
+        # A closed/partial PLM_f8 means the frame is too deep -> abort.
         # Do NOT re-open it via CTRL_WR_SECURE; that would mask the diagnostic.
         plm_f8 = self.rd(REG_PLM_F8)
         if plm_f8 != 0xFFFFFFFF:
