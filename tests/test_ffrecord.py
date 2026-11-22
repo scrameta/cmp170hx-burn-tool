@@ -87,6 +87,10 @@ class TestFFRecord(unittest.TestCase):
                     "gpc_defective": "0x0",
                     "fbp_disable": "0x852",
                     "fbp_defective": "0x840",
+                    "fbpa_disable": "0x2460",  # = replay of row 222 (c1/b7=0x0123)
+                    "fbpa_defective": "0x0",
+                    "rop_l2_disable": "0x0",
+                    "rop_l2_defective": "0x0",
                 },
             }
             burn_plan = {
@@ -120,6 +124,7 @@ class TestFFRecord(unittest.TestCase):
                     "--burn-plan", str(bp),
                     "--dump", str(dp),
                     "--out", str(outp),
+                    "--base-sm", "122",
                     "--prepend-noop-test",
                 ])
             self.assertEqual(rc, 0, err_buf.getvalue())
@@ -144,6 +149,8 @@ class TestFFRecord(unittest.TestCase):
             work.chmod(0o700)
             ff_rows = {str(i): f"0x{0x1000 + i:08x}" for i in range(8, 16)}
             ff_rows["222"] = f"0x{encode_ff(1, 19, 0x4290):08x}"
+            for r in range(223, 487):
+                ff_rows[str(r)] = "0x00000000"
             dump = {
                 "sku": "8gb",
                 "ff_rows": ff_rows,
@@ -161,7 +168,7 @@ class TestFFRecord(unittest.TestCase):
             dp.write_text(json.dumps(dump)); dp.chmod(0o600)
             bp.write_text(json.dumps(burn_plan)); bp.chmod(0o600)
             with self.assertRaisesRegex(BurnError, "genuinely defective"):
-                import_ffcalc_plan(bp, dp)
+                import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
 
     def test_make_noop_test_record(self):
         rows = {222: encode_ff(1, 7, 0xABCD)}

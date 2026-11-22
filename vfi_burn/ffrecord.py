@@ -16,10 +16,8 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .model import BurnError, SKU_CMP170HX_8GB, require_private_file, u32
+from .model import FF_ROW_MAX, FF_ROW_MIN, BurnError, SKU_CMP170HX_8GB, require_private_file, u32
 
-FF_ROW_MIN = 222
-FF_ROW_MAX = 486
 FF_EMPTY_WORD = 0x00000000
 DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
 TOTAL_FUSE_ROWS = 512
@@ -170,6 +168,68 @@ def decode_ff(word: int) -> FFRecord:
 def fields_in_block(chain: int, block: int) -> list[OptionField]:
     """Return all known GA100 option fields that overlap (chain, block)."""
     return [f for f in OPTION_FIELDS if f.chain == chain and block in f.blocks]
+
+
+def _field_bit_positions(f: OptionField, block: int) -> list[tuple[int, int]]:
+    """[(field_relative_bit, block_local_bit)] for the bits of ``f`` that live in ``block``."""
+    base = block * 16
+    return [
+        (base + i - f.bit, i)
+        for i in range(16)
+        if f.bit <= base + i < f.bit + f.width
+    ]
+
+
+def apply_ff_word_to_masks(word: int, masks: dict[str, int]) -> dict[str, int]:
+    """Return the mask fields (canonical names) whose value is changed/fixed by ``word``.
+
+    Uses FF replace semantics: after the record, every bit of (chain, block) equals the
+    record's data. Only fields already present in ``masks`` are returned, with their
+    bits in this block overwritten and all other bits kept.
+    """
+    rec = decode_ff(word)
+    out: dict[str, int] = {}
+    for f in fields_in_block(rec.chain, rec.block):
+        name = FFCALC_KEY_TO_FIELD.get(f.key)
+        if name is None or name not in masks:
+            continue
+        value = masks[name]
+        for j, i in _field_bit_positions(f, rec.block):
+            if (rec.data >> i) & 1:
+                value |= 1 << j
+            else:
+                value &= ~(1 << j)
+        out[name] = value & 0xFFFFFFFF
+    return out
+
+
+def ff_word_defect_audit(word: int, defect_masks: dict[str, int]) -> tuple[list[str], list[str]]:
+    """Audit one FF word against genuine defect masks, independent of plan metadata.
+
+    Returns ``(violations, unknown_fields)``. Under replace semantics the record fully
+    determines its 16-bit block, so every genuinely defective unit whose disable bit
+    lives in that block MUST stay disabled (bit = 1) in the new data. This holds no
+    matter what the plan's ``mask_update``/``defect_sensitive`` metadata claims and
+    regardless of the block's previous value.
+    """
+    rec = decode_ff(word)
+    violations: list[str] = []
+    unknown: list[str] = []
+    for f in fields_in_block(rec.chain, rec.block):
+        name = FFCALC_KEY_TO_FIELD.get(f.key)
+        if name is None:
+            continue
+        if name not in defect_masks:
+            unknown.append(name)
+            continue
+        defect = defect_masks[name]
+        bad = [j for j, i in _field_bit_positions(f, rec.block) if (defect >> j) & 1 and not (rec.data >> i) & 1]
+        if bad:
+            violations.append(
+                f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} re-enables genuinely defective "
+                f"{name} unit bit(s) {bad} (defect mask 0x{defect:x})"
+            )
+    return violations, unknown
 
 
 def _field_local_mask(f: OptionField, block: int) -> int:
@@ -403,9 +463,9 @@ def import_ffcalc_plan(
     burn_plan_path: str | Path,
     dump_path: str | Path,
     *,
+    base_sm_ceiling: int,
     stock_mv: float = 787.5,
     tolerance_mv: float = 25.0,
-    base_sm_ceiling: int = 128,
     override_sm_ceiling: int | None = None,
     first_record_as_test: bool = True,
     prepend_noop_test: bool = False,
@@ -417,10 +477,18 @@ def import_ffcalc_plan(
     Validates:
       - All 8 Die ID rows (8..15) are present in the card dump (refuses incomplete dumps).
       - Every planned FF record decodes cleanly (IFF bit 5 == 0) and matches chain/block/new.
-      - Rows are contiguous inside 222..486 and strictly after existing non-zero FF rows.
-      - No planned record clears any bit marked in the card's *_defective registers.
+      - The dump covers every FF row 222..486, and its used rows are one contiguous prefix.
+      - Planned rows are contiguous, start at the first free FF row and never collide.
+      - Each planned ``old`` value equals the replayed current block.
+      - The dump's fused mask registers agree with the FF replay (model check).
+      - No planned record leaves any *_defective unit enabled (word-derived check).
       - Computes exact before/after disable masks and SM counts from full FF replay.
+
+    ``base_sm_ceiling`` is required: it is community/operator knowledge the card cannot
+    supply (BURN_SPEC §4), and defaulting it to the full-die 128 made the check vacuous.
     """
+    if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
+        raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")
     bp = require_private_file(burn_plan_path, "ffcalc burn plan")
     dp = require_private_file(dump_path, "ffcalc card dump")
     try:
@@ -445,6 +513,22 @@ def import_ffcalc_plan(
             f"ffcalc dump missing die ID rows {missing_die}; re-capture all 512 rows with --read-ff-rows"
         )
     die_rows = {str(r): f"0x{ff_rows[r]:08x}" for r in DIE_ID_ROWS}
+
+    # Row occupancy must be fully known (mirrors cmp170hx-ffcalc ffrows.require).
+    missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
+    if missing_ff:
+        raise BurnError(
+            f"ffcalc dump covers only {FF_ROW_MAX - FF_ROW_MIN + 1 - len(missing_ff)} of "
+            f"{FF_ROW_MAX - FF_ROW_MIN + 1} FF rows (missing e.g. {missing_ff[:5]}); "
+            "an unread row would look free"
+        )
+    region = [ff_rows[r] for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)]
+    first_free_idx = next((i for i, v in enumerate(region) if v == FF_EMPTY_WORD), None)
+    if first_free_idx is None:
+        raise BurnError("ffcalc dump shows the FF region full")
+    if any(v != FF_EMPTY_WORD for v in region[first_free_idx:]):
+        raise BurnError("ffcalc dump FF rows are non-contiguous; vfi_burn's free-slot proof would refuse")
+    next_row = FF_ROW_MIN + first_free_idx
 
     opt_words = dump_obj.get("option_words", {})
     if not isinstance(opt_words, dict):
@@ -471,6 +555,16 @@ def import_ffcalc_plan(
     running_masks = dict(expected_masks)
     vfi_records: list[dict] = []
 
+    base_blocks = replay_ff_rows(ff_rows)
+    replay_fields = decode_all_fields(base_blocks)
+    for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
+        if vfi_name in expected_masks and replay_fields[ff_key] != expected_masks[vfi_name]:
+            raise BurnError(
+                f"dump fused {vfi_name}=0x{expected_masks[vfi_name]:x} disagrees with FF replay "
+                f"0x{replay_fields[ff_key]:x}; the FF-only option model does not hold for this card, "
+                "so planned before/after masks cannot be trusted"
+            )
+
     if prepend_noop_test:
         noop = make_noop_test_record(ff_rows)
         if "GPC_DISABLE" in expected_masks:
@@ -480,6 +574,19 @@ def import_ffcalc_plan(
             noop["expected_cold"] = {first_key: f"0x{expected_masks[first_key]:x}"}
         vfi_records.append(noop)
         first_record_as_test = False
+        next_row += 1  # the no-op occupies the first free row; planned rows shift by one
+
+    planned_rows = [int(item["row"]) for item in burn_list]
+    if len(set(planned_rows)) != len(planned_rows):
+        raise BurnError("ffcalc burn plan uses the same row twice")
+    expected_first = next_row - (1 if prepend_noop_test else 0)
+    if planned_rows != list(range(expected_first, expected_first + len(planned_rows))):
+        raise BurnError(
+            f"ffcalc planned rows {planned_rows[:3]}... are not contiguous from the first free "
+            f"FF row {expected_first} of this dump (stale dump or plan?)"
+        )
+    if (next_row + len(planned_rows) - 1) > FF_ROW_MAX:
+        raise BurnError("plan does not fit in the remaining FF rows")
 
     for idx, item in enumerate(burn_list):
         row = int(item["row"])
@@ -492,8 +599,15 @@ def import_ffcalc_plan(
                 f"burn[{idx}] row {row}: record 0x{word:08x} disagrees with "
                 f"chain={chain} block={block} new=0x{new_data:04x}"
             )
+        if "old" in item:
+            replay_old = replay_ff_rows(running_rows).get(chain, {}).get(block, 0)
+            if u32(item["old"], f"burn[{idx}].old") != replay_old:
+                raise BurnError(
+                    f"burn[{idx}] row {row}: planned old=0x{u32(item['old'], 'old'):04x} != "
+                    f"replayed current block 0x{replay_old:04x}"
+                )
         sim = simulate_ff_write(running_rows, row, word)
-        running_rows[row] = word
+        running_rows[row] = word  # rows validated free + contiguous above; no-op test is replay-neutral
 
         fields = list(item.get("fields", []))
         is_pcie = any(
@@ -541,26 +655,32 @@ def import_ffcalc_plan(
             "expected_cold": {},
         }
 
+        for ff_key, (before_v, after_v) in changed_masks:
+            vfi_name = FFCALC_KEY_TO_FIELD[ff_key]
+            if running_masks[vfi_name] != before_v:
+                # Never silently drop reconciliation metadata: fail closed.
+                raise BurnError(
+                    f"burn[{idx}] row {row}: tracked {vfi_name}=0x{running_masks[vfi_name]:x} "
+                    f"!= replayed before-value 0x{before_v:x}"
+                )
+            running_masks[vfi_name] = after_v
         if len(changed_masks) == 1:
             ff_key, (before_v, after_v) = changed_masks[0]
             vfi_name = FFCALC_KEY_TO_FIELD[ff_key]
-            if running_masks[vfi_name] == before_v:
-                running_masks[vfi_name] = after_v
-                rec_dict["defect_sensitive"] = True
-                rec_dict["mask_update"] = {
-                    "field": vfi_name,
-                    "from": f"0x{before_v:x}",
-                    "to": f"0x{after_v:x}",
-                }
-                if any(tok in vfi_name for tok in ("GPC", "TPC", "SM")):
-                    gpc_d = running_masks.get("GPC_DISABLE", 0)
-                    tpc_ds = [running_masks.get(f"TPC_GPC{i}_DISABLE", 0) for i in range(TOTAL_GPC)]
-                    rec_dict["resulting_sm_count"] = compute_sm_count(gpc_d, tpc_ds)
-        else:
-            # Multi-field shared 16-bit block: track updated masks cleanly and attach cold expectations.
-            for ff_key, (before_v, after_v) in changed_masks:
-                vfi_name = FFCALC_KEY_TO_FIELD[ff_key]
-                running_masks[vfi_name] = after_v
+            rec_dict["defect_sensitive"] = True
+            rec_dict["mask_update"] = {
+                "field": vfi_name,
+                "from": f"0x{before_v:x}",
+                "to": f"0x{after_v:x}",
+            }
+        # Multi-field shared blocks cannot carry one mask_update; the engine re-derives and
+        # defect-checks every field from the word itself. Always attach the SM count.
+        if any(
+            any(tok in FFCALC_KEY_TO_FIELD[k] for tok in ("GPC", "TPC")) for k, _ in changed_masks
+        ):
+            gpc_d = running_masks.get("GPC_DISABLE", 0)
+            tpc_ds = [running_masks.get(f"TPC_GPC{i}_DISABLE", 0) for i in range(TOTAL_GPC)]
+            rec_dict["resulting_sm_count"] = compute_sm_count(gpc_d, tpc_ds)
 
         for ff_key, (_before_v, after_v) in changed_masks:
             rec_dict["expected_cold"][FFCALC_KEY_TO_FIELD[ff_key]] = f"0x{after_v:x}"
@@ -588,7 +708,8 @@ def import_ffcalc_plan(
         "MAGIC_D": f"0x{final_decoded['magic_d']:x}",
         "BOOT_GEN3_DIS": f"0x{final_decoded['pcie_boot_gen3_dis']:x}",
         "DISABLE_GEN3_SPEED": f"0x{final_decoded['disable_gen3_speed_bit1'] | final_decoded['disable_gen3_speed_bit9']:x}",
-        "LnkCap2": f"0x{link_cap2_after:x}",
+        # Only expect the new link capability if the plan actually burns a PCIe record.
+        "LnkCap2": f"0x{(link_cap2_after if any(r.get('kind') == 'pcie' for r in vfi_records) else link_cap2_before):x}",
         "SM_COUNT": final_sm,
     }
 
@@ -612,7 +733,7 @@ def import_ffcalc_plan(
             "tolerance_mv": tolerance_mv,
         },
         "ceiling": {
-            "base_sm": max(base_sm_ceiling, final_sm) if base_sm_ceiling is None else base_sm_ceiling,
+            "base_sm": base_sm_ceiling,
             "override_sm": override_sm_ceiling,
             "reconfig_semantics_verified": False,
         },

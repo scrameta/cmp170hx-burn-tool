@@ -352,7 +352,7 @@ class TestCLIAndConsole(unittest.TestCase):
         w_pcie = encode_ff(2, 47, 0x0000)
         ctl = FakeController(
             fields={"GPC_DISABLE": 0x85},
-            rows={222: 0xABCD00DE, 223: 0x13572468, 224: 0, 225: 0, 226: 0, 227: 0},
+            rows={222: 0xABCD00DE, 223: 0x13572448, 224: 0, 225: 0, 226: 0, 227: 0},
         )
         lines: list[str] = []
         cmds = iter([
@@ -397,7 +397,7 @@ class TestCLIAndConsole(unittest.TestCase):
         w_gpc = encode_ff(1, 8, 0x0420)  # floorsweep GPC word
         ctl = FakeController(
             fields={"GPC_DISABLE": 0x85},
-            rows={222: 0xABCD00DE, 223: 0x13572468, 224: 0, 225: 0, 226: 0, 227: 0},
+            rows={222: 0xABCD00DE, 223: 0x13572448, 224: 0, 225: 0, 226: 0, 227: 0},
         )
         lines: list[str] = []
         cmds = iter([

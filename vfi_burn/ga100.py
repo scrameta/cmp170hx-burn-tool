@@ -31,7 +31,7 @@ from .ffrecord import (
     decode_ff,
 )
 from .mmio import AlignedMMIO, REG_DEBUGCTRL, REG_FUSECTRL, REG_PLM_F8
-from .model import BurnError, SKU_CMP170HX_8GB, is_poison
+from .model import BurnError, PreTriggerRefusal, SKU_CMP170HX_8GB, is_poison
 
 BAR0_MAP_SIZE = 0x01000000  # 16 MiB BAR0 window
 
@@ -93,6 +93,7 @@ OPTION_REGS: dict[str, int] = {
     "MAGIC_D": 0x00820520,
     "OPT_PCIE_MAGIC_BITS_D": 0x00820520,
     "BOOT_GEN23_DIS": 0x0082057C,
+    "OPT_PCIE_BOOT_GEN23_DIS": 0x0082057C,
     "BOOT_GEN3_DIS": 0x00820580,
     "OPT_PCIE_BOOT_GEN3_DIS": 0x00820580,
     "PCIE_DEVIDA": 0x008204D8,
@@ -100,6 +101,7 @@ OPTION_REGS: dict[str, int] = {
     **{f"TPC_GPC{i}_DISABLE": 0x00820760 + 4 * i for i in range(TOTAL_GPC)},
     **{f"TPC_GPC{i}_STATUS": 0x00820C38 + 4 * i for i in range(TOTAL_GPC)},
 }
+
 
 TPC_DEFECTIVE_REGS: tuple[int, ...] = (
     0x008205C8,
@@ -446,36 +448,63 @@ class GA100FuseController:
         self._wr(REG_WDATA_WR_SECURE, 0)
         if self.rd(REG_WDATA_WR_SECURE) != 0:
             raise BurnError("WDATA_WR_SECURE did not clear to 0")
-        if self.rd(REG_PLM_F8) != 0xFFFFFFFF:
-            self._wr(REG_CTRL_WR_SECURE, 0)
+        # BURN_SPEC §3/§6: a closed/partial PLM_f8 means the frame is too deep -> abort.
+        # Do NOT re-open it via CTRL_WR_SECURE; that would mask the diagnostic.
+        plm_f8 = self.rd(REG_PLM_F8)
+        if plm_f8 != 0xFFFFFFFF:
+            raise BurnError(
+                f"PLM_f8=0x{plm_f8:08x} not fully open at arm time: frame too deep / host access "
+                "revoked; refusing to re-open it in software"
+            )
 
         problems = self.armed_problems()
         if problems:
             raise BurnError("controller not armed: " + "; ".join(problems))
 
-    def program_row(self, row: int, word: int, *, timeout_s: float = 10.0) -> int:
-        """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions."""
-        if self.read_only:
-            raise BurnError("cannot program fuse on a read-only controller")
-        if isinstance(row, bool) or not (FF_ROW_MIN <= row <= FF_ROW_MAX):
-            raise BurnError(
-                f"REFUSED: row {row} is outside the FF region {FF_ROW_MIN}..{FF_ROW_MAX} "
-                "(rows 0..221 are regular/control/FPF; 487..511 are IFF)"
-            )
-        decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
-        if is_poison(word):
-            raise BurnError(f"REFUSED: payload 0x{word:08x} matches poison prefix")
-
-        self.arm()
-
-        current = self.read_row(row)
-        if current != FF_EMPTY_WORD:
-            raise BurnError(
-                f"REFUSED: target FF row {row} is not blank (reads 0x{current:08x}, want 0x00000000)"
-            )
-
-        orig_addr = self.rd(REG_FUSEADDR)
+    def _relatch_no_burn(self, orig_addr: int | None) -> None:
+        """Best effort, only when FUSECTRL is idle (never after poison): restore FUSEADDR
+        and put the FUSEWDATA=0 no-burn latch back, so a stray CMD_PROGRAM (other tool,
+        operator typo, firmware) cannot re-burn the staged word into whatever row
+        FUSEADDR now selects."""
         try:
+            if not is_fusectrl_idle(self.rd(REG_FUSECTRL)):
+                return
+            if orig_addr is not None:
+                self._wr(REG_FUSEADDR, orig_addr)
+            self._wr(REG_FUSEWDATA, 0)
+        except Exception:
+            pass
+
+    def program_row(self, row: int, word: int, *, timeout_s: float = 10.0) -> int:
+        """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions.
+
+        Every failure before CMD_PROGRAM is raised as ``PreTriggerRefusal`` (nothing burned).
+        Failures after CMD_PROGRAM are plain ``BurnError`` (row may be partially programmed).
+        """
+        orig_addr: int | None = None
+        staged = False
+        try:
+            if self.read_only:
+                raise BurnError("cannot program fuse on a read-only controller")
+            if isinstance(row, bool) or not (FF_ROW_MIN <= row <= FF_ROW_MAX):
+                raise BurnError(
+                    f"REFUSED: row {row} is outside the FF region {FF_ROW_MIN}..{FF_ROW_MAX} "
+                    "(rows 0..221 are regular/control/FPF; 487..511 are IFF)"
+                )
+            decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
+            if is_poison(word):
+                raise BurnError(f"REFUSED: payload 0x{word:08x} matches poison prefix")
+
+            self.arm()
+
+            current = self.read_row(row)
+            if current != FF_EMPTY_WORD:
+                raise BurnError(
+                    f"REFUSED: target FF row {row} is not blank (reads 0x{current:08x}, want 0x00000000)"
+                )
+
+            orig_addr = self.rd(REG_FUSEADDR)
+            staged = True
             self._wr(REG_FUSECTRL, CMD_IDLE)
             self._wr(REG_FUSEADDR, row)
             if self.rd(REG_FUSEADDR) != row:
@@ -487,14 +516,25 @@ class GA100FuseController:
                     f"FUSEWDATA readback mismatch before CMD_PROGRAM: "
                     f"wrote 0x{word:08x}, read 0x{rb_wdata:08x} (PLM_f4 blocked?)"
                 )
+        except PreTriggerRefusal:
+            if staged:
+                self._relatch_no_burn(orig_addr)
+            raise
+        except BurnError as exc:
+            if staged:
+                self._relatch_no_burn(orig_addr)
+            raise PreTriggerRefusal(str(exc)) from exc
+        except BaseException:
+            if staged:
+                self._relatch_no_burn(orig_addr)
+            raise
+
+        # ---- point of no return: CMD_PROGRAM ----
+        try:
             self._wr(REG_FUSECTRL, CMD_PROGRAM)
             self.poll_idle(timeout_s)
         finally:
-            try:
-                if is_fusectrl_idle(self.rd(REG_FUSECTRL)):
-                    self._wr(REG_FUSEADDR, orig_addr)
-            except Exception:
-                pass
+            self._relatch_no_burn(orig_addr)
 
         got = self.read_row(row)
         if got != word:
@@ -711,7 +751,7 @@ class GA100LiveAdapter:
 
     def write_one_record(self, row: int, word: int) -> None:
         if not self.writable:
-            raise BurnError("GA100LiveAdapter opened read-only; pass --execute to enable writes")
+            raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
         self.controller.program_row(row, word)
 
     def capture_cold_snapshot(

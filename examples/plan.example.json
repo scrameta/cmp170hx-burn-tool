@@ -12,12 +12,12 @@
   "records": [
     {
       "name": "FAKE_TEST", "kind": "test", "target": "SYNTHETIC_TEST_ROW",
-      "word": "0x13572468", "decode": "SYNTHETIC DATA - NOT A VALID FF RECORD",
+      "word": "0x13572448", "decode": "SYNTHETIC DATA - unmapped FF chain, never burn on a real card",
       "defect_sensitive": false, "expected_cold": {"SYNTHETIC_TEST_EFFECT": "0x1"}
     },
     {
       "name": "FAKE_COMPUTE", "kind": "regular", "target": "GPC_DISABLE",
-      "word": "0x24681357", "decode": "SYNTHETIC DATA - NOT A VALID FF RECORD",
+      "word": "0x24681357", "decode": "SYNTHETIC DATA - unmapped FF chain, never burn on a real card",
       "defect_sensitive": true,
       "mask_update": {"field": "GPC_DISABLE", "from": "0x85", "to": "0x84"},
       "resulting_sm_count": 75,

@@ -50,7 +50,7 @@ Key protocol details implemented:
   3. Write `FUSECTRL = 0 (IDLE)` → `FUSECTRL = 3 (SENSE_CTRL)`, poll `IDLE` (state=4). Verify `EFP (0x820078) == 1`, `DSOV == 0`, `CRC == 0x55`, `DFP (0x82007C) == 0`, `PLM_f8` bit 0 open. Idempotent when `EFP == 1` already (only one `SENSE_CTRL` per glitch window because `RESENSE_DISABLE` becomes `1`).
   4. Shadow-clear `SBFE_SHADOW (0x821108) = 0` and assert all 12 armed invariants (`FUSECTRL` idle, `DEBUGCTRL == 0`, `CRC == 0x55`, `DSOV == 0`, `EFP == 1`, `DFP == 0`, `EN_SW_OVERRIDE == 1`, `SBFE == 0`, `WDATA_WR_SECURE == 0`, `PLM_f4 == PLM_f8 == PLM_fc == 0xFFFFFFFF`).
 - **Single-Record Program (`CMD_PROGRAM = 2`)**:
-  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADF`/`0xBAD0` poison) → restore `FUSEADDR` → `CMD_READ` verify `== word` → full post-write health/PMBus/host gate → second `CMD_READ`.
+  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/PMBus/host gate → second `CMD_READ`.
 
 ---
 
@@ -138,7 +138,7 @@ Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (80 tests):
+# Run the full offline test suite (102 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:
@@ -170,8 +170,13 @@ python3 -m vfi_burn simulate --plan private/plan.json --fake private/after-test.
 python3 -m vfi_burn import-ffcalc \
   --burn-plan private/card.burn.json \
   --dump private/card.dump.json \
+  --base-sm <YOUR_REVIEWED_SM_CEILING> \
   --prepend-noop-test \
   --out private/plan.json
+#   --base-sm is REQUIRED (operator/community knowledge, e.g. 122; the card cannot supply it).
+#   Optionally pass --link-cap2-before/--link-cap2-after with values you read from your card.
+#   The importer refuses stale/partial dumps, non-contiguous or colliding rows, wrong `old`
+#   values, and dumps whose fused masks disagree with the FF replay.
 
 # 2. Review every decoded record, die ID row (8..15), and defect mask offline:
 python3 -m vfi_burn plan --plan private/plan.json
@@ -234,10 +239,15 @@ sudo python3 -m vfi_burn manual --plan private/plan.json \
 - No `nvidia` or `nouveau` driver loaded or bound to the GPU
 - SKU `10de:20c2` and all 8 Die ID rows (`8..15`) match the plan
 - FF row bounds `222..486`, IFF bit 5 == `0`, blank target slot (`0x00000000`), no poison payload
-- Genuine `defect_masks` bits are strictly refused
+- Genuine `defect_masks` bits are strictly refused — derived from the **FF word itself** (replace semantics over its 16-bit block), so missing or wrong `mask_update` metadata, shared multi-field blocks, and console one-liners cannot bypass it; a word touching a field with no known defect mask is refused unless `--override-undetermined-ceiling`
+- Declared `mask_update.to` / `resulting_sm_count` must match what the word actually writes; GPC/TPC changes are checked against the SM ceiling from the word
 - Hard rail bounds `400..1500 mV` and critical PMBus fault bits (`0x2042`, `OFF`, `VOUT`, `POWER_GOOD#`)
 - Instantaneous pre-trigger check *after* confirmation and *immediately before* `CMD_PROGRAM`
 - Mandatory `CMD_READ` read-back + post-write health/PMBus/host gate + second `CMD_READ`; immediate `HALT_UNVERIFIED` with no retry and no pointer advance on any error
+- Failures strictly before `CMD_PROGRAM` are journaled as `aborted_pre_trigger` (`write_issued=false`), not as a possibly-partial `HALT_UNVERIFIED`
+- `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` are held back from the `attempt` journal entry until the record's outcome is fsynced (Ctrl-C or an SSH drop cannot land mid-program); `FUSEWDATA` is reset to the `0` no-burn latch after every program
+- Any `0xBADxxxxx` read is treated as poison (same test as `cmp170hx-8gb-vfi-tools`)
+- Real-stage `verify-cold` requires `fpf_rows` and fails if any journaled row reads `0` after the cold boot
 
 ### Granular Manual Overrides (No blanket `--force`)
 
