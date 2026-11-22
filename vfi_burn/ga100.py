@@ -58,7 +58,7 @@ REG_SBFE_SHADOW = 0x00821108     # OPT_SECURED_BURN_FEATURE_ENABLE (write 0 afte
 # FUSECTRL commands & state field.
 CMD_IDLE = 0x0
 CMD_READ = 0x1
-CMD_PROGRAM = 0x2                # transient state 3 (0xE00C0000) -> IDLE (4) in ~1 ms
+CMD_PROGRAM = 0x2                # busy: state field [20:16] = 0xC (e.g. 0xE00C0000) -> IDLE (4) in ~1 ms
 CMD_SENSE_CTRL = 0x3             # restores EFP=1 while keeping DSOV=0
 FUSECTRL_STATE_SHIFT = 16
 FUSECTRL_STATE_MASK = 0x1F
