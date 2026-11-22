@@ -784,8 +784,6 @@ def import_ffcalc_plan(
     dump_path: str | Path,
     *,
     base_sm_ceiling: int,
-    stock_mv: float = 787.5,
-    tolerance_mv: float = 25.0,
     override_sm_ceiling: int | None = None,
     first_record_as_test: bool = False,
     prepend_noop_test: bool = True,
@@ -1077,10 +1075,6 @@ def import_ffcalc_plan(
             "expected_next_row": baseline_next_row,
             "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in sorted(baseline_ff_prefix.items())},
             "baseline_ff_sha256": baseline_ff_sha,
-        },
-        "environment": {
-            "stock_mv": stock_mv,
-            "tolerance_mv": tolerance_mv,
         },
         "ceiling": {
             "base_sm": base_sm_ceiling,

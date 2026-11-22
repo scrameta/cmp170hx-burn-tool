@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 import fcntl
 import json
-import math
 import os
 import stat
 
@@ -65,46 +64,10 @@ def deferred_signals():
 FUSECTRL_IDLE = 0xE0040000
 GOLDILOCKS_CRC = 0x55
 GOLDILOCKS_PLM = 0xFFFFFFFF
-LATCH_STATUS_WORD = 0x2042
-HARD_VOUT_MIN_MV = 400.0
-HARD_VOUT_MAX_MV = 1500.0
-
-# Standard PMBus STATUS_WORD bit definitions (high byte + low byte).
-PMBUS_STATUS_BITS: tuple[tuple[int, str], ...] = (
-    (0x8000, "VOUT"),
-    (0x4000, "IOUT/POUT"),
-    (0x2000, "INPUT"),
-    (0x1000, "MFR"),
-    (0x0800, "POWER_GOOD#"),
-    (0x0400, "FANS"),
-    (0x0200, "OTHER"),
-    (0x0100, "UNKNOWN"),
-    (0x0080, "BUSY"),
-    (0x0040, "OFF"),
-    (0x0020, "VOUT_OV"),
-    (0x0010, "IOUT_OC"),
-    (0x0008, "VIN_UV"),
-    (0x0004, "TEMP"),
-    (0x0002, "CML"),
-    (0x0001, "NONE_OF_THE_ABOVE"),
-)
-
-# Critical PMBus fault bits that always indicate VRM latch/off/fault (never overrideable).
-PMBUS_CRITICAL_FAULT_MASK = 0x8840  # VOUT | POWER_GOOD# | OFF
 
 
 def hex32(value: int) -> str:
     return f"0x{value:08x}"
-
-
-def decode_pmbus_status_word(status_word: int) -> list[str]:
-    return [name for mask, name in PMBUS_STATUS_BITS if status_word & mask]
-
-
-def format_pmbus_status(status_word: int) -> str:
-    flags = decode_pmbus_status_word(status_word)
-    suffix = f" ({' | '.join(flags)})" if flags else ""
-    return f"0x{status_word:04x}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -112,7 +75,7 @@ class Overrides:
     """Explicit, granular manual overrides. All default to False/None (fail-closed).
 
     Hard brick-prevention invariants (aligned 32-bit stores, empty target slot,
-    no GPU driver, die/SKU match, poison/PLM_f8/latch halt, mandatory read-back,
+    no GPU driver, die/SKU match, poison/PLM_f8 halt, mandatory read-back,
     post-write gate, known genuine defect bits, and read-only PCIe device-ID
     blocks c2/b37-38 & burnable=False bits) are NEVER overrideable.
     """
@@ -121,7 +84,6 @@ class Overrides:
     skip_active_sense: bool = False
     no_test_receipt: bool = False
     mask_mismatch: bool = False
-    vout_range: bool = False
     undetermined_ceiling: bool = False
     allow_manual_debugctrl: bool = False
     baseline_mismatch: bool = False
@@ -137,8 +99,6 @@ class Overrides:
             active.append("no_test_receipt")
         if self.mask_mismatch:
             active.append("mask_mismatch")
-        if self.vout_range:
-            active.append("vout_range")
         if self.undetermined_ceiling:
             active.append("undetermined_ceiling")
         if self.allow_manual_debugctrl:
@@ -157,24 +117,17 @@ def _poison(name: str, value: int) -> None:
 
 def evaluate_health(
     h: Health,
-    plan: Plan,
+    plan: Plan | None = None,
     *,
-    allow_vout_override: bool = False,
     require_efp_one: bool = False,
 ) -> list[str]:
     """Evaluate all health gates and return every failing condition (never mutates state)."""
+    del plan
     issues: list[str] = []
-    for key in ("fusectrl", "dsov", "crc", "plm", "plm_f8", "status_word", "en_sw", "debugctrl"):
+    for key in ("fusectrl", "dsov", "crc", "plm", "plm_f8", "en_sw", "debugctrl"):
         val = getattr(h, key)
         if is_poison(val):
             issues.append(f"{key} poison/fuse-unit error: {hex32(val)}")
-
-    if h.status_word == LATCH_STATUS_WORD:
-        issues.append(f"controller latch STATUS_WORD={format_pmbus_status(h.status_word)}")
-    elif h.status_word & PMBUS_CRITICAL_FAULT_MASK:
-        issues.append(f"PMBus VRM fault/off STATUS_WORD={format_pmbus_status(h.status_word)}")
-    elif h.status_word & ~plan.allowed_status_mask:
-        issues.append(f"unexpected PMBus STATUS_WORD={format_pmbus_status(h.status_word)}")
 
     if (h.plm_f8 & 1) == 0:
         issues.append(
@@ -203,37 +156,19 @@ def evaluate_health(
             f"goldilocks lost: DSOV={hex32(h.dsov)}, CRC={hex32(h.crc)}, "
             f"PLM={hex32(h.plm)}, PLM_f8={hex32(h.plm_f8)}"
         )
-
-    if isinstance(h.vout_mv, bool) or not math.isfinite(h.vout_mv):
-        issues.append(f"invalid READ_VOUT reading: {h.vout_mv!r}")
-    elif not (HARD_VOUT_MIN_MV <= h.vout_mv <= HARD_VOUT_MAX_MV):
-        issues.append(
-            f"rail at {h.vout_mv} mV (outside hard safety bounds "
-            f"{HARD_VOUT_MIN_MV}..{HARD_VOUT_MAX_MV} mV; possible floor/latch)"
-        )
-    elif not allow_vout_override and not (
-        plan.stock_mv - plan.vout_tolerance_mv
-        <= h.vout_mv
-        <= plan.stock_mv + plan.vout_tolerance_mv
-    ):
-        issues.append(
-            f"rail at {h.vout_mv} mV, expected {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV"
-        )
     return issues
 
 
 def check_health(
     h: Health,
-    plan: Plan,
+    plan: Plan | None = None,
     *,
-    allow_vout_override: bool = False,
     require_efp_one: bool = False,
 ) -> None:
-    """No repair, reset, rail adjustment or retry is performed."""
+    """No repair, reset or retry is performed."""
     issues = evaluate_health(
         h,
         plan,
-        allow_vout_override=allow_vout_override,
         require_efp_one=require_efp_one,
     )
     if issues:
@@ -251,8 +186,6 @@ def evaluate_host(host: Host, *, require_hold: bool = True) -> list[str]:
         issues.append("nvidia/nouveau driver loaded")
     if "[none]" not in host.lockdown.split():
         issues.append(f"kernel lockdown is not [none]: {host.lockdown}")
-    if host.vrm_tainted:
-        issues.append("VRM profile tainted")
     if not host.boot_id:
         issues.append("missing boot identity")
     return issues
@@ -311,7 +244,7 @@ def preflight(
     if reader.pci_id().lower() != plan.pci_id:
         raise BurnError(f"PCI identity mismatch: expected {plan.pci_id}, got {reader.pci_id()}")
     h = reader.health()
-    check_health(h, plan, allow_vout_override=ov.vout_range)
+    check_health(h, plan)
     check_die_rows(plan, reader)
     if match_masks and not ov.mask_mismatch:
         check_masks(expected_masks if expected_masks is not None else plan.expected_masks, reader)
@@ -321,7 +254,6 @@ def preflight(
         check_health(
             reader.health(),
             plan,
-            allow_vout_override=ov.vout_range,
             require_efp_one=True,
         )
         check_host(reader.host())
@@ -879,7 +811,7 @@ def _write_verify_or_halt(
                 f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
             )
         health = reader.health()
-        check_health(health, plan, allow_vout_override=ov.vout_range)
+        check_health(health, plan)
         host_after = reader.host()
         check_host(host_after)
         # Extra slot check: no pointer advance before every post-write gate passes.
@@ -939,14 +871,6 @@ def _journal_halt(
         pointer_advanced=False,
         manual_record_sha256=manual_record_sha256,
     )
-
-
-def _rail_telemetry_mode(reader) -> str:
-    if getattr(reader, "simulation", False):
-        return "simulated"
-    if getattr(reader, "rail_telemetry_live", True):
-        return "live_pmbus"
-    return "assumed_unmeasured"
 
 
 def _run_poweroff_sanity(
@@ -1024,7 +948,6 @@ def process_records(
     ov = overrides or Overrides()
     is_live = not getattr(reader, "simulation", False)
     strict_ff = is_live or (plan.baseline_ff_rows is not None)
-    rail_mode = _rail_telemetry_mode(reader)
     effective_debugctrl = allow_manual_debugctrl or ov.allow_manual_debugctrl
     use_active_sense = (
         (not ov.skip_active_sense)
@@ -1044,16 +967,6 @@ def process_records(
                 decode_ff(r.word)
             except BurnError as exc:
                 raise BurnError(f"{r.name}: not a valid GA100 FF record word ({exc})") from exc
-
-    if is_live and rail_mode == "assumed_unmeasured":
-        show("\n" + "!" * 72)
-        show("!!! WARNING: NO LIVE PMBUS RAIL TELEMETRY (USING ASSUMED VOLTAGE)")
-        show(
-            "!!! READ_VOUT is operator-assumed and STATUS_WORD is assumed 0x0000.\n"
-            "!!! vfi_burn CANNOT detect rail brown-out, VRM latch, or VRM profile taint.\n"
-            "!!! Monitor NVVDD externally before and during every write."
-        )
-        show("!" * 72)
 
     receipt: dict | None = None
     if stage == "real":
@@ -1140,32 +1053,11 @@ def process_records(
             plan_sha256=plan.content_hash,
             phase="initial_preflight",
             active_sense=use_active_sense,
-            rail_telemetry=rail_mode,
             health=h_snap,
             host=host_snap,
             error=str(exc),
         )
         raise
-
-    if ov.vout_range and not dry_run:
-        live_health = reader.health()
-        if not (
-            plan.stock_mv - plan.vout_tolerance_mv
-            <= live_health.vout_mv
-            <= plan.stock_mv + plan.vout_tolerance_mv
-        ):
-            _require_override_confirm(
-                confirm,
-                journal,
-                show,
-                name="vout_range",
-                banner=(
-                    f"Measured READ_VOUT is {live_health.vout_mv:.1f} mV "
-                    f"(plan expects {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV)."
-                ),
-                token=f"OVERRIDE VOUT {live_health.vout_mv:.1f}",
-                details={"measured_vout_mv": live_health.vout_mv},
-            )
 
     try:
         pointer, nearby, live_rows = scan_fpf_rows(plan, reader, override_slot=ov.slot)
@@ -1177,7 +1069,6 @@ def process_records(
             plan_sha256=plan.content_hash,
             phase="slot_scan",
             active_sense=use_active_sense,
-            rail_telemetry=rail_mode,
             health=h_snap,
             host=host_snap,
             error=str(exc),
@@ -1203,7 +1094,6 @@ def process_records(
             plan_sha256=plan.content_hash,
             phase="baseline_ff_prefix",
             active_sense=use_active_sense,
-            rail_telemetry=rail_mode,
             health=h_snap,
             host=host_snap,
             error=str(exc),
@@ -1333,7 +1223,6 @@ def process_records(
                 plan_sha256=plan.content_hash,
                 phase="mask_check",
                 active_sense=use_active_sense,
-                rail_telemetry=rail_mode,
                 health=h_snap,
                 host=host_snap,
                 error=str(exc),
@@ -1365,7 +1254,6 @@ def process_records(
         stage=stage,
         boot_id=boot_id,
         held_frame_source="operator_supplied_live_adapter" if is_live else "fake_simulation",
-        rail_telemetry=rail_mode,
         baseline_ff_sha256=plan.baseline_ff_sha256,
         pointer=pointer,
         pending_records=[r.name for r in pending],
@@ -1410,7 +1298,6 @@ def process_records(
             stage=stage,
             pointer=pointer,
             active_sense=use_active_sense,
-            rail_telemetry=rail_mode,
             records=[r.name for r in pending],
         )
         return pointer
@@ -1474,7 +1361,6 @@ def process_records(
                     plan_sha256=plan.content_hash,
                     phase=f"before_record:{record.name}",
                     active_sense=False,
-                    rail_telemetry=rail_mode,
                     health=h_snap,
                     host=host_snap,
                     error=str(exc),
@@ -1584,7 +1470,7 @@ def process_records(
         # Instantaneous pre-trigger gate: closes the window while the human was reading/typing.
         try:
             check_host(reader.host())
-            check_health(reader.health(), plan, allow_vout_override=ov.vout_range)
+            check_health(reader.health(), plan)
             pre_slot = reader.fuse_row(pointer)
             _poison(f"pre-trigger FPF row {pointer}", pre_slot)
             if pre_slot != plan.empty_word:
@@ -1619,7 +1505,6 @@ def process_records(
                 previous=hex32(previous),
                 confirmation=confirm_word,
                 boot_id=boot_id,
-                rail_telemetry=rail_mode,
                 overrides=ov.active_names(),
             )
             readback, health, host_after = _write_verify_or_halt(
@@ -1642,7 +1527,6 @@ def process_records(
                 result="MATCH",
                 full_post_write_gate=health.serializable(),
                 host_after=host_after.serializable(),
-                rail_telemetry=rail_mode,
                 pointer_advanced=True,
                 cold_boot_verified=False,
                 boot_id=boot_id,
@@ -1699,7 +1583,6 @@ def process_records(
         stage=stage,
         last_pointer=pointer,
         records_written=len(written_records),
-        rail_telemetry=rail_mode,
         cold_boot_verified=False,
     )
     if written_records:

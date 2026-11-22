@@ -25,7 +25,6 @@ python3 -m vfi_burn menu \
 sudo python3 -m vfi_burn menu \
   --plan private/plan.json \
   --bdf 0000:05:00.0 \
-  --port /dev/ttyACM0 \
   --journal private/session.jsonl
 ```
 
@@ -76,5 +75,5 @@ See [`cmd_line.md`](cmd_line.md#granular-manual-overrides-no-blanket---force) fo
 ![vfi_burn Manual Overrides and FF Word Decoder](screenshots/05-overrides-and-decode.png)
 
 ### 6. `[9]` Manual Low-Level Console — Fuse Controller State, Exact PCIe BAR0 Writes & Staged `preview` → `apply`
-Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the complete decoded GA100 fuse controller state (`FUSECTRL`, `DEBUGCTRL`, `CRC`, `DSOV`, `EFP/DFP/RESENSE_DIS`, `EN_SW/SBFE/WDATA_WR_SEC`, `PLM_f4/f8/fc`, VRM rail, host hold) and the exact ordered 32-bit aligned PCIe BAR0 MMIO writes — and **stage** that exact write so you simply type `apply` (no arguments, zero risk of re-typing typos; still gated by row/word confirmation & read-back) or `clear` to discard.
+Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the complete decoded GA100 fuse controller state (`FUSECTRL`, `DEBUGCTRL`, `CRC`, `DSOV`, `EFP/DFP/RESENSE_DIS`, `EN_SW/SBFE/WDATA_WR_SEC`, `PLM_f4/f8/fc`, host hold) and the exact ordered 32-bit aligned PCIe BAR0 MMIO writes — and **stage** that exact write so you simply type `apply` (no arguments, zero risk of re-typing typos; still gated by row/word confirmation & read-back) or `clear` to discard.
 ![vfi_burn Manual Console Fuse State and Exact PCIe BAR0 Writes](screenshots/06-manual-console-writes.png)

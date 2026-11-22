@@ -1,7 +1,7 @@
 """Standalone CLI for vfi_burn.
 
 Supports:
-  - Direct Linux GA100 hardware access via ``--bdf`` (+ optional Pico ``--port``)
+  - Direct Linux GA100 hardware access via ``--bdf``
   - Custom owner-supplied adapters via ``--adapter module:factory``
   - Offline simulation via ``--fake``
   - ``cmp170hx-ffcalc`` plan import, FF record decoding, and cold-boot snapshot capture
@@ -65,20 +65,6 @@ def prompt_confirm(prompt: str, token: str) -> bool:
         return False
 
 
-def _add_live_hw_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--port",
-        default=None,
-        help="optional Pico serial port (e.g. /dev/ttyACM0) for live PMBus READ_VOUT/STATUS_WORD",
-    )
-    parser.add_argument(
-        "--assume-vout-mv",
-        type=float,
-        default=None,
-        help="only when --port is omitted: externally measured NVVDD rail in mV (e.g. 787.5)",
-    )
-
-
 def _add_override_args(parser: argparse.ArgumentParser, *, allow_debugctrl: bool = False) -> None:
     grp = parser.add_argument_group(
         "manual overrides (all off by default; each requires explicit typed confirmation and is journaled)"
@@ -104,11 +90,6 @@ def _add_override_args(parser: argparse.ArgumentParser, *, allow_debugctrl: bool
         "--override-mask-mismatch",
         action="store_true",
         help="skip initial expected_masks equality check (e.g. after external/manual changes)",
-    )
-    grp.add_argument(
-        "--override-vout-range",
-        action="store_true",
-        help="allow READ_VOUT outside stock_mv +/- tolerance_mv (hard 400..1500 mV and latch limits remain)",
     )
     grp.add_argument(
         "--override-undetermined-ceiling",
@@ -139,7 +120,6 @@ def _overrides_from_args(args: argparse.Namespace) -> Overrides:
         skip_active_sense=bool(getattr(args, "override_skip_sense", False)),
         no_test_receipt=bool(getattr(args, "override_no_test_receipt", False)),
         mask_mismatch=bool(getattr(args, "override_mask_mismatch", False)),
-        vout_range=bool(getattr(args, "override_vout_range", False)),
         undetermined_ceiling=bool(getattr(args, "override_undetermined_ceiling", False)),
         allow_manual_debugctrl=bool(getattr(args, "override_allow_debugctrl", False)),
         baseline_mismatch=bool(getattr(args, "override_baseline_mismatch", False)),
@@ -167,9 +147,7 @@ def _open_backend(args: argparse.Namespace, *, writable: bool = False):
     if bdf:
         return GA100LiveAdapter(
             bdf,
-            pico_port=getattr(args, "port", None),
             writable=writable,
-            assume_vout_mv=getattr(args, "assume_vout_mv", None),
         )
     return load_adapter(args.adapter)
 
@@ -180,10 +158,6 @@ def _print_plan_summary(p: Plan, final_masks: dict[str, int]) -> None:
     print(
         f"  FF Window    : rows {p.first_row}..{p.last_row} "
         f"({p.last_row - p.first_row + 1} slots) | empty_word={hex32(p.empty_word)}"
-    )
-    print(
-        f"  Rail / VRM   : stock={p.stock_mv} +/- {p.vout_tolerance_mv} mV | "
-        f"allowed_status_mask=0x{p.allowed_status_mask:04x}"
     )
     print(
         f"  SM Ceilings  : base={p.base_sm_ceiling} | override={p.override_sm_ceiling} | "
@@ -260,7 +234,6 @@ def build_parser() -> argparse.ArgumentParser:
     menu_g.add_argument("--bdf", default=None, help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     menu_g.add_argument("--adapter", default=None, help="custom owner-supplied live module:factory")
     menu_g.add_argument("--fake", default=None, help="synthetic mode-0600 JSON controller snapshot")
-    _add_live_hw_args(menu_p)
     menu_p.add_argument(
         "--journal",
         default="private/session.jsonl",
@@ -287,8 +260,6 @@ def build_parser() -> argparse.ArgumentParser:
     imp_p.add_argument("--burn-plan", required=True, help="mode-0600 cmp170hx-ffcalc plans/<uuid>.burn.json")
     imp_p.add_argument("--dump", required=True, help="mode-0600 cmp170hx-ffcalc cards/<uuid>.json (with all 512 rows)")
     imp_p.add_argument("--out", required=True, help="output path for new mode-0600 vfi_burn plan JSON")
-    imp_p.add_argument("--stock-mv", type=float, default=787.5)
-    imp_p.add_argument("--tolerance-mv", type=float, default=25.0)
     imp_p.add_argument(
         "--base-sm",
         type=int,
@@ -321,7 +292,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="capture a mode-0600 cold-boot snapshot from a live CMP 170HX for verify-cold",
     )
     snap_p.add_argument("--bdf", required=True, help="PCI BDF of CMP 170HX (e.g. 0000:05:00.0)")
-    _add_live_hw_args(snap_p)
     snap_p.add_argument("--previous-boot-id", required=True, help="boot_id from the burn session journal")
     snap_p.add_argument("--out", required=True, help="output path for new mode-0600 cold snapshot JSON")
     snap_p.add_argument("--no-rows", action="store_true", help="skip reading FF rows 222..486 (options + die ID only)")
@@ -332,7 +302,6 @@ def build_parser() -> argparse.ArgumentParser:
     ig.add_argument("--fake", help="synthetic JSON controller snapshot")
     ig.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     ig.add_argument("--adapter", help="custom owner-supplied live module:factory")
-    _add_live_hw_args(inspect_p)
     inspect_p.add_argument(
         "--sense",
         action="store_true",
@@ -356,7 +325,6 @@ def build_parser() -> argparse.ArgumentParser:
     bg = burn_p.add_mutually_exclusive_group(required=True)
     bg.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     bg.add_argument("--adapter", help="custom owner-supplied live module:factory")
-    _add_live_hw_args(burn_p)
     burn_p.add_argument(
         "--stage",
         required=True,
@@ -404,7 +372,6 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--fake", help="synthetic JSON controller snapshot")
     mg.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
     mg.add_argument("--adapter", help="custom owner-supplied live module:factory")
-    _add_live_hw_args(manual_p)
     man_sub = manual_p.add_subparsers(dest="action", required=True)
 
     man_sub.add_parser("status", help="print full health, host, die ID, and mask status (never writes)")
@@ -552,8 +519,6 @@ def main(argv=None) -> int:
             session = MenuSession(
                 plan_path=args.plan,
                 bdf=args.bdf,
-                pico_port=args.port,
-                assume_vout_mv=args.assume_vout_mv,
                 adapter_spec=args.adapter,
                 fake_path=args.fake,
                 journal_path=args.journal,
@@ -580,8 +545,6 @@ def main(argv=None) -> int:
             plan_dict = import_ffcalc_plan(
                 args.burn_plan,
                 args.dump,
-                stock_mv=args.stock_mv,
-                tolerance_mv=args.tolerance_mv,
                 base_sm_ceiling=args.base_sm,
                 override_sm_ceiling=args.override_sm,
                 prepend_noop_test=args.prepend_noop_test,
@@ -599,9 +562,7 @@ def main(argv=None) -> int:
         if args.cmd == "snapshot":
             backend = GA100LiveAdapter(
                 args.bdf,
-                pico_port=args.port,
                 writable=False,
-                assume_vout_mv=args.assume_vout_mv,
             )
             check_host_readonly_safe(backend.host())
             snap = backend.capture_cold_snapshot(

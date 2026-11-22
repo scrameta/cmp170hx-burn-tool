@@ -47,8 +47,6 @@ from .model import BurnError, Plan, require_private_file, u32
 class MenuSession:
     plan_path: str | None = None
     bdf: str | None = None
-    pico_port: str | None = None
-    assume_vout_mv: float | None = None
     adapter_spec: str | None = None
     fake_path: str | None = None
     journal_path: str = "private/session.jsonl"
@@ -105,10 +103,7 @@ class BurnMenu:
         if self.s.fake_path:
             return f"FAKE ({self.s.fake_path})"
         if self.s.bdf:
-            rail = f"port={self.s.pico_port}" if self.s.pico_port else (
-                f"assume_vout={self.s.assume_vout_mv}mV" if self.s.assume_vout_mv else "NO RAIL MONITOR"
-            )
-            return f"LIVE BDF={self.s.bdf} ({rail})"
+            return f"LIVE BDF={self.s.bdf}"
         if self.s.adapter_spec:
             return f"ADAPTER ({self.s.adapter_spec})"
         return "not selected"
@@ -129,9 +124,7 @@ class BurnMenu:
             return (
                 GA100LiveAdapter(
                     self.s.bdf,
-                    pico_port=self.s.pico_port,
                     writable=writable,
-                    assume_vout_mv=self.s.assume_vout_mv,
                 ),
                 True,
             )
@@ -181,7 +174,7 @@ class BurnMenu:
         self.show(f"  Journal   : {self.s.journal_path}" + (f" | Receipt: {self.s.receipt_path}" if self.s.receipt_path else ""))
         self.show(f"  Overrides : {ov_str}")
         self.show("-" * 72)
-        self.show("   [1] Setup / Load Plan, Import ffcalc, Target BDF/Port & Mode")
+        self.show("   [1] Setup / Load Plan, Import ffcalc, Target BDF & Mode")
         self.show("   [2] Review Plan & Expected Outcome (enabled/disabled, unknown fuses, FF rows)")
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
@@ -241,7 +234,7 @@ class BurnMenu:
             self.show("\n--- [1] Setup ---")
             self.show(f"  [a] Select plan JSON             (current: {self.s.plan_path or 'none'})")
             self.show("  [b] Import cmp170hx-ffcalc plan + 512-row dump -> new 0600 plan")
-            self.show(f"  [c] Select LIVE GPU (--bdf / --port) (current: {self.s.bdf or 'none'})")
+            self.show(f"  [c] Select LIVE GPU (--bdf)      (current: {self.s.bdf or 'none'})")
             self.show(f"  [d] Select FAKE snapshot (--fake)    (current: {self.s.fake_path or 'none'})")
             self.show(f"  [e] Select journal path          (current: {self.s.journal_path})")
             self.show(f"  [f] Select test receipt path     (current: {self.s.receipt_path or 'none'})")
@@ -275,15 +268,7 @@ class BurnMenu:
                 self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
             elif sub == "c":
                 bdf = self._ask("CMP 170HX PCI BDF (e.g. 0000:05:00.0)", self.s.bdf)
-                port = self._ask_clearable("Pico serial port", self.s.pico_port)
-                vout = None
-                if not port:
-                    default_vout = str(self.s.assume_vout_mv) if self.s.assume_vout_mv is not None else "787.5"
-                    vout_s = self._ask("Externally verified NVVDD in mV (e.g. 787.5)", default_vout)
-                    vout = float(vout_s) if vout_s else None
                 self.s.bdf = bdf or None
-                self.s.pico_port = port
-                self.s.assume_vout_mv = vout
                 self.s.fake_path = None
                 self.s.adapter_spec = None
                 self._cached_fake = None
@@ -344,7 +329,7 @@ class BurnMenu:
         backend, owned = self._open_backend(writable=False)
         try:
             check_host_readonly_safe(backend.host())
-            for line in format_status_report(p, backend, allow_vout_override=self.s.overrides.vout_range):
+            for line in format_status_report(p, backend):
                 self.show(line)
             with Journal(self.s.journal_path) as j:
                 try:
@@ -381,7 +366,7 @@ class BurnMenu:
         try:
             check_host_readonly_safe(backend.host())
             before = backend.health()
-            pre_issues = evaluate_health(before, p, allow_vout_override=self.s.overrides.vout_range)
+            pre_issues = evaluate_health(before, p)
             if pre_issues:
                 raise BurnError("passive health not ready for SENSE_CTRL: " + "; ".join(pre_issues))
             self.show(
@@ -397,7 +382,7 @@ class BurnMenu:
                 backend.active_sense_readonly()
                 after = backend.health()
                 post_issues = evaluate_health(
-                    after, p, allow_vout_override=self.s.overrides.vout_range, require_efp_one=True
+                    after, p, require_efp_one=True
                 )
                 j.append(
                     event="manual_active_sense",
@@ -498,17 +483,16 @@ class BurnMenu:
             self.show(f"  [2] Skip automatic SENSE_CTRL                 : {'ON' if ov.skip_active_sense else 'OFF'}")
             self.show(f"  [3] Allow real stage without test receipt     : {'ON' if ov.no_test_receipt else 'OFF'}")
             self.show(f"  [4] Skip initial expected_masks check         : {'ON' if ov.mask_mismatch else 'OFF'}")
-            self.show(f"  [5] Allow VOUT outside stock +/- tol          : {'ON' if ov.vout_range else 'OFF'}")
-            self.show(f"  [6] Override undetermined/exceeded SM ceiling : {'ON' if ov.undetermined_ceiling else 'OFF'}")
-            self.show(f"  [7] Manual-only: allow DEBUGCTRL target       : {'ON' if ov.allow_manual_debugctrl else 'OFF'}")
-            self.show(f"  [8] Allow baseline FF prefix mismatch/absent  : {'ON' if ov.baseline_mismatch else 'OFF'}")
-            self.show(f"  [9] Allow unknown/unmapped FF & missing mask  : {'ON' if ov.unmapped_ff else 'OFF'}")
+            self.show(f"  [5] Override undetermined/exceeded SM ceiling : {'ON' if ov.undetermined_ceiling else 'OFF'}")
+            self.show(f"  [6] Manual-only: allow DEBUGCTRL target       : {'ON' if ov.allow_manual_debugctrl else 'OFF'}")
+            self.show(f"  [7] Allow baseline FF prefix mismatch/absent  : {'ON' if ov.baseline_mismatch else 'OFF'}")
+            self.show(f"  [8] Allow unknown/unmapped FF & missing mask  : {'ON' if ov.unmapped_ff else 'OFF'}")
             self.show("  [r] Reset ALL overrides to strict defaults")
             self.show("  [0] Back to main menu")
             self.show("  (Never overrideable: aligned 32-bit stores, no nvidia/nouveau, Die ID, rows 222..486,")
             self.show("   IFF bit 5=0, blank slot, known genuine defects, PCIe device-ID c2/b37-38,")
-            self.show("   hard 400..1500mV, read-back & post-write gate.)")
-            pick = self.input_fn("Toggle [1-9, r, 0]: ").strip().lower()
+            self.show("   read-back & post-write gate.)")
+            pick = self.input_fn("Toggle [1-8, r, 0]: ").strip().lower()
             if pick in ("0", ""):
                 return
             if pick == "1":
@@ -524,14 +508,12 @@ class BurnMenu:
             elif pick == "4":
                 self.s.overrides = replace(ov, mask_mismatch=not ov.mask_mismatch)
             elif pick == "5":
-                self.s.overrides = replace(ov, vout_range=not ov.vout_range)
-            elif pick == "6":
                 self.s.overrides = replace(ov, undetermined_ceiling=not ov.undetermined_ceiling)
-            elif pick == "7":
+            elif pick == "6":
                 self.s.overrides = replace(ov, allow_manual_debugctrl=not ov.allow_manual_debugctrl)
-            elif pick == "8":
+            elif pick == "7":
                 self.s.overrides = replace(ov, baseline_mismatch=not ov.baseline_mismatch)
-            elif pick == "9":
+            elif pick == "8":
                 self.s.overrides = replace(ov, unmapped_ff=not ov.unmapped_ff)
             elif pick == "r":
                 self.s.overrides = Overrides()

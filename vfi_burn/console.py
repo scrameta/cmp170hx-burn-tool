@@ -18,7 +18,6 @@ from .engine import (
     check_plan,
     evaluate_health,
     evaluate_host,
-    format_pmbus_status,
     hex32,
     process_records,
     scan_slots,
@@ -171,14 +170,14 @@ def _format_experimental_compact_lines(readings: dict[str, int]) -> list[str]:
     return lines
 
 
-def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = False) -> list[str]:
+def format_status_report(plan: Plan, reader) -> list[str]:
     """Build a human-readable diagnostic report without aborting on bad health."""
     lines: list[str] = []
     pci = reader.pci_id()
     host = reader.host()
     health = reader.health()
     host_issues = evaluate_host(host, require_hold=True)
-    health_issues = evaluate_health(health, plan, allow_vout_override=allow_vout_override)
+    health_issues = evaluate_health(health, plan)
 
     lines.append("=== CARD & HOST STATUS ===")
     lines.append(
@@ -188,7 +187,7 @@ def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = Fals
     lines.append(
         f"  Host         : boot={host.boot_id} | driver={host.bound_driver or 'none'} | "
         f"nvidia={host.nvidia_loaded} nouveau={host.nouveau_loaded} | "
-        f"lockdown={host.lockdown} | vrm_tainted={host.vrm_tainted} | hold={host.hold_active}"
+        f"lockdown={host.lockdown} | hold={host.hold_active}"
     )
     lines.append(
         f"  FUSECTRL     : {hex32(health.fusectrl)}  "
@@ -213,15 +212,6 @@ def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = Fals
         if health.resense_disable is not None:
             arm_parts.append(f"RESENSE_DIS={health.resense_disable}")
         lines.append("  Arming State : " + "  ".join(arm_parts))
-    assumed_rail = (not getattr(reader, "simulation", False)) and (
-        not getattr(reader, "rail_telemetry_live", True)
-    )
-    rail_note = "  [ASSUMED / UNMEASURED — no live PMBus]" if assumed_rail else ""
-    lines.append(
-        f"  VRM / Rail   : STATUS_WORD={format_pmbus_status(health.status_word)}  "
-        f"READ_VOUT={health.vout_mv:.1f} mV "
-        f"(plan {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV){rail_note}"
-    )
 
     die_bad: list[str] = []
     for idx, expected in sorted(plan.die_rows.items()):
@@ -350,7 +340,7 @@ def format_plan_review(
     mode_tag = "WITH TARGET FF SCAN (read-only)" if current_rows is not None else "OFFLINE ONLY"
     lines.append(f"=== PLAN REVIEW & EXPECTED OUTCOME ({mode_tag}) ===")
     lines.append(f"  Plan SHA256  : {plan.content_hash}")
-    lines.append(f"  Target SKU   : {plan.pci_id} (CMP 170HX 8 GB) | Rail: {plan.stock_mv} +/- {plan.vout_tolerance_mv} mV")
+    lines.append(f"  Target SKU   : {plan.pci_id} (CMP 170HX 8 GB)")
     lines.append(
         f"  SM Ceilings  : base={plan.base_sm_ceiling} | override={plan.override_sm_ceiling} | "
         f"reconfig_verified={plan.reconfig_semantics_verified}"
@@ -614,8 +604,8 @@ def format_plan_review(
     return lines
 
 
-def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: bool = False) -> list[str]:
-    """Decode and format the live/fake GA100 fuse controller registers, PLM, VRM, and armed state."""
+def format_fuse_controller_state(plan: Plan, reader) -> list[str]:
+    """Decode and format the live/fake GA100 fuse controller registers, PLM, and armed state."""
     health = reader.health()
     host = reader.host()
     ctrl = health.fusectrl
@@ -632,7 +622,7 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
     resense_str = str(health.resense_disable) if health.resense_disable is not None else "n/a"
     plm_f4_str = hex32(health.plm_f4) if health.plm_f4 is not None else "n/a"
 
-    health_issues = evaluate_health(health, plan, allow_vout_override=allow_vout_override)
+    health_issues = evaluate_health(health, plan)
     host_issues = evaluate_host(host, require_hold=True)
     if health_issues or host_issues:
         verdict = "NOT READY (" + "; ".join(health_issues + host_issues) + ")"
@@ -641,10 +631,6 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
     else:
         verdict = "PASSIVE GOLDILOCKS OK (DSOV=0, CRC=0x55, PLM_f8 OPEN; needs SENSE_CTRL + arm before CMD_PROGRAM)"
 
-    assumed_rail = (not getattr(reader, "simulation", False)) and (
-        not getattr(reader, "rail_telemetry_live", True)
-    )
-    rail_tag = " [ASSUMED/UNMEASURED]" if assumed_rail else ""
     lines = [
         "=== FUSE CONTROLLER STATE (BAR0 0x0082xxxx) ===",
         f"  FUSECTRL (0x820000) : {hex32(ctrl)}  [{idle_str}]",
@@ -653,7 +639,7 @@ def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: boo
         f"  Sense / Arm Flags   : EFP(0x820078)={efp_str}  DFP(0x82007C)={dfp_str}  RESENSE_DIS(0x821058)={resense_str}",
         f"  Override / Shadow   : EN_SW(0x820040)={hex32(health.en_sw)}  SBFE(0x821108)={sbfe_str}  WDATA_WR_SEC(0x82048C)={wsec_str}",
         f"  PLM Gates           : PLM_f4(0x8200F4)={plm_f4_str}  PLM_f8(0x8200F8)={hex32(health.plm_f8)} ({'OPEN' if health.plm_f8 & 1 else 'CLOSED!'})  PLM_fc(0x8200FC)={hex32(health.plm)}",
-        f"  VRM / Host          : READ_VOUT={health.vout_mv:.1f} mV{rail_tag}  STATUS_WORD={format_pmbus_status(health.status_word)}  driver={host.bound_driver or 'none'}  hold={host.hold_active}",
+        f"  Host                : driver={host.bound_driver or 'none'}  hold={host.hold_active}",
         f"  Controller Verdict  : {verdict}",
     ]
     return lines
@@ -720,7 +706,7 @@ def format_pcie_write_plan(
     lines.append("  [16] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
     lines.append(f"  [17] WR32 BAR0+0x00820004  FUSEADDR         <- {hex32(row)}  (select row {row})")
     lines.append(f"  [18] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000001  (CMD_READ; verify FUSEDATA(0x820008) == {hex32(word)})")
-    lines.append("  [19] POST-WRITE GATE       full health/PMBus/host check + second CMD_READ verify")
+    lines.append("  [19] POST-WRITE GATE       full health/host check + second CMD_READ verify")
     lines.append("  GUARANTEES: single aligned 32-bit stores only | DEBUGCTRL (0x820060) NEVER written | FUSEDATA (0x820008) read-only")
     return lines
 
@@ -794,9 +780,7 @@ class ManualConsole:
         if self.overrides.active_names():
             self.show("Active overrides: " + ", ".join(self.overrides.active_names()))
         self.show("Type 'help' for commands, 'preview <word>' then 'apply' to burn without re-typing, 'quit' to exit.")
-        for line in format_status_report(
-            self.plan, self.reader, allow_vout_override=self.overrides.vout_range
-        ):
+        for line in format_status_report(self.plan, self.reader):
             self.show(line)
 
         while True:
@@ -843,9 +827,7 @@ class ManualConsole:
             self._cmd_help()
             return True
         if cmd == "status":
-            for out in format_status_report(
-                self.plan, self.reader, allow_vout_override=self.overrides.vout_range
-            ):
+            for out in format_status_report(self.plan, self.reader):
                 self.show(out)
             self.journal.append(event="manual_status")
             return True
@@ -920,9 +902,7 @@ class ManualConsole:
         )
 
     def _cmd_state(self) -> None:
-        for out in format_fuse_controller_state(
-            self.plan, self.reader, allow_vout_override=self.overrides.vout_range
-        ):
+        for out in format_fuse_controller_state(self.plan, self.reader):
             self.show(out)
         self.journal.append(event="manual_fuse_state", health=self.reader.health().serializable())
 
@@ -950,9 +930,7 @@ class ManualConsole:
             old_blk = blocks.get(ff.chain, {}).get(ff.block, 0)
         except Exception:
             old_blk = None
-        for out in format_fuse_controller_state(
-            self.plan, self.reader, allow_vout_override=self.overrides.vout_range
-        ):
+        for out in format_fuse_controller_state(self.plan, self.reader):
             self.show(out)
         for out in format_pcie_write_plan(
             row,
@@ -1085,9 +1063,7 @@ class ManualConsole:
 
     def _cmd_sense(self) -> None:
         before = self.reader.health()
-        pre_issues = evaluate_health(
-            before, self.plan, allow_vout_override=self.overrides.vout_range
-        )
+        pre_issues = evaluate_health(before, self.plan)
         if pre_issues:
             self.journal.append(
                 event="manual_active_sense_refused",
@@ -1107,9 +1083,7 @@ class ManualConsole:
             raise BurnError("active sense declined by operator")
         self.reader.active_sense_readonly()
         after = self.reader.health()
-        post_issues = evaluate_health(
-            after, self.plan, allow_vout_override=self.overrides.vout_range
-        )
+        post_issues = evaluate_health(after, self.plan)
         self.journal.append(
             event="manual_active_sense",
             before=before.serializable(),
@@ -1119,8 +1093,7 @@ class ManualConsole:
         self.show(
             f"Active sense completed: FUSECTRL {hex32(before.fusectrl)} -> {hex32(after.fusectrl)} | "
             f"PLM_f8 {hex32(before.plm_f8)} -> {hex32(after.plm_f8)} | "
-            f"EN_SW {hex32(before.en_sw)} -> {hex32(after.en_sw)} | "
-            f"VOUT {before.vout_mv:.1f} -> {after.vout_mv:.1f} mV"
+            f"EN_SW {hex32(before.en_sw)} -> {hex32(after.en_sw)}"
         )
         if post_issues:
             self.show("WARNING — frame degraded by active sense (too deep; do NOT write):")

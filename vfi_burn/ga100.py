@@ -1,11 +1,11 @@
-"""Verified GA100 (CMP 170HX 8 GB) fuse-controller protocol and Linux BAR0/PMBus adapter.
+"""Verified GA100 (CMP 170HX 8 GB) fuse-controller protocol and Linux BAR0 adapter.
 
 Register addresses, commands, and Goldilocks arming/programming sequences are
 cross-verified across:
   - Kate Land's GA100VFI writeup (blog.kate.land)
   - sayhellotojungle/cmp170hx-ffcalc (live 17-record CMP 170HX burn)
   - kprinssu/ga100-ff-tools (live 3-card CMP 170HX arm + burn)
-  - darkmaniac7/cmp170hx-8gb-vfi-tools (aligned 32-bit BAR0 store + PMBus safety)
+  - darkmaniac7/cmp170hx-8gb-vfi-tools (aligned 32-bit BAR0 store)
 
 Every MMIO access uses AlignedMMIO (single 32-bit memoryview.cast("I") loads/stores,
 NEVER struct.pack_into). DEBUGCTRL (0x00820060) is never written.
@@ -398,23 +398,6 @@ TPC_DEFECTIVE_REGS: tuple[int, ...] = (
 for _i, _addr in enumerate(TPC_DEFECTIVE_REGS):
     OPTION_REGS[f"TPC_GPC{_i}_DEFECTIVE"] = _addr
 
-# MP2888B PMBus constants (from cmp170hx-8gb-vfi-tools/tools/vfi_common.py).
-VRM_I2C_ADDR = 0x25
-PMBUS_REG_STATUS_WORD = 0x79
-PMBUS_REG_READ_VOUT = 0x8B
-PMBUS_REG_CTRL_MODE = 0xE1
-E1_PMBUS_HELD = 0xC2FA
-HEALTHY_RAIL_MIN_MV = 500.0
-PROFILE_REGS = (0xBA, 0xB9, 0x30, 0x31, 0x32, 0x45)
-PROFILE_FAST = {
-    0xBA: 0x0001,
-    0xB9: 0x0001,
-    0x30: 0xCE04,
-    0x31: 0x0002,
-    0x32: 0x0F81,
-    0x45: 0x7218,
-}
-
 BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 
@@ -527,12 +510,12 @@ class GA100FuseController:
                 )
             self._sleep(0.001)
 
-    def read_health_registers(self, *, status_word: int = 0, vout_mv: float = 787.5) -> Health:
+    def read_health_registers(self) -> Health:
         """Read health registers in BURN_SPEC order: FUSECTRL FIRST, stopping on poison."""
         ctrl = self._check_fusectrl_first()
         dsov = self.rd(REG_DSOV_STATUS)
         if is_poison(dsov):
-            return Health(ctrl, dsov, 0, 0, 0, status_word, vout_mv, 0)
+            return Health(ctrl, dsov, 0, 0, 0, 0)
         crc = self.rd(REG_CRC_STATUS)
         plm_fc = self.rd(REG_PLM_FC)
         plm_f8 = self.rd(REG_PLM_F8)
@@ -550,8 +533,6 @@ class GA100FuseController:
             crc=crc,
             plm=plm_fc,
             plm_f8=plm_f8,
-            status_word=status_word,
-            vout_mv=vout_mv,
             en_sw=en_sw,
             debugctrl=dbg,
             efp=efp,
@@ -926,7 +907,7 @@ class BDFLock:
 
 
 class GA100LiveAdapter:
-    """Linux live hardware adapter for CMP 170HX 8 GB (10de:20c2) via sysfs BAR0 + optional Pico PMBus.
+    """Linux live hardware adapter for CMP 170HX 8 GB (10de:20c2) via sysfs BAR0.
 
     Read-only by default (``writable=False``). When ``writable=True`` is requested by
     ``burn --execute`` or ``manual write-record --execute``, sets ``write_enabled = True``
@@ -941,21 +922,16 @@ class GA100LiveAdapter:
         self,
         bdf: str,
         *,
-        pico_port: str | None = None,
         writable: bool = False,
-        assume_vout_mv: float | None = None,
         assume_hold_active: bool = False,
         lock_dir: str | Path | None = None,
     ) -> None:
         self.bdf = normalize_bdf(bdf)
-        self.pico_port = pico_port
         self.writable = bool(writable)
         self.write_enabled = bool(writable)
         self.writer_verified = bool(writable)  # legacy alias; means write mode enabled, not bench-certified
-        self.assume_vout_mv = assume_vout_mv
         self.assume_hold_active = assume_hold_active
         self._bdf_lock: BDFLock | None = None
-        self._card = None
         self._fd: int | None = None
         self._mm = None
 
@@ -965,15 +941,6 @@ class GA100LiveAdapter:
 
         self._bdf_lock = BDFLock(self.bdf, lock_dir=lock_dir)
         try:
-            if self.pico_port:
-                self._card = self._open_pico(self.pico_port)
-                # Check rail over I2C BEFORE opening BAR0 or reading PCI config space.
-                _, vout_mv, _ = self._read_pmbus_rail()
-                if vout_mv < HEALTHY_RAIL_MIN_MV:
-                    raise BurnError(
-                        f"rail at {vout_mv:.1f} mV (brown-out/latch): refusing to touch PCI config or BAR0"
-                    )
-
             # Verify PCI config memory decode is on before mapping BAR0.
             cfg = self._read_pci_config()
             if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
@@ -996,31 +963,6 @@ class GA100LiveAdapter:
             self.close()
             raise
 
-    @property
-    def rail_telemetry_live(self) -> bool:
-        return self._card is not None
-
-    @staticmethod
-    def _open_pico(port: str):
-        if not os.path.exists(port):
-            raise BurnError(f"Pico serial port not found: {port}")
-        try:
-            from ga100vfi.glitch import Card
-        except ImportError as exc:
-            raise BurnError(
-                "cannot import ga100vfi.glitch.Card for --port; install pico-ga100vfi/host "
-                "or omit --port and pass --assume-vout-mv if using an external rail monitor"
-            ) from exc
-        return Card(port)
-
-    def _close_pico(self) -> None:
-        if getattr(self, "_card", None) is not None:
-            try:
-                self._card.close()
-            except Exception:
-                pass
-            self._card = None
-
     def close(self) -> None:
         if getattr(self, "_mm", None) is not None:
             try:
@@ -1034,7 +976,6 @@ class GA100LiveAdapter:
             except Exception:
                 pass
             self._fd = None
-        self._close_pico()
         if getattr(self, "_bdf_lock", None) is not None:
             self._bdf_lock.release()
             self._bdf_lock = None
@@ -1044,28 +985,6 @@ class GA100LiveAdapter:
 
     def __exit__(self, *args) -> None:
         self.close()
-
-    def _vrm16(self, reg: int) -> int:
-        raw = self._card.read(VRM_I2C_ADDR, reg, 2)
-        return raw[0] | (raw[1] << 8)
-
-    def _read_pmbus_rail(self) -> tuple[int, float, int]:
-        """Return (e1_ctrl_mode, vout_mv, status_word) over Pico I2C."""
-        _, e1 = self._card.lock_status()
-        vout_mv = float(self._vrm16(PMBUS_REG_READ_VOUT))
-        status_word = self._vrm16(PMBUS_REG_STATUS_WORD)
-        return e1, vout_mv, status_word
-
-    def _vrm_profile_tainted(self) -> bool:
-        if self._card is None:
-            return False
-        for reg in PROFILE_REGS:
-            try:
-                if self._vrm16(reg) == PROFILE_FAST[reg]:
-                    return True
-            except Exception:
-                return True
-        return False
 
     def _read_pci_config(self) -> bytes:
         with open(self._sysfs / "config", "rb") as f:
@@ -1084,37 +1003,21 @@ class GA100LiveAdapter:
         lockdown_path = Path("/sys/kernel/security/lockdown")
         lockdown = lockdown_path.read_text(encoding="utf-8").strip() if lockdown_path.exists() else "[none]"
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        vrm_tainted = self._vrm_profile_tainted()
-        if self._card is not None:
-            e1, vout_mv, _ = self._read_pmbus_rail()
-            hold_active = (e1 == E1_PMBUS_HELD) and (vout_mv >= HEALTHY_RAIL_MIN_MV)
-        else:
-            # Without Pico PMBus telemetry, treat DSOV==0 + CRC==0x55 or explicit flag as held indicator.
-            hold_active = self.assume_hold_active or (
-                not is_poison(self.controller.rd(REG_FUSECTRL))
-                and self.controller.rd(REG_DSOV_STATUS) == 0
-            )
+        hold_active = self.assume_hold_active or (
+            not is_poison(self.controller.rd(REG_FUSECTRL))
+            and self.controller.rd(REG_DSOV_STATUS) == 0
+        )
         return Host(
             bound_driver=bound_driver,
             nvidia_loaded=nvidia_loaded,
             nouveau_loaded=nouveau_loaded,
             lockdown=lockdown,
-            vrm_tainted=vrm_tainted,
             hold_active=hold_active,
             boot_id=boot_id,
         )
 
     def health(self) -> Health:
-        if self._card is not None:
-            _, vout_mv, status_word = self._read_pmbus_rail()
-        elif self.assume_vout_mv is not None:
-            vout_mv, status_word = float(self.assume_vout_mv), 0
-        else:
-            raise BurnError(
-                "no live PMBus rail telemetry: pass --port /dev/ttyACM0 (Pico) "
-                "or explicitly supply --assume-vout-mv <mV> if rail is externally verified"
-            )
-        return self.controller.read_health_registers(status_word=status_word, vout_mv=vout_mv)
+        return self.controller.read_health_registers()
 
     def die_row(self, index: int) -> int:
         if index not in DIE_ID_ROWS:
@@ -1142,28 +1045,10 @@ class GA100LiveAdapter:
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
-    def _pre_trigger_rail_check(self) -> None:
-        if self._card is None:
-            return
-        e1, vout_mv, status_word = self._read_pmbus_rail()
-        if e1 != E1_PMBUS_HELD:
-            raise BurnError(
-                f"live PMBus hold lost before CMD_PROGRAM (E1=0x{e1:04x}, expected 0x{E1_PMBUS_HELD:04x})"
-            )
-        if vout_mv < HEALTHY_RAIL_MIN_MV:
-            raise BurnError(
-                f"live rail collapse before CMD_PROGRAM ({vout_mv:.1f} mV < {HEALTHY_RAIL_MIN_MV} mV)"
-            )
-        if status_word == 0x2042 or (status_word & 0x8840):
-            raise BurnError(
-                f"live PMBus critical fault before CMD_PROGRAM (STATUS_WORD=0x{status_word:04x})"
-            )
-
     def write_one_record(self, row: int, word: int) -> None:
         if not self.writable:
             raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
-        check_cb = self._pre_trigger_rail_check if self._card is not None else None
-        self.controller.program_row(row, word, pre_trigger_check=check_cb)
+        self.controller.program_row(row, word)
 
     def capture_cold_snapshot(
         self,

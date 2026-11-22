@@ -593,7 +593,7 @@ class TestCLIAndConsole(unittest.TestCase):
 
         # 4. Poisoned FUSECTRL must skip experimental BAR0 reads immediately.
         poisoned_ctl = FakeController(
-            health=Health(0xBADF510E, 0, 0x55, 0xFFFFFFFF, 0xFFFFFFFF, 0, 787.5, 0),
+            health=Health(0xBADF510E, 0, 0x55, 0xFFFFFFFF, 0xFFFFFFFF, 0),
             registers={0x00820228: 0x00000001},
         )
         readings, skipped = read_experimental_registers(poisoned_ctl)

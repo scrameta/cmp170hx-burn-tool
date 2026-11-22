@@ -29,8 +29,6 @@ class Health:
     crc: int
     plm: int
     plm_f8: int
-    status_word: int
-    vout_mv: float
     en_sw: int = 0
     debugctrl: int = 0
     efp: int | None = None
@@ -50,7 +48,6 @@ class Host:
     nvidia_loaded: bool
     nouveau_loaded: bool
     lockdown: str
-    vrm_tainted: bool
     hold_active: bool
     boot_id: str
 
@@ -111,7 +108,7 @@ has_verified_writer = has_write_capability
 
 
 class FakeController:
-    """In-memory simulation only; cannot access BAR0, PMBus, or physical fuses."""
+    """In-memory simulation only; cannot access BAR0 or physical fuses."""
 
     simulation = True
     write_enabled = False
@@ -134,10 +131,10 @@ class FakeController:
         self.rows = dict(rows) if rows is not None else {}
         self.regs = dict(registers) if registers is not None else {}
         self.state = health or Health(
-            0xE0040000, 0, 0x55, 0xFFFFFFFF, 0xFFFFFFFF, 0, 787.5, 0
+            0xE0040000, 0, 0x55, 0xFFFFFFFF, 0xFFFFFFFF, 0
         )
         self.machine = host or Host(
-            "pci-stub", False, False, "[none]", False, True, "fake-boot-1"
+            "pci-stub", False, False, "[none]", True, "fake-boot-1"
         )
         self.events: list[tuple] = []
         self.after_sense = None
@@ -273,13 +270,8 @@ def fake_from_file(path: str | Path) -> FakeController:
     try:
         health_raw = data["health"]
         health_kwargs = {
-            **health_raw,
-            # Optional Health fields are saved as JSON null by --save-fake; keep them None.
-            **{
-                k: (None if v is None else u32(v, f"health.{k}"))
-                for k, v in health_raw.items()
-                if k != "vout_mv"
-            },
+            k: (None if v is None else u32(v, f"health.{k}"))
+            for k, v in health_raw.items()
         }
         return FakeController(
             pci_id=str(data["pci_id"]),

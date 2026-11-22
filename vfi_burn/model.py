@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
-import math
 
 SKU_CMP170HX_8GB = "10de:20c2"
 DEBUGCTRL_ADDR = 0x00820060
@@ -63,18 +62,6 @@ def u32(value, name: str = "value") -> int:
     if not 0 <= n <= 0xFFFFFFFF:
         raise BurnError(f"{name}: value {n} outside unsigned 32-bit range")
     return n
-
-
-def _finite_float(value, name: str) -> float:
-    if isinstance(value, bool):
-        raise BurnError(f"{name}: boolean is not a number")
-    try:
-        f = float(value)
-    except (TypeError, ValueError) as exc:
-        raise BurnError(f"{name}: expected number") from exc
-    if not math.isfinite(f):
-        raise BurnError(f"{name}: must be finite")
-    return f
 
 
 def _req(mapping: dict, key: str, context: str):
@@ -191,14 +178,11 @@ class Plan:
     first_row: int
     last_row: int
     empty_word: int
-    stock_mv: float
-    vout_tolerance_mv: float
     base_sm_ceiling: int
     override_sm_ceiling: int | None
     reconfig_semantics_verified: bool
     final_expected_cold: dict[str, int]
     records: tuple[Record, ...]
-    allowed_status_mask: int = 0
     baseline_ff_rows: dict[int, int] | None = None
     baseline_ff_sha256: str | None = None
     expected_next_row: int | None = None
@@ -219,7 +203,6 @@ class Plan:
 
         card = _req(d, "card", "plan")
         fpf = _req(d, "fpf", "plan")
-        env = _req(d, "environment", "plan")
         ceiling = _req(d, "ceiling", "plan")
         raw_records = _req(d, "records", "plan")
         if not isinstance(raw_records, list):
@@ -322,12 +305,6 @@ class Plan:
                 )
             expected_next_row = parsed_next
 
-        stock = _finite_float(_req(env, "stock_mv", "environment"), "environment.stock_mv")
-        tol = _finite_float(_req(env, "tolerance_mv", "environment"), "environment.tolerance_mv")
-        if not (400.0 <= stock <= 1500.0 and 0.0 < tol <= 100.0):
-            raise BurnError("implausible stock VOUT / tolerance; check PMBus units (expected mV)")
-        allowed_status_mask = u32(env.get("allowed_status_mask", 0), "environment.allowed_status_mask")
-
         base_sm = u32(_req(ceiling, "base_sm", "ceiling"), "ceiling.base_sm")
         if base_sm == 0:
             raise BurnError("ceiling.base_sm must be positive")
@@ -385,14 +362,11 @@ class Plan:
             first_row=first,
             last_row=last,
             empty_word=empty_word,
-            stock_mv=stock,
-            vout_tolerance_mv=tol,
             base_sm_ceiling=base_sm,
             override_sm_ceiling=override_sm,
             reconfig_semantics_verified=reconfig_verified,
             final_expected_cold=safe_num_mapping(d.get("final_expected_cold", {}), "final_expected_cold"),
             records=records,
-            allowed_status_mask=allowed_status_mask,
             baseline_ff_rows=baseline_ff_rows,
             baseline_ff_sha256=baseline_ff_sha256,
             expected_next_row=expected_next_row,
