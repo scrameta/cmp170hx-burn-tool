@@ -67,7 +67,7 @@ class TestBurnMenu(unittest.TestCase):
             session,
             [
                 "2",             # Review plan offline
-                "10", "0x0fe805c1",  # Decode FF word
+                "9", "0x0fe805c1",  # Decode FF word
                 "3",             # Status & passive inspect
                 "4", "NO",       # Active sense cancelled
                 "4", "SENSE",    # Active sense confirmed
@@ -92,7 +92,7 @@ class TestBurnMenu(unittest.TestCase):
         self.assertIn("dry_run_complete", events)
         self.assertNotIn("attempt", events)
 
-    def test_single_window_burn_flow_on_fake(self):
+    def test_unified_burn_plan_continue_same_window_on_fake(self):
         session = MenuSession(
             plan_path=str(self.plan_path),
             fake_path=str(self.fake_path),
@@ -107,13 +107,16 @@ class TestBurnMenu(unittest.TestCase):
             [
                 "6",
                 "YES",                   # confirm FAKE_TEST
-                "CONTINUE SAME WINDOW",  # keep same glitch window
+                "CONTINUE SAME WINDOW",  # keep same glitch session
                 "YES",                   # confirm FAKE_COMPUTE
+                "6",                     # re-entering [6] detects COMPLETE
                 "0",
             ],
         )
         self.assertEqual(rc, 0, out)
+        self.assertIn("Card state : FRESH", out)
         self.assertIn("SIMULATION COMPLETE", out)
+        self.assertIn("Card state : COMPLETE", out)
         self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572448)
         self.assertEqual(menu._cached_fake.fuse_row(224), 0x04200201)
 
@@ -121,7 +124,7 @@ class TestBurnMenu(unittest.TestCase):
         self.assertIn("same_window_continue_confirmed", events)
         self.assertEqual(events.count("verified_readback_only"), 2)
 
-    def test_split_window_burn_with_cold_verify_receipt(self):
+    def test_unified_burn_plan_pause_after_test_cold_verify_and_resume(self):
         receipt_out = self.work / "test.receipt"
         session = MenuSession(
             plan_path=str(self.plan_path),
@@ -131,15 +134,46 @@ class TestBurnMenu(unittest.TestCase):
         rc, out, menu = self._run_menu(
             session,
             [
-                "7", "1", "YES",                                           # split stage=test
-                "11", "2", str(self.cold_path), "test", str(receipt_out),  # verify cold -> sets receipt_path
-                "7", "2", "", "YES",                                       # split stage=real
+                "6", "YES", "",                                            # burn test row, Enter to pause
+                "5",                                                       # dry-run adapts to RESUME
+                "10", "2", str(self.cold_path), "test", str(receipt_out),  # verify cold -> sets receipt_path
+                "6", "YES",                                                # [6] auto-detects RESUME -> burns real
+                "6",                                                       # [6] auto-detects COMPLETE
                 "0",
             ],
         )
         self.assertEqual(rc, 0, out)
         self.assertEqual(session.receipt_path, str(receipt_out))
         self.assertTrue(receipt_out.exists())
+        self.assertIn("DRY-RUN [RESUME]", out)
+        self.assertIn("Card state : RESUME", out)
+        self.assertIn("Card state : COMPLETE", out)
+        self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572448)
+        self.assertEqual(menu._cached_fake.fuse_row(224), 0x04200201)
+
+    def test_unified_burn_plan_resume_prompts_for_missing_receipt_before_burn(self):
+        receipt_out = self.work / "test.receipt"
+        session = MenuSession(
+            plan_path=str(self.plan_path),
+            fake_path=str(self.fake_path),
+            journal_path=str(self.journal_path),
+        )
+        # First burn test row, verify cold to create receipt, then clear session.receipt_path
+        # to simulate restarting vfi_burn after a reboot without passing --receipt.
+        rc, out, menu = self._run_menu(
+            session,
+            [
+                "6", "YES", "",
+                "10", "2", str(self.cold_path), "test", str(receipt_out),
+                "1", "f", "-", "0",               # clear receipt path
+                "6", "",                          # cancel at receipt prompt (no write)
+                "6", str(receipt_out), "YES",     # supply receipt inline -> resumes & finishes
+                "0",
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Burn cancelled (cold-boot test receipt required to resume", out)
+        self.assertEqual(session.receipt_path, str(receipt_out))
         self.assertEqual(menu._cached_fake.fuse_row(223), 0x13572448)
         self.assertEqual(menu._cached_fake.fuse_row(224), 0x04200201)
 
@@ -152,9 +186,9 @@ class TestBurnMenu(unittest.TestCase):
         rc, out, _ = self._run_menu(
             session,
             [
-                "8", "1", "225", "2", "5", "0",  # set slot=225, skip_active_sense, undetermined_ceiling
-                "9", "status", "quit",           # enter manual console and exit cleanly
-                "8", "1", "-", "r", "0",         # clear slot with '-', reset all overrides
+                "7", "1", "225", "2", "5", "0",  # set slot=225, skip_active_sense, undetermined_ceiling
+                "8", "status", "quit",           # enter manual console and exit cleanly
+                "7", "1", "-", "r", "0",         # clear slot with '-', reset all overrides
                 "0",
             ],
         )
@@ -358,15 +392,107 @@ class TestBurnMenu(unittest.TestCase):
             fake_path=str(exp_fake_path),
             journal_path=str(self.journal_path),
         )
-        rc, out, _ = self._run_menu(session, ["12", "0"])
+        rc, out, _ = self._run_menu(session, ["11", "0"])
         self.assertEqual(rc, 0, out)
-        self.assertIn("[12] Experimental Registers", out)
+        self.assertIn("[11] Experimental Registers", out)
         self.assertIn("=== EXPERIMENTAL READ-ONLY REGISTERS", out)
         self.assertIn("FUSE_ECC_EN", out)
         self.assertIn("DISABLED (CMP/consumer)", out)
         self.assertIn("MAX THROTTLE (5; CMP)", out)
         events = [e["event"] for e in self._journal_events()]
         self.assertIn("manual_experimental_read", events)
+
+    def test_unified_burn_plan_mid_plan_resume_with_baseline_and_override(self):
+        from vfi_burn.ffrecord import encode_ff
+        from vfi_burn.model import canonical_ff_prefix_sha256
+
+        w_base_nv = encode_ff(1, 23, 0x0007)
+        w_noop = encode_ff(1, 23, 0x0007)
+        w_real_1 = encode_ff(1, 23, 0x0003)
+        w_real_2 = encode_ff(1, 23, 0x0000)
+
+        brows = {222: w_base_nv}
+        plan_dict = {
+            "schema_version": 1,
+            "card": {
+                "pci_id": "10de:20c2",
+                "die_rows": {str(i): f"0x100{i:x}" for i in range(8, 16)},
+                "expected_masks": {"NVLINK_DISABLE": "0x7", "SYS_PIPE_DISABLE": "0x0"},
+                "defect_masks": {"NVLINK_DISABLE": "0x0", "SYS_PIPE_DISABLE": "0x0"},
+            },
+            "fpf": {
+                "first_row": 222,
+                "last_row": 230,
+                "empty_word": "0x00000000",
+                "expected_next_row": 223,
+                "baseline_ff_rows": {"222": f"0x{w_base_nv:08x}"},
+                "baseline_ff_sha256": canonical_ff_prefix_sha256(brows),
+            },
+            "ceiling": {"base_sm": 122},
+            "records": [
+                {
+                    "name": "NOOP_TEST",
+                    "kind": "test",
+                    "target": "NOOP_C1_B23",
+                    "word": f"0x{w_noop:08x}",
+                    "decode": "no-op test",
+                    "defect_sensitive": False,
+                    "expected_cold": {"NVLINK_DISABLE": "0x7"},
+                },
+                {
+                    "name": "REAL_1",
+                    "kind": "regular",
+                    "target": "NVLINK_DISABLE",
+                    "word": f"0x{w_real_1:08x}",
+                    "decode": "NVLink 0x7 -> 0x3",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "NVLINK_DISABLE", "from": "0x7", "to": "0x3"},
+                    "expected_cold": {"NVLINK_DISABLE": "0x3"},
+                },
+                {
+                    "name": "REAL_2",
+                    "kind": "regular",
+                    "target": "NVLINK_DISABLE",
+                    "word": f"0x{w_real_2:08x}",
+                    "decode": "NVLink 0x3 -> 0x0",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "NVLINK_DISABLE", "from": "0x3", "to": "0x0"},
+                    "expected_cold": {"NVLINK_DISABLE": "0x0"},
+                },
+            ],
+        }
+        # Simulate card where NOOP_TEST (row 223) and REAL_1 (row 224) are already burned.
+        fake_dict = json.loads(self.fake_path.read_text())
+        fake_dict["fields"] = {"NVLINK_DISABLE": "0x3", "SYS_PIPE_DISABLE": "0x0"}
+        fake_dict["rows"] = {str(r): "0x00000000" for r in range(222, 231)}
+        fake_dict["rows"]["222"] = f"0x{w_base_nv:08x}"
+        fake_dict["rows"]["223"] = f"0x{w_noop:08x}"
+        fake_dict["rows"]["224"] = f"0x{w_real_1:08x}"
+
+        b_plan = self.work / "resume_plan.json"
+        b_fake = self.work / "resume_fake.json"
+        b_plan.write_text(json.dumps(plan_dict))
+        b_fake.write_text(json.dumps(fake_dict))
+        b_plan.chmod(0o600)
+        b_fake.chmod(0o600)
+
+        session = MenuSession(
+            plan_path=str(b_plan),
+            fake_path=str(b_fake),
+            journal_path=str(self.journal_path),
+        )
+        rc, out, menu = self._run_menu(
+            session,
+            [
+                "7", "3", "0",                           # enable no_test_receipt override
+                "6", "OVERRIDE NO TEST RECEIPT", "YES",  # resumes directly at REAL_2 (row 225)!
+                "0",
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Card state : RESUME (2/3 plan record(s) already burned in rows 223..224; 1 real record(s) remaining starting at row 225)", out)
+        self.assertIn("Resuming real stage: 1 record(s) already committed", out)
+        self.assertEqual(menu._cached_fake.fuse_row(225), w_real_2)
 
 
 if __name__ == "__main__":

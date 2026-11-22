@@ -669,6 +669,189 @@ def _load_test_receipt(plan: Plan, test_receipt: str | Path) -> dict:
     return receipt
 
 
+@dataclass(frozen=True)
+class PlanProgress:
+    """Passive detection of how much of a plan is already burned in card FPF rows."""
+
+    state: str  # "fresh", "resume", "complete", or "mismatch"
+    committed_count: int
+    total_count: int
+    start_row: int | None
+    next_row: int | None
+    detail: str = ""
+
+
+def _journal_test_row(plan: Plan, journal_path: str | Path | None) -> int | None:
+    if not journal_path:
+        return None
+    p = Path(journal_path)
+    if not p.exists():
+        return None
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    test_rec = plan.records[0]
+    expected_word = hex32(test_rec.word)
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            item.get("event") == "verified_readback_only"
+            and item.get("plan_sha256") == plan.content_hash
+            and item.get("record") == test_rec.name
+            and item.get("intended") == expected_word
+            and isinstance(item.get("row"), int)
+            and not isinstance(item.get("row"), bool)
+        ):
+            return int(item["row"])
+    return None
+
+
+def detect_plan_progress(
+    plan: Plan,
+    reader,
+    *,
+    journal_path: str | Path | None = None,
+    receipt_path: str | Path | None = None,
+    override_slot: int | None = None,
+) -> PlanProgress:
+    """Passively determine whether the card is fresh, mid-plan (resumable), or complete.
+
+    Issues only minimal CMD_READs (1 row on a fresh card when ``baseline_ff_rows`` is
+    present) and never triggers SENSE_CTRL or CMD_PROGRAM.
+    """
+    total = len(plan.records)
+
+    def _match_from(start_row: int) -> PlanProgress:
+        for offset in range(total):
+            row_idx = start_row + offset
+            if row_idx > plan.last_row:
+                return PlanProgress(
+                    state="fresh" if offset == 0 else "resume",
+                    committed_count=offset,
+                    total_count=total,
+                    start_row=start_row,
+                    next_row=row_idx,
+                )
+            word = reader.fuse_row(row_idx)
+            _poison(f"FPF row {row_idx}", word)
+            if word == plan.empty_word:
+                if offset == 0:
+                    return PlanProgress(
+                        state="fresh",
+                        committed_count=0,
+                        total_count=total,
+                        start_row=start_row,
+                        next_row=override_slot if override_slot is not None else start_row,
+                    )
+                return PlanProgress(
+                    state="resume",
+                    committed_count=offset,
+                    total_count=total,
+                    start_row=start_row,
+                    next_row=row_idx,
+                )
+            expected = plan.records[offset]
+            if word != expected.word:
+                if offset == 0:
+                    detail = (
+                        f"FPF row {row_idx} reads {hex32(word)}, expected empty "
+                        f"or plan test record {expected.name!r} ({hex32(expected.word)})"
+                    )
+                else:
+                    detail = (
+                        f"FPF row {row_idx} reads {hex32(word)}, expected empty "
+                        f"or plan record {expected.name!r} ({hex32(expected.word)})"
+                    )
+                return PlanProgress(
+                    state="mismatch",
+                    committed_count=offset,
+                    total_count=total,
+                    start_row=start_row,
+                    next_row=None,
+                    detail=detail,
+                )
+        return PlanProgress(
+            state="complete",
+            committed_count=total,
+            total_count=total,
+            start_row=start_row,
+            next_row=start_row + total,
+        )
+
+    # 1. Authoritative baseline snapshot (present on all live/imported plans): 1 read if fresh.
+    if plan.baseline_ff_rows is not None:
+        expected_next = (
+            plan.expected_next_row
+            if plan.expected_next_row is not None
+            else (plan.first_row + len(plan.baseline_ff_rows))
+        )
+        return _match_from(expected_next)
+
+    # 2. Without baseline_ff_rows: check receipt if supplied.
+    if receipt_path is not None:
+        receipt = _load_test_receipt(plan, receipt_path)
+        return _match_from(receipt["test_row"])
+
+    # 3. Check session journal for a prior verified write of this plan's test record.
+    j_row = _journal_test_row(plan, journal_path)
+    if j_row is not None and plan.first_row <= j_row <= plan.last_row:
+        w = reader.fuse_row(j_row)
+        _poison(f"FPF row {j_row}", w)
+        if w == plan.records[0].word:
+            return _match_from(j_row)
+
+    # 4. Fallback scan until first empty row.
+    if override_slot is not None:
+        return PlanProgress(
+            state="fresh",
+            committed_count=0,
+            total_count=total,
+            start_row=override_slot,
+            next_row=override_slot,
+        )
+
+    occupied: list[tuple[int, int]] = []
+    pointer = plan.last_row + 1
+    for r in range(plan.first_row, plan.last_row + 1):
+        w = reader.fuse_row(r)
+        _poison(f"FPF row {r}", w)
+        if w == plan.empty_word:
+            pointer = r
+            break
+        occupied.append((r, w))
+
+    # Without baseline, receipt, or journal evidence, only auto-detect multi-record
+    # plan suffixes (>= 2 matching records) so a factory row can never be mistaken for a no-op test.
+    if total >= 2 and len(occupied) >= 2:
+        max_k = min(total, len(occupied))
+        for k in range(max_k, 1, -1):
+            tail_words = [w for _, w in occupied[-k:]]
+            plan_words = [rec.word for rec in plan.records[:k]]
+            if tail_words == plan_words:
+                start_row = occupied[-k][0]
+                return PlanProgress(
+                    state="complete" if k == total else "resume",
+                    committed_count=k,
+                    total_count=total,
+                    start_row=start_row,
+                    next_row=pointer,
+                )
+
+    return PlanProgress(
+        state="fresh",
+        committed_count=0,
+        total_count=total,
+        start_row=pointer,
+        next_row=pointer,
+    )
+
+
 def _capture_snapshot(reader) -> tuple[dict | None, dict | None]:
     health_dict = None
     host_dict = None
@@ -1106,21 +1289,36 @@ def process_records(
                     )
             pending = list(plan.records[1:])
         else:
+            resume_test_row: int | None = None
             if receipt is not None:
-                test_row = receipt["test_row"]
-                actual_test = live_rows[test_row] if test_row in live_rows else reader.fuse_row(test_row)
-                if actual_test != plan.records[0].word or pointer < test_row + 1:
+                resume_test_row = receipt["test_row"]
+                actual_test = (
+                    live_rows[resume_test_row]
+                    if resume_test_row in live_rows
+                    else reader.fuse_row(resume_test_row)
+                )
+                if actual_test != plan.records[0].word or pointer < resume_test_row + 1:
                     raise BurnError(
                         "cold-verified test record not at expected location; refuse real stage"
                     )
-                already_written = pointer - (test_row + 1)
+            elif plan.baseline_ff_rows is not None:
+                expected_next = (
+                    plan.expected_next_row
+                    if plan.expected_next_row is not None
+                    else (plan.first_row + len(plan.baseline_ff_rows))
+                )
+                if pointer > expected_next:
+                    resume_test_row = expected_next
+
+            if resume_test_row is not None:
+                already_written = pointer - (resume_test_row + 1)
                 if already_written > len(plan.records) - 1:
                     raise BurnError(
                         f"FPF pointer {pointer} is past end of plan "
-                        f"(test_row={test_row}, {len(plan.records) - 1} real records)"
+                        f"(test_row={resume_test_row}, {len(plan.records) - 1} real records)"
                     )
                 for offset in range(1, already_written + 1):
-                    row_idx = test_row + offset
+                    row_idx = resume_test_row + offset
                     expected_rec = plan.records[offset]
                     actual_word = live_rows[row_idx] if row_idx in live_rows else reader.fuse_row(row_idx)
                     if actual_word != expected_rec.word:
@@ -1143,7 +1341,7 @@ def process_records(
                 if already_written > 0:
                     show(
                         f"Resuming real stage: {already_written} record(s) already committed "
-                        f"in rows {test_row + 1}..{pointer - 1}."
+                        f"in rows {resume_test_row + 1}..{pointer - 1}."
                     )
                 pending = list(plan.records[1 + already_written :])
                 if not pending:
@@ -1492,11 +1690,12 @@ def process_records(
             )
             show(
                 "NOTE: Read-back confirms the test write landed in the fuse array, NOT a cold-boot re-parse.\n"
-                "You can stop now to cold-boot verify the test row, or continue directly into real records."
+                "You can continue burning the real records in this same glitch session, "
+                "or stop now to power-cycle and cold-boot verify the test row first."
             )
             if not _confirm_token(
                 confirm,
-                "Type 'CONTINUE SAME WINDOW' to proceed to real records now "
+                "Type 'CONTINUE SAME WINDOW' to burn real records now "
                 "(or press Enter to stop and cold-boot verify first): ",
                 "CONTINUE SAME WINDOW",
             ):
@@ -1515,8 +1714,9 @@ def process_records(
                     cold_boot_verified=False,
                 )
                 show(
-                    "Paused cleanly after test row. Cold-boot, run verify-cold --stage test "
-                    "--receipt-out <file>, then resume with --stage real --receipt <file>."
+                    "Paused cleanly after test row. Power-cycle to cold-boot verify "
+                    "(menu [10] Verify Cold, or CLI: verify-cold --stage test --receipt-out <file>), "
+                    "then resume with menu [6] Burn Plan (or CLI: --stage real --receipt <file>)."
                 )
                 return pointer
             journal.append(

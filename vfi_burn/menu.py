@@ -31,6 +31,7 @@ from .engine import (
     Overrides,
     check_host_readonly_safe,
     check_plan,
+    detect_plan_progress,
     evaluate_health,
     hex32,
     preflight,
@@ -179,13 +180,12 @@ class BurnMenu:
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
         self.show("   [5] Dry-Run Burn Preview (passive preflight + row plan, NO writes)")
-        self.show("   [6] Burn Plan — Interactive (no-op test first, pause/stop by functional block)")
-        self.show("   [7] Burn Plan — By Stage (no-op test only, or real records with test receipt)")
-        self.show("   [8] Configure Manual Overrides (granular, audited)")
-        self.show("   [9] Manual Low-Level Console (read rows/regs/fields, diff, single write)")
-        self.show("  [10] Decode Any 32-Bit FF Word (offline)")
-        self.show("  [11] Cold-Boot Snapshot & Verify (snapshot / verify-cold)")
-        self.show("  [12] Experimental Registers (read-only: ECC, SM speed select, SKU, readouts)")
+        self.show("   [6] Burn Plan (no-op test first, or resume remaining records)")
+        self.show("   [7] Configure Manual Overrides (granular, audited)")
+        self.show("   [8] Manual Low-Level Console (read rows/regs/fields, diff, single write)")
+        self.show("   [9] Decode Any 32-Bit FF Word (offline)")
+        self.show("  [10] Cold-Boot Snapshot & Verify (snapshot / verify-cold)")
+        self.show("  [11] Experimental Registers (read-only: ECC, SM speed select, SKU, readouts)")
         self.show("   [0] Quit")
         self.show("-" * 72)
 
@@ -193,7 +193,7 @@ class BurnMenu:
         while True:
             self._render_header()
             try:
-                choice = self.input_fn("Select [0-12]: ").strip()
+                choice = self.input_fn("Select [0-11]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 self.show("\nExiting vfi_burn menu.")
                 return 0
@@ -214,17 +214,16 @@ class BurnMenu:
             "3": self._menu_status_inspect,
             "4": self._menu_active_sense,
             "5": self._menu_dry_run,
-            "6": self._menu_burn_single_window,
-            "7": self._menu_burn_split,
-            "8": self._menu_overrides,
-            "9": self._menu_manual_console,
-            "10": self._menu_decode_word,
-            "11": self._menu_cold_verify,
-            "12": self._menu_experimental_registers,
+            "6": self._menu_burn_plan,
+            "7": self._menu_overrides,
+            "8": self._menu_manual_console,
+            "9": self._menu_decode_word,
+            "10": self._menu_cold_verify,
+            "11": self._menu_experimental_registers,
         }
         fn = handlers.get(choice)
         if fn is None:
-            self.show(f"Unknown selection {choice!r}; pick 0-12.")
+            self.show(f"Unknown selection {choice!r}; pick 0-11.")
             return
         fn()
 
@@ -408,15 +407,50 @@ class BurnMenu:
         p = self._load_plan()
         backend, owned = self._open_backend(writable=False)
         try:
+            check_host_readonly_safe(backend.host())
+            progress = detect_plan_progress(
+                p,
+                backend,
+                journal_path=self.s.journal_path,
+                receipt_path=self.s.receipt_path,
+                override_slot=self.s.overrides.slot,
+            )
+            if progress.state == "complete":
+                span = (
+                    f"row {progress.start_row}"
+                    if progress.total_count == 1
+                    else f"rows {progress.start_row}..{progress.start_row + progress.total_count - 1}"
+                )
+                self.show(
+                    f"DRY-RUN: all {progress.total_count}/{progress.total_count} plan record(s) "
+                    f"are already burned in {span}; nothing left to burn."
+                )
+                return
+            if progress.state == "mismatch":
+                raise BurnError(f"dry-run mismatch: {progress.detail}")
+
+            stage = "all"
+            receipt = None
+            dry_overrides = self.s.overrides
+            if progress.state == "resume":
+                stage = "real"
+                receipt = self.s.receipt_path
+                if receipt is None and not dry_overrides.no_test_receipt:
+                    dry_overrides = replace(dry_overrides, no_test_receipt=True)
+                self.show(
+                    f"DRY-RUN [RESUME]: {progress.committed_count}/{progress.total_count} record(s) "
+                    f"already burned; previewing remaining {progress.total_count - progress.committed_count} real record(s)."
+                )
             with Journal(self.s.journal_path) as j:
                 process_records(
                     p,
                     backend,
                     MissingWriter(),
                     j,
-                    stage="all",
+                    stage=stage,
                     confirm=self._confirm,
-                    overrides=self.s.overrides,
+                    test_receipt=receipt,
+                    overrides=dry_overrides,
                     dry_run=True,
                     run_active_sense=False,
                     show=self.show,
@@ -425,24 +459,8 @@ class BurnMenu:
         finally:
             self._close_if_owned(backend, owned)
 
-    # ------------------------------------------------------------------ [6] Single-Window Burn
-    def _menu_burn_single_window(self) -> None:
-        self._run_burn_stage("all", receipt=None, max_records=None)
-
-    # ------------------------------------------------------------------ [7] Burn Plan By Stage
-    def _menu_burn_split(self) -> None:
-        self.show("\n--- [7] Burn Plan By Stage ---")
-        self.show("  [1] Stage 'test' (burn ONLY the no-op test record, then stop)")
-        self.show("  [2] Stage 'real' (burn real records; requires cold-verified test receipt unless overridden)")
-        pick = self.input_fn("Choose [1-2, Enter to cancel]: ").strip()
-        if pick == "1":
-            self._run_burn_stage("test", receipt=None, max_records=None)
-        elif pick == "2":
-            max_s = self._ask("Max records this session (blank for all)", "")
-            max_n = int(max_s) if max_s else None
-            self._run_burn_stage("real", receipt=self.s.receipt_path, max_records=max_n)
-
-    def _run_burn_stage(self, stage: str, *, receipt: str | None, max_records: int | None) -> None:
+    # ------------------------------------------------------------------ [6] Burn Plan (Unified)
+    def _menu_burn_plan(self) -> None:
         p = self._load_plan()
         self._check_execute_policy()
         is_fake = bool(self.s.fake_path)
@@ -450,18 +468,89 @@ class BurnMenu:
         backend, owned = self._open_backend(writable=want_write)
         try:
             self._require_execute_ready(backend)
-            writer = backend
+            check_host_readonly_safe(backend.host())
+            progress = detect_plan_progress(
+                p,
+                backend,
+                journal_path=self.s.journal_path,
+                receipt_path=self.s.receipt_path,
+                override_slot=self.s.overrides.slot,
+            )
+            self.show("\n--- [6] Burn Plan ---")
+            if progress.state == "complete":
+                span = (
+                    f"row {progress.start_row}"
+                    if progress.total_count == 1
+                    else f"rows {progress.start_row}..{progress.start_row + progress.total_count - 1}"
+                )
+                self.show(
+                    f"Card state : COMPLETE (all {progress.total_count}/{progress.total_count} "
+                    f"plan record(s) already burned in {span}; nothing left to burn)."
+                )
+                return
+            if progress.state == "mismatch":
+                raise BurnError(f"cannot burn plan: {progress.detail}")
+
+            if progress.state == "fresh":
+                real_count = len(p.records) - 1
+                self.show(
+                    f"Card state : FRESH (0/{progress.total_count} plan record(s) burned; "
+                    f"next free row {progress.next_row})"
+                )
+                if real_count > 0:
+                    self.show(
+                        f"Flow       : Burns no-op test record first, then pauses so you can continue into "
+                        f"the {real_count} real record(s) in this glitch session or stop to cold-boot verify."
+                    )
+                else:
+                    self.show("Flow       : Burns the no-op test record.")
+                stage = "all"
+                receipt = None
+            else:
+                done_end = progress.start_row + progress.committed_count - 1
+                done_span = (
+                    f"row {progress.start_row}"
+                    if progress.committed_count == 1
+                    else f"rows {progress.start_row}..{done_end}"
+                )
+                remaining = progress.total_count - progress.committed_count
+                self.show(
+                    f"Card state : RESUME ({progress.committed_count}/{progress.total_count} "
+                    f"plan record(s) already burned in {done_span}; "
+                    f"{remaining} real record(s) remaining starting at row {progress.next_row})"
+                )
+                receipt = self.s.receipt_path
+                if receipt:
+                    self.show(f"Test receipt: {receipt}")
+                elif self.s.overrides.no_test_receipt:
+                    self.show(
+                        "Test receipt: none (override 'no_test_receipt' enabled — will require typed confirm)"
+                    )
+                else:
+                    entered = self._ask(
+                        "Cold-boot test receipt path (from [10] Verify Cold, or Enter to cancel)"
+                    )
+                    if not entered:
+                        self.show(
+                            "Burn cancelled (cold-boot test receipt required to resume; "
+                            "run [10] Verify Cold or enable override in [7])."
+                        )
+                        return
+                    self.s.receipt_path = entered
+                    receipt = entered
+                stage = "real"
+
             with Journal(self.s.journal_path) as j:
                 process_records(
                     p,
                     backend,
-                    writer,
+                    backend,
                     j,
                     stage=stage,
                     confirm=self._confirm,
                     test_receipt=receipt,
                     overrides=self.s.overrides,
-                    max_records=max_records,
+                    max_records=None,
                     dry_run=False,
                     strict_confirm=not is_fake,
                     confirm_active_sense=not is_fake,
@@ -470,15 +559,15 @@ class BurnMenu:
             if is_fake:
                 self.show("SIMULATION COMPLETE (in-memory fake rows updated; no GPU contacted).")
             else:
-                self.show("READ-BACK VERIFIED (NOT cold-boot verified). Cold boot and run [11] Verify Cold.")
+                self.show("READ-BACK VERIFIED (NOT cold-boot verified). Cold boot and run [10] Verify Cold.")
         finally:
             self._close_if_owned(backend, owned)
 
-    # ------------------------------------------------------------------ [8] Overrides
+    # ------------------------------------------------------------------ [7] Overrides
     def _menu_overrides(self) -> None:
         while True:
             ov = self.s.overrides
-            self.show("\n--- [8] Granular Manual Overrides (each still requires typed confirm at burn time) ---")
+            self.show("\n--- [7] Granular Manual Overrides (each still requires typed confirm at burn time) ---")
             self.show(f"  [1] Override target FF slot (ambiguous gap)   : {ov.slot if ov.slot is not None else 'OFF'}")
             self.show(f"  [2] Skip automatic SENSE_CTRL                 : {'ON' if ov.skip_active_sense else 'OFF'}")
             self.show(f"  [3] Allow real stage without test receipt     : {'ON' if ov.no_test_receipt else 'OFF'}")
@@ -519,7 +608,7 @@ class BurnMenu:
                 self.s.overrides = Overrides()
                 self.show("All manual overrides reset to OFF.")
 
-    # ------------------------------------------------------------------ [9] Manual Console
+    # ------------------------------------------------------------------ [8] Manual Console
     def _menu_manual_console(self) -> None:
         p = self._load_plan()
         is_fake = bool(self.s.fake_path)
@@ -547,7 +636,7 @@ class BurnMenu:
         finally:
             self._close_if_owned(backend, owned)
 
-    # ------------------------------------------------------------------ [10] Decode FF Word
+    # ------------------------------------------------------------------ [9] Decode FF Word
     def _menu_decode_word(self) -> None:
         raw = self._ask("Enter 32-bit FF word (e.g. 0x0fe805c1)")
         if not raw:
@@ -563,9 +652,9 @@ class BurnMenu:
         else:
             self.show("Overlapping GA100 option fields: none in known map")
 
-    # ------------------------------------------------------------------ [11] Cold Snapshot & Verify
+    # ------------------------------------------------------------------ [10] Cold Snapshot & Verify
     def _menu_cold_verify(self) -> None:
-        self.show("\n--- [11] Cold-Boot Snapshot & Verify ---")
+        self.show("\n--- [10] Cold-Boot Snapshot & Verify ---")
         self.show("  [1] Capture cold snapshot from live card (--bdf) -> mode-0600 JSON")
         self.show("  [2] Verify cold snapshot against plan (verify-cold)")
         pick = self.input_fn("Choose [1-2, Enter to cancel]: ").strip()
@@ -596,7 +685,7 @@ class BurnMenu:
                     self.s.receipt_path = receipt_out
             self.show("PASS: cold snapshot matches declared expectations (not independently authenticated).")
 
-    # ------------------------------------------------------------------ [12] Experimental Registers
+    # ------------------------------------------------------------------ [11] Experimental Registers
     def _menu_experimental_registers(self) -> None:
         backend, owned = self._open_backend(writable=False)
         try:
