@@ -45,17 +45,15 @@ from .engine import (
     verify_cold_snapshot,
 )
 from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
-from .ga100 import EXPERIMENTAL_INSPECT_REGS, GA100LiveAdapter, decode_experimental_register
+from .fuses import (
+    EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
+    EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
+    decode_experimental_register,
+)
+from .ga100 import GA100LiveAdapter
 from .menu import BurnMenu, MenuSession
 from .mmio import resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
-
-_EXP_BY_ADDR = {r.address: r for r in EXPERIMENTAL_INSPECT_REGS}
-_EXP_BY_NAME = {}
-for _r in EXPERIMENTAL_INSPECT_REGS:
-    _EXP_BY_NAME[_r.name] = _r
-    for _a in _r.aliases:
-        _EXP_BY_NAME[_a] = _r
 
 
 def prompt_confirm(prompt: str, token: str) -> bool:

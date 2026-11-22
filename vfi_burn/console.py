@@ -33,16 +33,14 @@ from .ffrecord import (
     decode_ff,
     replay_ff_rows,
 )
-from .ga100 import EXPERIMENTAL_INSPECT_REGS, decode_experimental_register
+from .fuses import (
+    EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
+    EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
+    EXPERIMENTAL_INSPECT_REGS,
+    decode_experimental_register,
+)
 from .mmio import REG_FUSECTRL, resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, u32
-
-_EXP_BY_ADDR = {reg.address: reg for reg in EXPERIMENTAL_INSPECT_REGS}
-_EXP_BY_NAME = {}
-for _reg in EXPERIMENTAL_INSPECT_REGS:
-    _EXP_BY_NAME[_reg.name] = _reg
-    for _alias in _reg.aliases:
-        _EXP_BY_NAME[_alias] = _reg
 
 
 def read_experimental_registers(
