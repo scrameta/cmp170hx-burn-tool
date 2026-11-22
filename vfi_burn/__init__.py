@@ -9,6 +9,8 @@ from .fuse_rules import (
     FuseCombinationRule,
     FuseGroup,
     evaluate_fuse_combinations,
+    poweroff_domain_for_group,
+    poweroff_domains_for_groups,
 )
 from .fuses import FFLocation, FUSE_CATALOG, FuseDefinition, FuseType
 from .ga100 import GA100FuseController, GA100LiveAdapter
@@ -68,6 +70,8 @@ __all__ = [
     "evaluate_fuse_combinations",
     "has_verified_writer",
     "import_ffcalc_plan",
+    "poweroff_domain_for_group",
+    "poweroff_domains_for_groups",
     "preflight",
     "process_records",
     "replay_ff_rows",

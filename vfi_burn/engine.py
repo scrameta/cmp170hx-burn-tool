@@ -21,6 +21,7 @@ from .ffrecord import (
     replay_ff_rows,
     verify_noop_test_record,
 )
+from .fuse_rules import poweroff_domains_for_groups
 from .journal import Journal, deferred_signals
 from .model import (
     BurnError,
@@ -424,7 +425,7 @@ def reconcile(
         raise BurnError(f"{record.name}: not a valid GA100 FF record word ({exc})") from exc
 
     if baseline_blocks is not None:
-        old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
+        old_block = baseline_blocks.get(ff.chain, {}).get(ff.block)
 
     # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
     hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
@@ -809,6 +810,35 @@ def _run_poweroff_sanity(
     return sanity
 
 
+def _has_split_poweroff_domains(
+    committed_records: list[Record],
+    remaining_records: list[Record],
+    baseline_blocks: dict[int, dict[int, int]] | None,
+) -> bool:
+    """Return True if any atomic power-off domain spans both committed and remaining records."""
+    walk = {c: dict(b) for c, b in baseline_blocks.items()} if baseline_blocks is not None else None
+
+    def _collect(records: list[Record]) -> set[str]:
+        domains: set[str] = set()
+        for rec in records:
+            if walk is not None:
+                try:
+                    ff = decode_ff(rec.word)
+                    old_b = walk.get(ff.chain, {}).get(ff.block)
+                    groups = classify_ff_functional_groups(rec.word, old_b)
+                    walk.setdefault(ff.chain, {})[ff.block] = ff.data
+                except BurnError:
+                    groups = {"unknown"}
+            else:
+                groups = classify_ff_functional_groups(rec.word, None)
+            domains.update(poweroff_domains_for_groups(groups))
+        return domains
+
+    committed_domains = _collect(committed_records)
+    remaining_domains = _collect(remaining_records)
+    return bool(committed_domains & remaining_domains)
+
+
 def process_records(
     plan: Plan,
     reader,
@@ -1160,7 +1190,7 @@ def process_records(
             if dry_blocks is not None:
                 try:
                     ff_d = decode_ff(record.word)
-                    old_b = dry_blocks.get(ff_d.chain, {}).get(ff_d.block, 0)
+                    old_b = dry_blocks.get(ff_d.chain, {}).get(ff_d.block)
                 except BurnError:
                     old_b = None
             groups = sorted(classify_ff_functional_groups(record.word, old_b))
@@ -1202,7 +1232,7 @@ def process_records(
         if working_blocks is not None:
             try:
                 ff_cur = decode_ff(record.word)
-                rec_old_block = working_blocks.get(ff_cur.chain, {}).get(ff_cur.block, 0)
+                rec_old_block = working_blocks.get(ff_cur.chain, {}).get(ff_cur.block)
             except BurnError:
                 rec_old_block = None
         rec_touches_pcie = (record.kind == "pcie") or ff_word_touches_pcie(record.word, rec_old_block)
@@ -1254,11 +1284,17 @@ def process_records(
                 )
                 raise
 
+        prev_domains = poweroff_domains_for_groups(prev_groups) if prev_groups is not None else set()
+        rec_domains = poweroff_domains_for_groups(rec_groups)
         if (
-            prev_groups is not None
-            and prev_groups != {"noop"}
-            and rec_groups != {"noop"}
-            and not (prev_groups & rec_groups)
+            prev_domains
+            and rec_domains
+            and not (prev_domains & rec_domains)
+            and not _has_split_poweroff_domains(
+                already_committed + written_records,
+                pending[idx:] + deferred_by_max + tail_after_stage,
+                sanity_baseline,
+            )
         ):
             show(
                 f"\n--- Functional group boundary: completed [{', '.join(sorted(prev_groups))}]; "

@@ -289,7 +289,7 @@ class TestCLIAndConsole(unittest.TestCase):
     def test_burn_dry_run_and_execute_guards(self):
         from vfi_burn.ffrecord import encode_ff
 
-        base_row = encode_ff(1, 7, 0x0123)
+        base_row = encode_ff(1, 8, 0x0428)  # c1/b8 with GPC_DISABLE=0x85 (baseline for FAKE_COMPUTE)
         live_plan = json.loads(self.plan_path.read_text())
         live_plan["card"]["defect_masks"]["FBPA_DISABLE"] = "0x0"
         live_plan["fpf"]["baseline_ff_rows"] = {"222": f"0x{base_row:08x}"}

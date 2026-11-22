@@ -25,7 +25,9 @@ from vfi_burn.engine import (
 from vfi_burn.ffrecord import (
     FF_ROW_MIN,
     encode_ff,
+    ff_word_touches_pcie,
     import_ffcalc_plan,
+    replay_ff_rows,
 )
 from vfi_burn.ga100 import (
     BDFLock,
@@ -822,6 +824,435 @@ class TestP2_WriteCapabilityAndColdSnapshotHardening(SafetyReviewTestBase):
         with Journal(self.journal_path) as j:
             receipt = verify_cold_snapshot(plan, good_cold, stage="test", journal=j)
         self.assertEqual(receipt["status"], "PASS")
+
+
+class TestArchReviewSafetyFixes(SafetyReviewTestBase):
+    """Regression tests for post-architecture code-review safety findings."""
+
+    def _sm_hbm_fixture(self) -> tuple[dict[int, int], dict[str, str], dict[str, str], dict[str, int]]:
+        base_rows = {
+            222: encode_ff(1, 7, 0x0123),   # FBPA (no-op target)
+            223: encode_ff(1, 12, 0x0008),  # TPC_GPC1_DISABLE bit 0 = 1 (compute)
+            224: encode_ff(1, 20, 0x0001),  # ROP_L2_DISABLE bit 1 = 1 (memory)
+            225: encode_ff(2, 47, 0x0008),  # pcie_magic_gen4_dis = 1 (pcie)
+        }
+        expected_masks = {
+            "GPC_DISABLE": "0x0",
+            **{f"TPC_GPC{i}_DISABLE": ("0x1" if i == 1 else "0x0") for i in range(8)},
+            "ROP_L2_DISABLE": "0x2",
+        }
+        defect_masks = {
+            "GPC_DISABLE": "0x0",
+            **{f"TPC_GPC{i}_DISABLE": "0x0" for i in range(8)},
+            "FBPA_DISABLE": "0x0",
+            "ROP_L2_DISABLE": "0x0",
+        }
+        live_fields = {
+            "GPC_DISABLE": 0x0,
+            **{f"TPC_GPC{i}_DISABLE": (0x1 if i == 1 else 0x0) for i in range(8)},
+            "ROP_L2_DISABLE": 0x2,
+            "LnkCap2": 0x06,
+        }
+        return base_rows, expected_masks, defect_masks, live_fields
+
+    def test_tpc_committed_with_rop_l2_pending_is_not_safe_to_power_off(self):
+        # Finding 1: compute (TPC) committed while memory (ROP_L2) is pending is a GSP-boot-failure
+        # state and must NOT print "clean point to stop" or report SAFE TO POWER OFF.
+        base_rows, expected_masks, defect_masks, live_fields = self._sm_hbm_fixture()
+        tpc_unlock = encode_ff(1, 12, 0x0000)   # compute: TPC_GPC1_DISABLE 0x1 -> 0x0 (128 SMs)
+        rop_unlock = encode_ff(1, 20, 0x0000)   # memory: ROP_L2_DISABLE 0x2 -> 0x0
+        pcie_unlock = encode_ff(2, 47, 0x0000)  # pcie: Gen4 unlock
+        plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "UNLOCK_TPC1",
+                    "kind": "regular",
+                    "target": "TPC_GPC1_DISABLE",
+                    "word": f"0x{tpc_unlock:08x}",
+                    "decode": "TPC_GPC1 0x1 -> 0x0",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "TPC_GPC1_DISABLE", "from": "0x1", "to": "0x0"},
+                    "resulting_sm_count": 128,
+                },
+                {
+                    "name": "UNLOCK_ROP_L2",
+                    "kind": "regular",
+                    "target": "ROP_L2_DISABLE",
+                    "word": f"0x{rop_unlock:08x}",
+                    "decode": "ROP_L2 0x2 -> 0x0",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "ROP_L2_DISABLE", "from": "0x2", "to": "0x0"},
+                },
+                {
+                    "name": "UNLOCK_PCIE_GEN4",
+                    "kind": "pcie",
+                    "target": "PCIE_MAGIC_GEN4_DIS",
+                    "word": f"0x{pcie_unlock:08x}",
+                    "decode": "clear Gen4 disable",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x1e",
+                },
+            ],
+            baseline_rows=base_rows,
+            expected_masks=expected_masks,
+            defect_masks=defect_masks,
+            extra_fpf={"last_row": 240},
+        )
+        # Allow 128 SMs ceiling for this synthetic plan.
+        plan = replace(plan, base_sm_ceiling=128)
+
+        # 1) Stop after NOOP + TPC (ROP_L2 still pending): DO NOT POWER OFF YET + split sm_hbm!
+        mmio1 = self._live_mmio(base_rows)
+        ad1 = LiveMMIOAdapter(mmio1, fields=live_fields)
+        shown1: list[str] = []
+        with Journal(self.journal_path) as j:
+            process_records(
+                plan,
+                ad1,
+                ad1,
+                j,
+                stage="all",
+                max_records=2,
+                confirm=lambda *_: True,
+                show=shown1.append,
+            )
+        out1 = "\n".join(shown1)
+        self.assertIn("DO NOT POWER OFF YET", out1)
+        self.assertNotIn("SAFE TO POWER OFF", out1)
+        self.assertIn("SM_HBM", out1)
+        self.assertIn("GSP boot failure", out1)
+        sanity1 = [e for e in self._logged() if e["event"] == "poweroff_sanity_check"]
+        self.assertEqual(len(sanity1), 1)
+        self.assertFalse(sanity1[0]["safe_to_power_off"])
+        self.assertEqual(sanity1[0]["split_groups"], ["sm_hbm"])
+
+        # 2) Burn through NOOP + TPC + ROP_L2 (stopping before PCIE):
+        #    - NO "clean point to stop" banner between TPC (compute) and ROP_L2 (memory).
+        #    - Pre-power-off sanity check before PCIE IS safe to power off!
+        mmio2 = self._live_mmio(base_rows)
+        ad2 = LiveMMIOAdapter(mmio2, fields=live_fields)
+        shown2: list[str] = []
+        j2_path = self.work / "sm_hbm_full.jsonl"
+        with Journal(j2_path) as j2:
+            process_records(
+                plan,
+                ad2,
+                ad2,
+                j2,
+                stage="all",
+                max_records=3,
+                confirm=lambda *_: True,
+                show=shown2.append,
+            )
+        out2 = "\n".join(shown2)
+        self.assertNotIn("clean point to stop & restart", out2)
+        self.assertIn("SAFE TO POWER OFF", out2)
+
+        # 3) Burn all 4 records: "clean point to stop & restart" appears ONLY before PCIE,
+        #    never between TPC (compute) and ROP_L2 (memory).
+        mmio3 = self._live_mmio(base_rows)
+        ad3 = LiveMMIOAdapter(mmio3, fields=live_fields)
+        shown3: list[str] = []
+        with Journal(self.work / "sm_hbm_all4.jsonl") as j3:
+            process_records(
+                plan,
+                ad3,
+                ad3,
+                j3,
+                stage="all",
+                confirm=lambda *_: True,
+                show=shown3.append,
+            )
+        boundary_lines = [line for line in shown3 if "clean point to stop & restart" in line]
+        self.assertEqual(len(boundary_lines), 1)
+        self.assertIn("next is [pcie]", boundary_lines[0])
+
+    def test_interleaved_compute_pcie_memory_does_not_claim_clean_boundary_before_pcie(self):
+        # Even if PCIE sits between TPC (compute) and ROP_L2 (memory), sm_hbm is still split
+        # before PCIE, so the mid-loop banner must NOT claim a clean point to stop.
+        base_rows, expected_masks, defect_masks, live_fields = self._sm_hbm_fixture()
+        plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "UNLOCK_TPC1",
+                    "kind": "regular",
+                    "target": "TPC_GPC1_DISABLE",
+                    "word": f"0x{encode_ff(1, 12, 0x0000):08x}",
+                    "decode": "TPC_GPC1 0x1 -> 0x0",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "TPC_GPC1_DISABLE", "from": "0x1", "to": "0x0"},
+                    "resulting_sm_count": 128,
+                },
+                {
+                    "name": "UNLOCK_PCIE_GEN4",
+                    "kind": "pcie",
+                    "target": "PCIE_MAGIC_GEN4_DIS",
+                    "word": f"0x{encode_ff(2, 47, 0x0000):08x}",
+                    "decode": "clear Gen4 disable",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x1e",
+                },
+                {
+                    "name": "UNLOCK_ROP_L2",
+                    "kind": "regular",
+                    "target": "ROP_L2_DISABLE",
+                    "word": f"0x{encode_ff(1, 20, 0x0000):08x}",
+                    "decode": "ROP_L2 0x2 -> 0x0",
+                    "defect_sensitive": True,
+                    "mask_update": {"field": "ROP_L2_DISABLE", "from": "0x2", "to": "0x0"},
+                },
+            ],
+            baseline_rows=base_rows,
+            expected_masks=expected_masks,
+            defect_masks=defect_masks,
+            name="interleaved.json",
+        )
+        plan = replace(plan, base_sm_ceiling=128)
+        mmio = self._live_mmio(base_rows)
+        ad = LiveMMIOAdapter(mmio, fields=live_fields)
+        shown: list[str] = []
+        with Journal(self.journal_path) as j:
+            process_records(plan, ad, ad, j, stage="all", confirm=lambda *_: True, show=shown.append)
+        self.assertFalse(any("clean point to stop & restart" in line for line in shown))
+
+    def test_missing_block_39_keeps_pcie_devidb_hard_deny_even_with_override(self):
+        # Finding 2: When chain 2 block 39 is absent from the FF prefix, reconcile() and
+        # process_records() must pass old_block=None (not 0), keeping the unconditional hard deny
+        # on pcie_devidb[15] (bit 0) even if --override-unmapped-ff is supplied.
+        rows_without_b39 = {
+            222: encode_ff(1, 7, 0x0123),
+            223: encode_ff(1, 19, 0x4290),
+        }
+        gen3_word = encode_ff(2, 39, 0x0580)  # standard Gen3 unlock with bit 0 = 0
+        plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "GEN3_MISSING_B39",
+                    "kind": "pcie",
+                    "target": "DISABLE_GEN3_SPEED",
+                    "word": f"0x{gen3_word:08x}",
+                    "decode": "Gen3 unlock 0x0580 when c2/b39 absent from FF prefix",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x0e",
+                },
+            ],
+            baseline_rows=rows_without_b39,
+            name="missing_b39.json",
+        )
+
+        # 1) Direct reconcile() refuses even with allow_unmapped_ff=True.
+        with self.assertRaisesRegex(BurnError, "NV_FUSE_OPT_PCIE_DEVIDB.*no verified baseline block"):
+            reconcile(
+                plan,
+                plan.records[1],
+                plan.expected_masks.copy(),
+                allow_unmapped_ff=True,
+                baseline_blocks=replay_ff_rows(rows_without_b39),
+                enforce_known_ff=True,
+            )
+
+        # 2) process_records() refuses with Overrides(unmapped_ff=True) and ZERO program calls.
+        mmio = self._live_mmio(rows_without_b39)
+        ad = LiveMMIOAdapter(mmio)
+        with Journal(self.journal_path) as j:
+            with self.assertRaisesRegex(BurnError, "NV_FUSE_OPT_PCIE_DEVIDB.*no verified baseline block"):
+                process_records(
+                    plan,
+                    ad,
+                    ad,
+                    j,
+                    stage="all",
+                    overrides=Overrides(unmapped_ff=True),
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio.program_calls, 0)
+
+        # 3) import_ffcalc_plan() also refuses chain 2 block 39 when absent from dump FF prefix.
+        ff_rows = {str(i): f"0x{v:08x}" for i, v in DIE_ROWS.items()}
+        ff_rows["222"] = f"0x{encode_ff(1, 7, 0x0123):08x}"
+        for r in range(223, 487):
+            ff_rows[str(r)] = "0x00000000"
+        dp = self._write_json(
+            "dump_no_b39.json",
+            {"sku": "8gb", "ff_rows": ff_rows, "option_words": {}},
+        )
+        bp = self._write_json(
+            "burn_no_b39.json",
+            {
+                "sku": "8gb",
+                "burn": [
+                    {
+                        "row": 223,
+                        "chain": 2,
+                        "block": 39,
+                        "old": "0x0000",
+                        "new": "0x0580",
+                        "record": f"0x{gen3_word:08x}",
+                        "fields": ["disable_gen3_speed_bit1", "disable_gen3_speed_bit9"],
+                    }
+                ],
+            },
+        )
+        with self.assertRaisesRegex(BurnError, "NV_FUSE_OPT_PCIE_DEVIDB.*no verified baseline block"):
+            import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
+
+    def test_chain2_block46_magic_d_is_treated_as_pcie_and_enforces_lnkcap2_and_review(self):
+        # Finding 3: ga100-ff-tools Gen4 record on chain 2 block 46 (0xA000 -> 0x8000, magic_d)
+        # must be treated as PCIe via functional_group == "pcie", enforcing LnkCap2 and REVIEW PCIE
+        # while still requiring --override-unmapped-ff because magic_d is opt_in.
+        b46_old = encode_ff(2, 46, 0xA000)
+        b46_new = encode_ff(2, 46, 0x8000)
+        self.assertTrue(ff_word_touches_pcie(b46_new, 0xA000))
+        self.assertTrue(ff_word_touches_pcie(b46_new, None))
+
+        base_rows = {
+            **self._base_rows(),
+            227: b46_old,
+        }
+
+        # 1) Without LnkCap2 before/after, even with kind="regular" and Overrides(unmapped_ff=True),
+        #    reconcile / process_records refuses before any write.
+        no_lnk_plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "GEN4_B46_NO_LNK",
+                    "kind": "regular",
+                    "target": "MAGIC_D",
+                    "word": f"0x{b46_new:08x}",
+                    "decode": "chain 2 block 46 0xA000 -> 0x8000",
+                    "defect_sensitive": False,
+                },
+            ],
+            baseline_rows=base_rows,
+            name="b46_no_lnk.json",
+        )
+        mmio0 = self._live_mmio(base_rows)
+        ad0 = LiveMMIOAdapter(mmio0)
+        with Journal(self.work / "j_b46_0.jsonl") as j0:
+            with self.assertRaisesRegex(BurnError, "LnkCap2 before/after"):
+                process_records(
+                    no_lnk_plan,
+                    ad0,
+                    ad0,
+                    j0,
+                    stage="all",
+                    overrides=Overrides(unmapped_ff=True),
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio0.program_calls, 0)
+
+        # 2) With LnkCap2 declared, WITHOUT --override-unmapped-ff it is still refused (magic_d opt_in).
+        with_lnk_plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "GEN4_B46",
+                    "kind": "regular",  # intentionally mislabelled regular; word must still force PCIe gates
+                    "target": "MAGIC_D",
+                    "word": f"0x{b46_new:08x}",
+                    "decode": "chain 2 block 46 0xA000 -> 0x8000",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x1e",
+                },
+            ],
+            baseline_rows=base_rows,
+            name="b46_with_lnk.json",
+        )
+        mmio_no_ov = self._live_mmio(base_rows)
+        ad_no_ov = LiveMMIOAdapter(mmio_no_ov)
+        with Journal(self.work / "j_b46_no_ov.jsonl") as j_no_ov:
+            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
+                process_records(
+                    with_lnk_plan,
+                    ad_no_ov,
+                    ad_no_ov,
+                    j_no_ov,
+                    stage="all",
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio_no_ov.program_calls, 0)
+
+        # 3) With Overrides(unmapped_ff=True), wrong live LnkCap2 refuses before burning block 46.
+        mmio1 = self._live_mmio(base_rows)
+        ad1 = LiveMMIOAdapter(mmio1, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x02})
+        with Journal(self.work / "j_b46_1.jsonl") as j1:
+            with self.assertRaisesRegex(BurnError, "current LnkCap2"):
+                process_records(
+                    with_lnk_plan,
+                    ad1,
+                    ad1,
+                    j1,
+                    stage="all",
+                    overrides=Overrides(unmapped_ff=True),
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio1.program_calls, 1)  # NOOP_TEST only; block 46 refused
+
+        # 4) Matching live LnkCap2 demands REVIEW PCIE confirmation token!
+        mmio2 = self._live_mmio(base_rows)
+        ad2 = LiveMMIOAdapter(mmio2, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x06})
+        tokens: list[str] = []
+
+        def decline_review_pcie(prompt, token):
+            tokens.append(token)
+            return token != "REVIEW PCIE"
+
+        with Journal(self.work / "j_b46_2.jsonl") as j2:
+            with self.assertRaisesRegex(BurnError, "special record not confirmed"):
+                process_records(
+                    with_lnk_plan,
+                    ad2,
+                    ad2,
+                    j2,
+                    stage="all",
+                    overrides=Overrides(unmapped_ff=True),
+                    confirm=decline_review_pcie,
+                    show=lambda *_: None,
+                )
+        self.assertIn("REVIEW PCIE", tokens)
+        self.assertEqual(mmio2.program_calls, 1)
+
+        # 5) import_ffcalc_plan classifies block 46 magic_d as kind="pcie" with LnkCap2 fields.
+        ff_rows = {str(i): f"0x{v:08x}" for i, v in DIE_ROWS.items()}
+        ff_rows["222"] = f"0x{encode_ff(1, 7, 0x0123):08x}"
+        ff_rows["223"] = f"0x{b46_old:08x}"
+        for r in range(224, 487):
+            ff_rows[str(r)] = "0x00000000"
+        dp = self._write_json("dump_b46.json", {"sku": "8gb", "ff_rows": ff_rows, "option_words": {}})
+        bp = self._write_json(
+            "burn_b46.json",
+            {
+                "sku": "8gb",
+                "burn": [
+                    {
+                        "row": 224,
+                        "chain": 2,
+                        "block": 46,
+                        "old": "0xa000",
+                        "new": "0x8000",
+                        "record": f"0x{b46_new:08x}",
+                        "fields": ["magic_d"],
+                    }
+                ],
+            },
+        )
+        imported = import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
+        self.assertEqual(imported["records"][1]["kind"], "pcie")
+        self.assertIn("link_cap2_before", imported["records"][1])
+        self.assertIn("link_cap2_after", imported["records"][1])
+        self.assertEqual(imported["final_expected_cold"]["LnkCap2"], "0x1e")
 
 
 if __name__ == "__main__":

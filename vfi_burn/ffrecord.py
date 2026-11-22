@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .fuse_rules import evaluate_fuse_combinations
+from .fuse_rules import evaluate_fuse_combinations, poweroff_domain_for_group
 from .fuses import (
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
@@ -442,9 +442,8 @@ def ff_word_touches_pcie(word: int, old_block: int | None = None) -> bool:
     except BurnError:
         return False
     analysis = analyze_ff_block(rec.chain, rec.block, rec.data, old_block)
-    if old_block is not None:
-        return any(f.category == "pcie" for f in analysis["changed_fields"])
-    return any(f.category == "pcie" for f in analysis["fields"])
+    fields = analysis["changed_fields"] if old_block is not None else analysis["fields"]
+    return any(FIELD_FUNCTIONAL_GROUP.get(f.key, f.category) == "pcie" for f in fields)
 
 
 def verify_noop_test_record(word: int, existing_blocks: dict[int, dict[int, int]]) -> None:
@@ -561,17 +560,19 @@ def evaluate_poweroff_sanity(
         else:
             warnings.append(issue.message)
 
-    # 3. Functional-group boundary check between committed and remaining planned records.
+    # 3. Functional-group / atomic power-off domain boundary check between committed and remaining records.
     if baseline_blocks is not None:
         walk_blocks = {c: dict(b) for c, b in baseline_blocks.items()}
     else:
         walk_blocks = {c: dict(b) for c, b in live_blocks.items()}
 
     committed_by_group: dict[str, list[str]] = {}
+    committed_by_domain: dict[str, list[str]] = {}
+    committed_groups_in_domain: dict[str, set[str]] = {}
     for rec in committed_records:
         try:
             ff = decode_ff(rec.word)
-            old_b = walk_blocks.get(ff.chain, {}).get(ff.block, 0)
+            old_b = walk_blocks.get(ff.chain, {}).get(ff.block)
             groups = classify_ff_functional_groups(rec.word, old_b)
             walk_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
         except BurnError:
@@ -579,12 +580,19 @@ def evaluate_poweroff_sanity(
         for g in groups:
             if g != "noop":
                 committed_by_group.setdefault(g, []).append(rec.name)
+                dom = poweroff_domain_for_group(g)
+                committed_groups_in_domain.setdefault(dom, set()).add(g)
+                dom_recs = committed_by_domain.setdefault(dom, [])
+                if rec.name not in dom_recs:
+                    dom_recs.append(rec.name)
 
     remaining_by_group: dict[str, list[str]] = {}
+    remaining_by_domain: dict[str, list[str]] = {}
+    remaining_groups_in_domain: dict[str, set[str]] = {}
     for rec in remaining_records:
         try:
             ff = decode_ff(rec.word)
-            old_b = walk_blocks.get(ff.chain, {}).get(ff.block, 0)
+            old_b = walk_blocks.get(ff.chain, {}).get(ff.block)
             groups = classify_ff_functional_groups(rec.word, old_b)
             walk_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
         except BurnError:
@@ -592,15 +600,33 @@ def evaluate_poweroff_sanity(
         for g in groups:
             if g != "noop":
                 remaining_by_group.setdefault(g, []).append(rec.name)
+                dom = poweroff_domain_for_group(g)
+                remaining_groups_in_domain.setdefault(dom, set()).add(g)
+                dom_recs = remaining_by_domain.setdefault(dom, [])
+                if rec.name not in dom_recs:
+                    dom_recs.append(rec.name)
 
-    split_groups = sorted(set(committed_by_group) & set(remaining_by_group))
-    for grp in split_groups:
-        warnings.append(
-            f"PARTIAL '{grp.upper()}' FUNCTIONAL GROUP BURNED: committed "
-            f"[{', '.join(committed_by_group[grp])}] while [{', '.join(remaining_by_group[grp])}] "
-            f"are still pending! Powering off before finishing the '{grp}' group may leave "
-            "an inconsistent configuration."
-        )
+    split_groups: list[str] = []
+    for dom in sorted(set(committed_by_domain) & set(remaining_by_domain)):
+        dom_groups = committed_groups_in_domain[dom] | remaining_groups_in_domain[dom]
+        if len(dom_groups) == 1:
+            grp = next(iter(dom_groups))
+            split_groups.append(grp)
+            warnings.append(
+                f"PARTIAL '{grp.upper()}' FUNCTIONAL GROUP BURNED: committed "
+                f"[{', '.join(committed_by_group[grp])}] while [{', '.join(remaining_by_group[grp])}] "
+                f"are still pending! Powering off before finishing the '{grp}' group may leave "
+                "an inconsistent configuration."
+            )
+        else:
+            split_groups.append(dom)
+            coupled = "+".join(sorted(dom_groups))
+            warnings.append(
+                f"PARTIAL '{dom.upper()}' ATOMIC GROUP ({coupled}) BURNED: committed "
+                f"[{', '.join(committed_by_domain[dom])}] while [{', '.join(remaining_by_domain[dom])}] "
+                "are still pending! Powering off with compute/memory (GPC/TPC/PES vs FBP/FBPA/FBIO/ROP_L2) "
+                "split can leave SMs unlocked while PES/ROP_L2 remain masked and cause GSP boot failure."
+            )
 
     safe_to_power_off = (not errors) and (not split_groups)
 
@@ -825,11 +851,18 @@ def import_ffcalc_plan(
                 f"chain={chain} block={block} new=0x{new_data:04x}"
             )
         replay_blocks_now = replay_ff_rows(running_rows)
-        replay_old = replay_blocks_now.get(chain, {}).get(block, 0)
+        replay_old = replay_blocks_now.get(chain, {}).get(block)
         if "old" in item:
-            if u32(item["old"], f"burn[{idx}].old") != replay_old:
+            expected_old = u32(item["old"], f"burn[{idx}].old")
+            if replay_old is None:
+                if expected_old != 0:
+                    raise BurnError(
+                        f"burn[{idx}] row {row}: planned old=0x{expected_old:04x} but "
+                        f"c{chain}/b{block} is absent from replayed FF prefix"
+                    )
+            elif expected_old != replay_old:
                 raise BurnError(
-                    f"burn[{idx}] row {row}: planned old=0x{u32(item['old'], 'old'):04x} != "
+                    f"burn[{idx}] row {row}: planned old=0x{expected_old:04x} != "
                     f"replayed current block 0x{replay_old:04x}"
                 )
         hard_denials, overridable_issues = ff_word_safety_audit(word, replay_old)
@@ -845,7 +878,9 @@ def import_ffcalc_plan(
 
         fields = list(item.get("fields", []))
         is_pcie = ff_word_touches_pcie(word, replay_old) or any(
-            FIELDS_BY_KEY[k].category == "pcie" for k in fields if k in FIELDS_BY_KEY
+            FIELD_FUNCTIONAL_GROUP.get(k, FIELDS_BY_KEY[k].category) == "pcie"
+            for k in fields
+            if k in FIELDS_BY_KEY
         )
 
         # Find primary floorsweep mask changed by this record (if any).

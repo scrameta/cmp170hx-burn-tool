@@ -429,7 +429,7 @@ def format_plan_review(
             )
             continue
 
-        old_blk = sim_blocks.get(ff.chain, {}).get(ff.block, 0) if sim_blocks is not None else None
+        old_blk = sim_blocks.get(ff.chain, {}).get(ff.block) if sim_blocks is not None else None
         analysis = analyze_ff_block(ff.chain, ff.block, ff.data, old_blk)
         if sim_blocks is not None:
             sim_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
@@ -966,7 +966,7 @@ class ManualConsole:
                 for r in range(self.plan.first_row, self.plan.last_row + 1)
             }
             blocks, _ = _safe_replay_rows(cur_rows)
-            old_blk = blocks.get(ff.chain, {}).get(ff.block, 0)
+            old_blk = blocks.get(ff.chain, {}).get(ff.block)
         except Exception:
             old_blk = None
         for out in format_fuse_controller_state(self.plan, self.reader):
