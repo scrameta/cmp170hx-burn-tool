@@ -1,0 +1,9 @@
+{
+  "pci_id": "10de:20c2",
+  "cold_boot": true,
+  "boot_id": "synthetic-cold-boot-2",
+  "previous_boot_id": "synthetic-boot-1",
+  "die_rows": {"8": "0x1008", "9": "0x1009", "10": "0x100a", "11": "0x100b", "12": "0x100c", "13": "0x100d", "14": "0x100e", "15": "0x100f"},
+  "fpf_rows": {"223": "0x13572468"},
+  "fields": {"SYNTHETIC_TEST_EFFECT": "0x1"}
+}

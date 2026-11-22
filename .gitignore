@@ -1,0 +1,14 @@
+# NEVER commit per-card plans, die IDs, snapshots, receipts, or audit logs.
+*.json
+!examples/*.example.json
+*.jsonl
+*.log
+*.receipt
+private/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/

@@ -1,0 +1,291 @@
+"""Strict per-card plan decoding. Supplied FF words are opaque, never synthesized."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import hashlib
+import json
+import math
+
+SKU_CMP170HX_8GB = "10de:20c2"
+DEBUGCTRL_ADDR = 0x00820060
+POISON_PREFIXES = (0xBADF0000, 0xBAD00000)
+
+
+class BurnError(Exception):
+    """A fail-closed validation, controller, safety-gate or operator error."""
+
+
+def is_poison(value: int) -> bool:
+    """Return True if a 32-bit word carries a GPU poison or fuse-unit error prefix."""
+    return (value & 0xFFFF0000) in POISON_PREFIXES
+
+
+def is_debugctrl_target(target: str) -> bool:
+    """Return True if a target refers to DEBUGCTRL by name or numeric address."""
+    norm = target.strip().upper()
+    if "DEBUGCTRL" in norm:
+        return True
+    try:
+        return int(norm, 0) == DEBUGCTRL_ADDR
+    except ValueError:
+        return False
+
+
+def u32(value, name: str = "value") -> int:
+    if isinstance(value, bool):
+        raise BurnError(f"{name}: boolean is not an integer")
+    if isinstance(value, float):
+        raise BurnError(f"{name}: float is not an integer")
+    try:
+        n = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError) as exc:
+        raise BurnError(f"{name}: expected unsigned 32-bit integer or hex string") from exc
+    if not 0 <= n <= 0xFFFFFFFF:
+        raise BurnError(f"{name}: value {n} outside unsigned 32-bit range")
+    return n
+
+
+def _finite_float(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise BurnError(f"{name}: boolean is not a number")
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BurnError(f"{name}: expected number") from exc
+    if not math.isfinite(f):
+        raise BurnError(f"{name}: must be finite")
+    return f
+
+
+def _req(mapping: dict, key: str, context: str):
+    if not isinstance(mapping, dict):
+        raise BurnError(f"{context} must be a JSON object")
+    if key not in mapping:
+        raise BurnError(f"missing required field '{context}.{key}'")
+    return mapping[key]
+
+
+def require_private_file(path: str | Path, label: str = "private file") -> Path:
+    """Ensure path is a non-symlink regular file with no group/other permissions (0600)."""
+    p = Path(path)
+    if p.is_symlink():
+        raise BurnError(f"{label} must not be a symlink: {p}")
+    try:
+        st = p.stat()
+    except FileNotFoundError as exc:
+        raise BurnError(f"{label} not found: {p}") from exc
+    if st.st_mode & 0o077:
+        raise BurnError(
+            f"{label} must have mode 0600 (no group/other access): {p} — run: chmod 600 {p}"
+        )
+    return p
+
+
+def safe_num_mapping(obj, name: str) -> dict[str, int]:
+    if not isinstance(obj, dict):
+        raise BurnError(f"{name} must be a JSON object")
+    return {str(k): u32(v, f"{name}.{k}") for k, v in obj.items()}
+
+
+@dataclass(frozen=True)
+class Record:
+    name: str
+    target: str
+    word: int
+    decode: str
+    kind: str
+    defect_sensitive: bool
+    mask_field: str | None
+    from_disable: int | None
+    to_disable: int | None
+    resulting_sm_count: int | None
+    expected_cold: dict[str, int]
+    link_cap2_before: int | None
+    link_cap2_after: int | None
+
+    @classmethod
+    def parse(cls, r) -> "Record":
+        if not isinstance(r, dict):
+            raise BurnError("record must be a JSON object")
+        kind = r.get("kind", "regular")
+        if kind not in ("test", "regular", "pcie", "reconfig"):
+            raise BurnError(f"unknown record kind {kind!r}; expected test, regular, pcie, or reconfig")
+        defect_sensitive = r.get("defect_sensitive", False)
+        if not isinstance(defect_sensitive, bool):
+            raise BurnError("defect_sensitive must be a JSON boolean")
+        mask = r.get("mask_update")
+        if mask is not None and not isinstance(mask, dict):
+            raise BurnError("mask_update must be a JSON object")
+        if defect_sensitive and mask is None:
+            raise BurnError("defect-sensitive record needs mask_update for reconciliation")
+        if mask is not None and not defect_sensitive:
+            raise BurnError("mask_update must be flagged defect_sensitive=true")
+        for field in ("name", "target", "decode"):
+            val = r.get(field)
+            if not isinstance(val, str) or not val.strip():
+                raise BurnError(f"record.{field} must be a nonempty string")
+        word = u32(_req(r, "word", f"record[{r['name']}]"), f"record[{r['name']}].word")
+        mask_field = None
+        from_disable = None
+        to_disable = None
+        if mask is not None:
+            raw_field = _req(mask, "field", f"record[{r['name']}].mask_update")
+            if not isinstance(raw_field, str) or not raw_field.strip():
+                raise BurnError(f"record[{r['name']}].mask_update.field must be a nonempty string")
+            mask_field = raw_field.strip()
+            from_disable = u32(_req(mask, "from", f"record[{r['name']}].mask_update"), "mask.from")
+            to_disable = u32(_req(mask, "to", f"record[{r['name']}].mask_update"), "mask.to")
+        sm_raw = r.get("resulting_sm_count")
+        lc_before = r.get("link_cap2_before")
+        lc_after = r.get("link_cap2_after")
+        return cls(
+            name=r["name"].strip(),
+            target=r["target"].strip(),
+            word=word,
+            decode=r["decode"].strip(),
+            kind=kind,
+            defect_sensitive=defect_sensitive,
+            mask_field=mask_field,
+            from_disable=from_disable,
+            to_disable=to_disable,
+            resulting_sm_count=u32(sm_raw, "resulting_sm_count") if sm_raw is not None else None,
+            expected_cold=safe_num_mapping(r.get("expected_cold", {}), "expected_cold"),
+            link_cap2_before=u32(lc_before, "link_cap2_before") if lc_before is not None else None,
+            link_cap2_after=u32(lc_after, "link_cap2_after") if lc_after is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class Plan:
+    content_hash: str
+    pci_id: str
+    die_rows: dict[int, int]
+    expected_masks: dict[str, int]
+    defect_masks: dict[str, int]
+    first_row: int
+    last_row: int
+    empty_word: int
+    stock_mv: float
+    vout_tolerance_mv: float
+    base_sm_ceiling: int
+    override_sm_ceiling: int | None
+    reconfig_semantics_verified: bool
+    final_expected_cold: dict[str, int]
+    records: tuple[Record, ...]
+    allowed_status_mask: int = 0
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Plan":
+        # No YAML dependency or implicit integer conversion. Private plan files only.
+        p = require_private_file(path, "private plan")
+        raw = p.read_bytes()
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise BurnError(f"invalid JSON in plan {p}: {exc}") from exc
+        if not isinstance(d, dict):
+            raise BurnError("plan root must be a JSON object")
+        if d.get("schema_version") != 1:
+            raise BurnError("only schema_version=1 is understood")
+
+        card = _req(d, "card", "plan")
+        fpf = _req(d, "fpf", "plan")
+        env = _req(d, "environment", "plan")
+        ceiling = _req(d, "ceiling", "plan")
+        raw_records = _req(d, "records", "plan")
+        if not isinstance(raw_records, list):
+            raise BurnError("plan.records must be a JSON list")
+
+        raw_die = _req(card, "die_rows", "card")
+        if not isinstance(raw_die, dict):
+            raise BurnError("card.die_rows must be a JSON object")
+        die: dict[int, int] = {}
+        for k, v in raw_die.items():
+            try:
+                idx = int(k)
+            except (TypeError, ValueError) as exc:
+                raise BurnError(f"card.die_rows key {k!r} is not an integer") from exc
+            if idx in die:
+                raise BurnError(f"duplicate die_rows key {idx}")
+            die[idx] = u32(v, f"card.die_rows.{idx}")
+        if set(die) != set(range(8, 16)):
+            raise BurnError("must provide all eight cold die ID rows (8..15)")
+
+        pci_id = str(_req(card, "pci_id", "card")).strip().lower()
+        if pci_id != SKU_CMP170HX_8GB:
+            raise BurnError(f"this implementation is exclusively for CMP 170HX 8 GB ({SKU_CMP170HX_8GB})")
+
+        first = u32(_req(fpf, "first_row", "fpf"), "fpf.first_row")
+        last = u32(_req(fpf, "last_row", "fpf"), "fpf.last_row")
+        if not (0 <= first < last <= 4096):
+            raise BurnError("invalid explicitly configured FPF row limits (need 0 <= first < last <= 4096)")
+        empty_word = u32(_req(fpf, "empty_word", "fpf"), "fpf.empty_word")
+
+        stock = _finite_float(_req(env, "stock_mv", "environment"), "environment.stock_mv")
+        tol = _finite_float(_req(env, "tolerance_mv", "environment"), "environment.tolerance_mv")
+        if not (400.0 <= stock <= 1500.0 and 0.0 < tol <= 100.0):
+            raise BurnError("implausible stock VOUT / tolerance; check PMBus units (expected mV)")
+        allowed_status_mask = u32(env.get("allowed_status_mask", 0), "environment.allowed_status_mask")
+
+        base_sm = u32(_req(ceiling, "base_sm", "ceiling"), "ceiling.base_sm")
+        if base_sm == 0:
+            raise BurnError("ceiling.base_sm must be positive")
+        override_sm = (
+            u32(ceiling["override_sm"], "ceiling.override_sm")
+            if ceiling.get("override_sm") is not None
+            else None
+        )
+        if override_sm is not None and override_sm < base_sm:
+            raise BurnError(f"ceiling.override_sm ({override_sm}) cannot be less than base_sm ({base_sm})")
+        reconfig_verified = ceiling.get("reconfig_semantics_verified", False)
+        if not isinstance(reconfig_verified, bool):
+            raise BurnError("ceiling.reconfig_semantics_verified must be a JSON boolean")
+
+        records = tuple(Record.parse(v) for v in raw_records)
+        if len(records) < 1 or records[0].kind != "test" or any(r.kind == "test" for r in records[1:]):
+            raise BurnError("first record must be the sole throwaway 'test' record")
+        if not records[0].expected_cold:
+            raise BurnError("test record must define expected_cold values for cold verification")
+        if len(records) > (last - first + 1):
+            raise BurnError(
+                f"plan has {len(records)} records but FPF window {first}..{last} only has {last - first + 1} rows"
+            )
+
+        seen_names: set[str] = set()
+        expected_masks = safe_num_mapping(_req(card, "expected_masks", "card"), "expected_masks")
+        defects = safe_num_mapping(_req(card, "defect_masks", "card"), "defect_masks")
+        for r in records:
+            if r.name in seen_names:
+                raise BurnError(f"duplicate record name {r.name!r} in plan")
+            seen_names.add(r.name)
+            if r.word == empty_word:
+                raise BurnError(
+                    f"record {r.name!r} word equals FPF empty_word (0x{empty_word:08x}); "
+                    "would break free-slot detection"
+                )
+            if is_poison(r.word):
+                raise BurnError(
+                    f"record {r.name!r} word 0x{r.word:08x} matches poison prefix (0xBADF/0xBAD0)"
+                )
+            if r.mask_field and (r.mask_field not in expected_masks or r.mask_field not in defects):
+                raise BurnError(f"missing cold mask or genuine defect mask for {r.mask_field}")
+
+        return cls(
+            content_hash=hashlib.sha256(raw).hexdigest(),
+            pci_id=pci_id,
+            die_rows=die,
+            expected_masks=expected_masks,
+            defect_masks=defects,
+            first_row=first,
+            last_row=last,
+            empty_word=empty_word,
+            stock_mv=stock,
+            vout_tolerance_mv=tol,
+            base_sm_ceiling=base_sm,
+            override_sm_ceiling=override_sm,
+            reconfig_semantics_verified=reconfig_verified,
+            final_expected_cold=safe_num_mapping(d.get("final_expected_cold", {}), "final_expected_cold"),
+            records=records,
+            allowed_status_mask=allowed_status_mask,
+        )

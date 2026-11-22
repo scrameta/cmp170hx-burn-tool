@@ -1,0 +1,46 @@
+{
+  "pci_id": "10de:20c2",
+  "die_rows": {
+    "8": "0x1008",
+    "9": "0x1009",
+    "10": "0x100a",
+    "11": "0x100b",
+    "12": "0x100c",
+    "13": "0x100d",
+    "14": "0x100e",
+    "15": "0x100f"
+  },
+  "fields": {
+    "GPC_DISABLE": "0x85"
+  },
+  "rows": {
+    "222": "0xABCD00DE",
+    "223": "0x00000000",
+    "224": "0x00000000",
+    "225": "0x00000000",
+    "226": "0x00000000",
+    "227": "0x00000000"
+  },
+  "health": {
+    "fusectrl": "0xE0040000",
+    "dsov": 0,
+    "crc": "0x55",
+    "plm": "0xFFFFFFFF",
+    "plm_f8": "0xFFFFFFFF",
+    "status_word": 0,
+    "vout_mv": 787.5,
+    "en_sw": 0
+  },
+  "host": {
+    "bound_driver": "pci-stub",
+    "nvidia_loaded": false,
+    "nouveau_loaded": false,
+    "lockdown": "[none]",
+    "vrm_tainted": false,
+    "hold_active": true,
+    "boot_id": "synthetic-boot-1"
+  },
+  "registers": {
+    "0x820060": "0x00000000"
+  }
+}

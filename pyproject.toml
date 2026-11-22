@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfi-burn"
+version = "0.3.0"
+description = "Fail-closed CMP 170HX 8GB FF fuse-burn safety controller with verified GA100 protocol and manual overrides"
+requires-python = ">=3.10"
+
+[project.scripts]
+vfi-burn = "vfi_burn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vfi_burn*"]
