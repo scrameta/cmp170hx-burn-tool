@@ -33,7 +33,11 @@ sudo python3 -m vfi_burn menu \
 ## Safety Behaviour & Menu Options
 
 The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JSONL journal, and typed confirmations:
-- **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6]` Single-Window `--stage all` or `[7]` Split-Window) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
+- **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6] Burn Plan`) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
+- **Adaptive `[6] Burn Plan`**: inspects live FPF rows against the plan and automatically picks the right flow:
+  - **Fresh card**: burns the no-op test row first, then pauses so you can either continue directly into the real records in the same held glitch session (`CONTINUE SAME WINDOW`) or press Enter to stop, power-cycle, and cold-boot verify first.
+  - **Resuming** (test row and/or earlier real records already on the card): shows which rows are already committed and which remain, uses (or prompts for) the cold-boot test receipt, and resumes cleanly from the next unburned record.
+  - **Complete**: reports that all planned records are already burned and exits without touching `SENSE_CTRL` or `CMD_PROGRAM`.
 - **Full end-to-end bench flow in one place**:
 
 | Option | Action |
@@ -42,13 +46,13 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 | `[2]` | Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit) |
 | `[3]` | Live Status & Passive Inspection |
 | `[4]` | Active Sense (`SENSE_CTRL`) |
-| `[5]` | Passive Dry-Run Preview |
-| `[6]` | Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records) |
-| `[7]` | Split-Window Burn |
-| `[8]` | Granular Manual Overrides |
-| `[9]` | Manual Low-Level Console |
-| `[10]` | Offline FF Word Decoder |
-| `[11]` | Cold-Boot Snapshot & Verify |
+| `[5]` | Passive Dry-Run Preview (adapts to fresh vs. resumed cards) |
+| `[6]` | Burn Plan (no-op test first, or resume remaining records) |
+| `[7]` | Granular Manual Overrides |
+| `[8]` | Manual Low-Level Console |
+| `[9]` | Offline FF Word Decoder |
+| `[10]` | Cold-Boot Snapshot & Verify |
+| `[11]` | Experimental Registers (read-only: ECC, SM speed select, SKU, readouts) |
 
 ---
 
@@ -66,14 +70,14 @@ Shows exact FF rows used/taken/remaining, what compute/PCIe/feature units are be
 ### 3. `[3]` Live Status, Passive Health Gates & Free-Slot Proof
 ![vfi_burn Live Status and Passive Inspection](screenshots/03-status-inspect.png)
 
-### 4. `[6]` Single-Window Burn (`--stage all`) With `CONTINUE SAME WINDOW` Checkpoint
+### 4. `[6]` Burn Plan With Post-Test `CONTINUE SAME WINDOW` Checkpoint
 On live hardware (`--execute`), each record additionally requires typing the exact row and hex word (`YES <row> <0xword>`), plus `SENSE` before `SENSE_CTRL`.
 ![vfi_burn Single-Window Burn Walkthrough](screenshots/04-single-window-burn.png)
 
-### 5. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
+### 5. `[7]` Granular Manual Overrides & `[9]` Offline 32-Bit FF Word Decoder
 See [`cmd_line.md`](cmd_line.md#granular-manual-overrides-no-blanket---force) for the full list of granular overrides and their typed confirmation phrases.
 ![vfi_burn Manual Overrides and FF Word Decoder](screenshots/05-overrides-and-decode.png)
 
-### 6. `[9]` Manual Low-Level Console — Fuse Controller State, Exact PCIe BAR0 Writes & Staged `preview` → `apply`
+### 6. `[8]` Manual Low-Level Console — Fuse Controller State, Exact PCIe BAR0 Writes & Staged `preview` → `apply`
 Run `preview <word>` (or `preview <target> <word> <description>`) to inspect the complete decoded GA100 fuse controller state (`FUSECTRL`, `DEBUGCTRL`, `CRC`, `DSOV`, `EFP/DFP/RESENSE_DIS`, `EN_SW/SBFE/WDATA_WR_SEC`, `PLM_f4/f8/fc`, host hold) and the exact ordered 32-bit aligned PCIe BAR0 MMIO writes — and **stage** that exact write so you simply type `apply` (no arguments, zero risk of re-typing typos; still gated by row/word confirmation & read-back) or `clear` to discard.
 ![vfi_burn Manual Console Fuse State and Exact PCIe BAR0 Writes](screenshots/06-manual-console-writes.png)

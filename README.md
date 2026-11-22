@@ -102,7 +102,7 @@ adapter_template.py    # ABC-backed template for custom hardware adapters
 
 `vfi_burn` provides two interfaces over the same fail-closed engine, safety gates, and `fsync`ed JSONL audit journal:
 
-- **[Interactive Menu Guide (`docs/menu_driven.md`)](docs/menu_driven.md)** *(recommended for bench use)* — SSH/serial/tmux-friendly numbered menu (`python3 -m vfi_burn` or `python3 -m vfi_burn menu`), read-only by default on live hardware, covering plan import/review, live status, active sense, dry-run preview, single-window (`--stage all`) and split-window burns, overrides, the staged `preview` → `apply` manual console, FF word decoding, and cold-boot verification, complete with an offline screenshot walkthrough.
+- **[Interactive Menu Guide (`docs/menu_driven.md`)](docs/menu_driven.md)** *(recommended for bench use)* — SSH/serial/tmux-friendly numbered menu (`python3 -m vfi_burn` or `python3 -m vfi_burn menu`), read-only by default on live hardware, covering plan import/review, live status, active sense, dry-run preview, unified burn/resume (`[6] Burn Plan`), overrides, the staged `preview` → `apply` manual console, FF word decoding, cold-boot verification, and experimental register inspection.
 - **[Command-Line Interface (`docs/cmd_line.md`)](docs/cmd_line.md)** — scriptable subcommands (`plan`, `decode`, `import-ffcalc`, `snapshot`, `inspect`, `burn`, `simulate`, `manual`, `verify-cold`), offline simulation examples, step-by-step live hardware bench workflow, and low-level `manual` diagnostics/console commands.
 - **[GA100 Fuse Controller Reference (`docs/FUSE_CONTROLLER.md`)](docs/FUSE_CONTROLLER.md)** — register map, `FUSECTRL` command FSM, locked → Goldilocks → sensed → armed security state machine, and read/sense/arm/program sequence diagrams.
 
