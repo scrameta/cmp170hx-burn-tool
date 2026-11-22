@@ -118,14 +118,4 @@ adapter_template.py    # Template for custom hardware adapters
 
 ### Granular Manual Overrides (No blanket `--force`)
 
-Every override is off by default, prints a loud banner, requires its own distinct typed confirmation phrase, and is logged in the journal:
-
-| Flag | Purpose | Typed confirmation |
-|---|---|---|
-| `--override-slot ROW` | Target a specific **empty** FF row when contiguous scan is ambiguous | `OVERRIDE SLOT <ROW>` |
-| `--override-skip-sense` | Skip `SENSE_CTRL` (passive goldilocks checks remain) | `OVERRIDE SKIP SENSE` |
-| `--override-no-test-receipt` | Run `real` stage when test row was verified outside `vfi_burn` | `OVERRIDE NO TEST RECEIPT` |
-| `--override-mask-mismatch` | Skip initial live mask equality check | `OVERRIDE MASK MISMATCH` |
-| `--override-vout-range` | Allow VOUT outside `stock_mv ± tolerance_mv` (within hard `400..1500 mV`) | `OVERRIDE VOUT <mV>` |
-| `--override-undetermined-ceiling` | Override undetermined/exceeded SM ceiling (genuine defects remain refused) | `OVERRIDE CEILING` |
-| `--override-allow-debugctrl` | **Manual mode only**: permit `DEBUGCTRL` (`0x820060`) target | `REVIEW DEBUGCTRL` + `CONFIRM DEBUGCTRL` |
+Every override is off by default, prints a loud banner, requires its own distinct typed confirmation phrase, and is logged in the journal — while the hard invariants above remain unbreakable. Overrides can be passed as CLI flags (see [`docs/cmd_line.md`](docs/cmd_line.md#granular-manual-overrides-no-blanket---force)) or toggled interactively via menu option `[8]` (see [`docs/menu_driven.md`](docs/menu_driven.md#5-8-granular-manual-overrides--10-offline-32-bit-ff-word-decoder)).
