@@ -17,11 +17,11 @@ How to use:
 """
 from __future__ import annotations
 
-from vfi_burn.backend import Health, Host
+from vfi_burn.interfaces import FuseReader, FuseWriter, Health, Host
 from vfi_burn.mmio import AlignedMMIO, ReadOnlyMMIO
 
 
-class MyLiveReader:
+class MyLiveReader(FuseReader):
     """Read-only hardware adapter. Cannot invoke physical fuse writes."""
 
     simulation = False
@@ -66,7 +66,7 @@ class MyLiveReader:
         raise NotImplementedError("must prove non-committing active sense on the bench")
 
 
-class MyLiveWriter(MyLiveReader):
+class MyLiveWriter(MyLiveReader, FuseWriter):
     """Opt-in live writer template. Disabled until writer_verified = True."""
 
     # DO NOT flip to True until FF encoding, FUSECTRL write opcodes, burn voltage,

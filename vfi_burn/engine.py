@@ -1,16 +1,9 @@
-"""Fail-closed fuse-controller state machine. Hardware programming is NOT implemented."""
+"""Fail-closed fuse-controller state machine."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-import fcntl
 import json
-import os
-import stat
-
-from contextlib import contextmanager
-import signal
 
 from .backend import Health, Host, MissingWriter
 from .ffrecord import (
@@ -28,6 +21,7 @@ from .ffrecord import (
     replay_ff_rows,
     verify_noop_test_record,
 )
+from .journal import Journal, deferred_signals
 from .model import (
     BurnError,
     Plan,
@@ -38,28 +32,6 @@ from .model import (
     require_private_file,
     u32,
 )
-
-_CRITICAL_SIGNALS = tuple(
-    s for s in (getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")) if s is not None
-)
-
-
-@contextmanager
-def deferred_signals():
-    """Block SIGINT/SIGTERM/SIGHUP/SIGQUIT for the duration of an irreversible step.
-
-    Ctrl-C or an SSH drop (SIGHUP) must not land between FUSEWDATA=word and the
-    post-write journal entry. Pending signals are delivered when the block exits,
-    after the outcome is fsynced. All hardware waits inside have bounded timeouts.
-    """
-    if not hasattr(signal, "pthread_sigmask") or not _CRITICAL_SIGNALS:
-        yield
-        return
-    old = signal.pthread_sigmask(signal.SIG_BLOCK, _CRITICAL_SIGNALS)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 FUSECTRL_IDLE = 0xE0040000
 GOLDILOCKS_CRC = 0x55
@@ -441,60 +413,54 @@ def reconcile(
     if is_debugctrl_target(record.target) and not allow_manual_debugctrl:
         raise BurnError("DEBUGCTRL must never be included in an automatic plan")
 
-    # Word-derived checks: computed from the 32-bit FF word itself, so they cannot be
-    # bypassed by missing/incorrect plan metadata (multi-field shared blocks, manual
-    # console one-liners, hand-edited plans). Non-FF words (synthetic fixtures) skip
-    # this; live hardware refuses them separately in process_records/program_row.
-    word_masks: dict[str, int] = {}
-    word_mapped_fields: set[str] = set()
+    # Word-derived checks: unconditionally decode the 32-bit GA100 FF word (IFF bit 5 == 0)
+    # so checks cannot be bypassed by missing/incorrect plan metadata or synthetic fixtures.
     prior_masks = dict(assumed_masks)
     old_block: int | None = None
     touches_pcie = record.kind == "pcie"
     try:
         ff = decode_ff(record.word)
-        is_ff = True
-    except BurnError:
-        ff = None
-        is_ff = False
-    if is_ff and ff is not None:
-        if baseline_blocks is not None:
-            old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
+    except BurnError as exc:
+        raise BurnError(f"{record.name}: not a valid GA100 FF record word ({exc})") from exc
 
-        # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
-        hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
-        if hard_denials:
-            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
-        if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
-            raise BurnError(
-                f"{record.name}: REFUSED; "
-                + "; ".join(overridable_ff)
-                + " (use --override-unmapped-ff only after independent verification)"
-            )
+    if baseline_blocks is not None:
+        old_block = baseline_blocks.get(ff.chain, {}).get(ff.block, 0)
 
-        # Independent no-op proof for test records whenever a verified baseline is available.
-        if record.kind == "test" and require_noop_test and baseline_blocks is not None:
-            verify_noop_test_record(record.word, baseline_blocks)
+    # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
+    hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
+    if hard_denials:
+        raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
+    if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
+        raise BurnError(
+            f"{record.name}: REFUSED; "
+            + "; ".join(overridable_ff)
+            + " (use --override-unmapped-ff only after independent verification)"
+        )
 
-        # Word-derived PCIe classification (cannot be evaded by setting kind="regular").
-        if ff_word_touches_pcie(record.word, old_block):
-            touches_pcie = True
+    # Independent no-op proof for test records whenever a verified baseline is available.
+    if record.kind == "test" and require_noop_test and baseline_blocks is not None:
+        verify_noop_test_record(record.word, baseline_blocks)
 
-        # Word-derived genuine defect audit. Known defects are NEVER overrideable; missing
-        # defect masks are NOT bypassed by --override-undetermined-ceiling.
-        violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
-        if violations:
-            raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
-        if unknown and not allow_unmapped_ff:
-            raise BurnError(
-                f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
-                "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
-            )
-        word_mapped_fields = {
-            FFCALC_KEY_TO_FIELD[f.key]
-            for f in fields_in_block(ff.chain, ff.block)
-            if f.key in FFCALC_KEY_TO_FIELD
-        }
-        word_masks = apply_ff_word_to_masks(record.word, assumed_masks)
+    # Word-derived PCIe classification (cannot be evaded by setting kind="regular").
+    if ff_word_touches_pcie(record.word, old_block):
+        touches_pcie = True
+
+    # Word-derived genuine defect audit. Known defects are NEVER overrideable; missing
+    # defect masks are NOT bypassed by --override-undetermined-ceiling.
+    violations, unknown = ff_word_defect_audit(record.word, plan.defect_masks)
+    if violations:
+        raise BurnError(f"{record.name}: REFUSED; " + "; ".join(violations))
+    if unknown and not allow_unmapped_ff:
+        raise BurnError(
+            f"{record.name}: FF word touches {', '.join(sorted(set(unknown)))} but the plan has "
+            "no genuine defect mask for it; cannot prove no defective unit is re-enabled"
+        )
+    word_mapped_fields = {
+        FFCALC_KEY_TO_FIELD[f.key]
+        for f in fields_in_block(ff.chain, ff.block)
+        if f.key in FFCALC_KEY_TO_FIELD
+    }
+    word_masks = apply_ff_word_to_masks(record.word, assumed_masks)
 
     if record.mask_field is not None:
         field = record.mask_field
@@ -519,7 +485,7 @@ def reconcile(
                 f"{record.name}: REFUSED; declared {field} end state {hex32(record.to_disable)} "
                 f"leaves genuinely defective bits {hex32(genuine & ~record.to_disable)} enabled"
             )
-        if is_ff and field not in word_mapped_fields:
+        if field not in word_mapped_fields:
             raise BurnError(
                 f"{record.name}: mask_update targets {field} but the FF word writes "
                 f"{', '.join(sorted(word_mapped_fields)) or 'no known option field'}"
@@ -586,7 +552,7 @@ def reconcile(
             "PCIe record (or FF word modifying PCIe speed/boot fuses) must declare reviewed LnkCap2 before/after"
         )
 
-    if baseline_blocks is not None and is_ff and ff is not None:
+    if baseline_blocks is not None:
         baseline_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
 
 
@@ -624,78 +590,6 @@ def check_plan(
                     f"contradicts record expected_cold={hex32(value)}"
                 )
     return assumed
-
-
-class Journal:
-    """Append-only, fsynced, exclusively locked JSONL with mode 0600 and no symlinks."""
-
-    def __init__(self, file: str | Path) -> None:
-        self.path = Path(file)
-        if self.path.is_symlink():
-            raise BurnError(f"refusing symlink journal: {self.path}")
-        if self.path.parent.is_symlink():
-            raise BurnError(f"refusing symlink journal parent directory: {self.path.parent}")
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if self.path.parent.stat().st_mode & 0o077:
-            raise BurnError(
-                f"journal parent directory not private (must be mode 0700): {self.path.parent} "
-                f"— run: chmod 700 {self.path.parent}"
-            )
-        self.fd: int | None = os.open(
-            self.path,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_APPEND
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        try:
-            if stat.S_IMODE(os.fstat(self.fd).st_mode) != 0o600:
-                raise BurnError(f"journal is not mode 0600: {self.path}")
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise BurnError(
-                    f"journal {self.path} is locked by another vfi_burn session; "
-                    "never run two sessions concurrently"
-                ) from exc
-        except Exception:
-            os.close(self.fd)
-            self.fd = None
-            raise
-
-    def append(self, **values) -> dict:
-        if self.fd is None:
-            raise BurnError("journal is closed")
-        entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **values}
-        line = (json.dumps(entry, sort_keys=True, default=str) + "\n").encode("utf-8")
-        view = memoryview(line)
-        try:
-            while len(view):
-                count = os.write(self.fd, view)
-                if count <= 0:
-                    raise BurnError("journal write failed; no further records allowed")
-                view = view[count:]
-        finally:
-            view.release()
-        os.fsync(self.fd)
-        return entry
-
-    def close(self) -> None:
-        if self.fd is not None:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(self.fd)
-            self.fd = None
-
-    def __enter__(self) -> "Journal":
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.close()
 
 
 def _confirm_token(confirm, prompt: str, token: str) -> bool:
@@ -960,13 +854,6 @@ def process_records(
         allow_undetermined_ceiling=ov.undetermined_ceiling,
         allow_unmapped_ff=ov.unmapped_ff,
     )
-    if is_live:
-        # Refuse non-FF payloads before preflight/SENSE_CTRL, not inside the write block.
-        for r in plan.records:
-            try:
-                decode_ff(r.word)
-            except BurnError as exc:
-                raise BurnError(f"{r.name}: not a valid GA100 FF record word ({exc})") from exc
 
     receipt: dict | None = None
     if stage == "real":

@@ -16,6 +16,22 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
+from .fuse_rules import evaluate_fuse_combinations
+from .fuses import (
+    DEVICE_ID_DENIED_BLOCKS,
+    DIE_ID_ROWS,
+    FFCALC_KEY_TO_FIELD,
+    FF_EMPTY_WORD,
+    FIELD_FUNCTIONAL_GROUP,
+    FIELDS_BY_KEY,
+    OPTION_FIELDS,
+    OptionField,
+    SM_PER_TPC,
+    TOTAL_FBP,
+    TOTAL_FUSE_ROWS,
+    TOTAL_GPC,
+    TPC_PER_GPC,
+)
 from .model import (
     FF_ROW_MAX,
     FF_ROW_MIN,
@@ -25,19 +41,6 @@ from .model import (
     require_private_file,
     u32,
 )
-
-FF_EMPTY_WORD = 0x00000000
-DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
-TOTAL_FUSE_ROWS = 512
-
-# Chain 2 blocks 37 and 38 carry read-only PCIe device-ID fuses (DEVIDA/DEVIDB) and no
-# burnable fields; unconditionally denied in both the engine and low-level fuse controller.
-DEVICE_ID_DENIED_BLOCKS: frozenset[tuple[int, int]] = frozenset({(2, 37), (2, 38)})
-
-TOTAL_GPC = 8
-TPC_PER_GPC = 8
-SM_PER_TPC = 2
-TOTAL_FBP = 12
 
 
 @dataclass(frozen=True)
@@ -49,128 +52,6 @@ class FFRecord:
     @property
     def word(self) -> int:
         return encode_ff(self.chain, self.block, self.data)
-
-
-@dataclass(frozen=True)
-class OptionField:
-    key: str
-    name: str
-    chain: int
-    bit: int
-    width: int
-    category: str
-    defect_key: str = ""
-    note: str = ""
-    burnable: bool = True
-    opt_in: bool = False
-
-    @property
-    def blocks(self) -> tuple[int, ...]:
-        return tuple(sorted({(self.bit + i) // 16 for i in range(self.width)}))
-
-
-def _tpc_fields() -> list[OptionField]:
-    return [
-        OptionField(
-            f"tpc_gpc{i}_disable",
-            f"NV_FUSE_OPT_TPC_GPC{i}_DISABLE",
-            1,
-            187 + 8 * i,
-            8,
-            "floorsweep",
-            f"tpc_gpc{i}_defective",
-        )
-        for i in range(TOTAL_GPC)
-    ]
-
-
-OPTION_FIELDS: tuple[OptionField, ...] = tuple(
-    [
-        OptionField("fbio_disable", "NV_FUSE_OPT_FBIO_DISABLE", 1, 83, 24, "floorsweep", "fbio_defective"),
-        OptionField("fbpa_disable", "NV_FUSE_OPT_FBPA_DISABLE", 1, 107, 24, "floorsweep", "fbpa_defective"),
-        OptionField("gpc_disable", "NV_FUSE_OPT_GPC_DISABLE", 1, 131, 8, "floorsweep", "gpc_defective"),
-    ]
-    + _tpc_fields()
-    + [
-        OptionField("pes_disable", "NV_FUSE_OPT_PES_DISABLE", 1, 251, 24, "floorsweep", "pes_defective"),
-        OptionField("fbp_disable", "NV_FUSE_OPT_FBP_DISABLE", 1, 307, 12, "floorsweep", "fbp_defective"),
-        OptionField("rop_l2_disable", "NV_FUSE_OPT_ROP_L2_DISABLE", 1, 319, 24, "floorsweep", "rop_l2_defective"),
-        OptionField(
-            "nvlink_disable",
-            "NV_FUSE_OPT_NVLINK_DISABLE",
-            1,
-            368,
-            3,
-            "nvlink",
-            "nvlink_defective",
-            "NVLink additionally needs U11 bridge mod + firmware check bypass",
-        ),
-        OptionField(
-            "sys_pipe_disable",
-            "NV_FUSE_OPT_SYS_PIPE_DISABLE",
-            1,
-            372,
-            8,
-            "mig",
-            "sys_pipe_defective",
-            "MIG/ECC/NVDEC unlock untested per Kate's writeup",
-        ),
-        OptionField("pcie_devida", "NV_FUSE_OPT_PCIE_DEVIDA", 2, 593, 16, "identity", "", "device ID (read-only)", burnable=False),
-        OptionField("pcie_devidb", "NV_FUSE_OPT_PCIE_DEVIDB", 2, 609, 16, "identity", "", "device ID (read-only)", burnable=False),
-        OptionField("disable_gen3_speed_bit1", "NV_FUSE_OPT_DISABLE_GEN3_SPEED", 2, 39 * 16 + 1, 1, "pcie", "", "PCIe Gen3 restriction (bit 1)"),
-        OptionField("disable_gen3_speed_bit9", "NV_FUSE_OPT_DISABLE_GEN3_SPEED", 2, 39 * 16 + 9, 1, "pcie", "", "PCIe Gen3 restriction (bit 9)"),
-        OptionField("pcie_magic_gen4_dis", "NV_FUSE_OPT_PCIE_MAGIC_BITS_D[25]", 2, 47 * 16 + 3, 1, "pcie", "", "Gen4 speed-disable flag"),
-        OptionField("pcie_boot_gen23_dis", "NV_FUSE_OPT_PCIE_BOOT_GEN23_DISABLE", 2, 49 * 16 + 6, 1, "pcie", ""),
-        OptionField("pcie_boot_gen3_dis", "NV_FUSE_OPT_PCIE_BOOT_GEN3_DISABLE", 2, 49 * 16 + 7, 1, "pcie", ""),
-        OptionField(
-            "magic_d",
-            "NV_FUSE_OPT_PCIE_MAGIC_BITS_D",
-            2,
-            730,
-            32,
-            "identity",
-            "",
-            "whole MAGIC_BITS_D word (opt-in; A100 value 0x00200000 is experimental)",
-            opt_in=True,
-        ),
-    ]
-)
-
-FIELDS_BY_KEY: dict[str, OptionField] = {f.key: f for f in OPTION_FIELDS}
-
-# Maps ffcalc lowercase option keys to vfi_burn canonical uppercase mask/field names.
-FFCALC_KEY_TO_FIELD: dict[str, str] = {
-    "gpc_disable": "GPC_DISABLE",
-    "fbp_disable": "FBP_DISABLE",
-    "fbio_disable": "FBIO_DISABLE",
-    "fbpa_disable": "FBPA_DISABLE",
-    "rop_l2_disable": "ROP_L2_DISABLE",
-    "pes_disable": "PES_DISABLE",
-    "nvlink_disable": "NVLINK_DISABLE",
-    "sys_pipe_disable": "SYS_PIPE_DISABLE",
-    **{f"tpc_gpc{i}_disable": f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)},
-}
-
-# Functional subsystem groupings used for pre-power-off boundary sanity checks.
-FIELD_FUNCTIONAL_GROUP: dict[str, str] = {
-    "gpc_disable": "compute",
-    "pes_disable": "compute",
-    **{f"tpc_gpc{i}_disable": "compute" for i in range(TOTAL_GPC)},
-    "fbp_disable": "memory",
-    "fbio_disable": "memory",
-    "fbpa_disable": "memory",
-    "rop_l2_disable": "memory",
-    "disable_gen3_speed_bit1": "pcie",
-    "disable_gen3_speed_bit9": "pcie",
-    "pcie_magic_gen4_dis": "pcie",
-    "pcie_boot_gen23_dis": "pcie",
-    "pcie_boot_gen3_dis": "pcie",
-    "magic_d": "pcie",
-    "nvlink_disable": "nvlink",
-    "sys_pipe_disable": "mig",
-    "pcie_devida": "identity",
-    "pcie_devidb": "identity",
-}
 
 
 def encode_ff(chain: int, block: int, data: int) -> int:
@@ -424,6 +305,16 @@ def decode_all_fields(blocks_by_chain: dict[int, dict[int, int]]) -> dict[str, i
     return {f.key: get_bits(blocks_by_chain, f.chain, f.bit, f.width) for f in OPTION_FIELDS}
 
 
+def decode_present_fields(blocks_by_chain: dict[int, dict[int, int]]) -> dict[str, int]:
+    """Decode only option fields whose backing FF block(s) are all present in ``blocks_by_chain``."""
+    out: dict[str, int] = {}
+    for f in OPTION_FIELDS:
+        chain_blocks = blocks_by_chain.get(f.chain, {})
+        if all(b in chain_blocks for b in f.blocks):
+            out[f.key] = get_bits(blocks_by_chain, f.chain, f.bit, f.width)
+    return out
+
+
 def simulate_ff_write(
     current_rows: dict[int, int],
     row: int,
@@ -657,14 +548,18 @@ def evaluate_poweroff_sanity(
             errors.append(
                 f"LIVE REPLAY SM COUNT {sm_count} exceeds plan ceiling {ceiling}!"
             )
-        # Internal compute sanity: warn if an enabled GPC has all 8 TPCs disabled.
-        gpc_dis = live_fields["gpc_disable"]
+
+    # 2b. Declarative cross-fuse combination & coherence rules (compute / memory / PCIe).
+    present_fields = decode_present_fields(live_blocks)
+    if "GPC_DISABLE" in plan.expected_masks and all(k in plan.expected_masks for k in tpc_keys):
+        present_fields.setdefault("gpc_disable", live_fields["gpc_disable"])
         for i in range(TOTAL_GPC):
-            if not ((gpc_dis >> i) & 1) and (live_fields[f"tpc_gpc{i}_disable"] & 0xFF) == 0xFF:
-                warnings.append(
-                    f"GPC{i} is enabled in GPC_DISABLE (0x{gpc_dis:02x}) but all 8 TPCs "
-                    f"in TPC_GPC{i}_DISABLE are disabled (0xff)."
-                )
+            present_fields.setdefault(f"tpc_gpc{i}_disable", live_fields[f"tpc_gpc{i}_disable"])
+    for issue in evaluate_fuse_combinations(present_fields):
+        if issue.severity == "error":
+            errors.append(issue.message)
+        else:
+            warnings.append(issue.message)
 
     # 3. Functional-group boundary check between committed and remaining planned records.
     if baseline_blocks is not None:

@@ -1,14 +1,17 @@
-"""Backend boundary. No real fuse writer exists in this package."""
+"""Backend boundary, writer-capability guards, fake controller, and private JSON I/O."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
 import importlib
 import json
 import os
 
+from .interfaces import FuseReader, FuseWriter, Health, Host
 from .model import BurnError, PreTriggerRefusal, require_private_file, u32
+
+# Backward-compatible interface aliases.
+Reader = FuseReader
+Writer = FuseWriter
 
 REQUIRED_READER_METHODS = (
     "pci_id",
@@ -22,57 +25,7 @@ REQUIRED_READER_METHODS = (
 )
 
 
-@dataclass
-class Health:
-    fusectrl: int
-    dsov: int
-    crc: int
-    plm: int
-    plm_f8: int
-    en_sw: int = 0
-    debugctrl: int = 0
-    efp: int | None = None
-    dfp: int | None = None
-    plm_f4: int | None = None
-    sbfe: int | None = None
-    wdata_wr_secure: int | None = None
-    resense_disable: int | None = None
-
-    def serializable(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class Host:
-    bound_driver: str | None
-    nvidia_loaded: bool
-    nouveau_loaded: bool
-    lockdown: str
-    hold_active: bool
-    boot_id: str
-
-    def serializable(self) -> dict:
-        return asdict(self)
-
-
-class Reader(Protocol):
-    """Adapter functions MUST do fresh hardware reads; cached hold logs are forbidden."""
-
-    def pci_id(self) -> str: ...
-    def die_row(self, index: int) -> int: ...
-    def field(self, name: str) -> int: ...
-    def fuse_row(self, index: int) -> int: ...
-    def register(self, address: int) -> int: ...
-    def health(self) -> Health: ...
-    def host(self) -> Host: ...
-    def active_sense_readonly(self) -> None: ...
-
-
-class Writer(Protocol):
-    def write_one_record(self, row: int, word: int) -> None: ...
-
-
-class MissingWriter:
+class MissingWriter(FuseWriter):
     """Mandatory default for physical hardware; refuses any write attempt."""
 
     write_enabled = False
@@ -107,7 +60,7 @@ def has_write_capability(adapter) -> bool:
 has_verified_writer = has_write_capability
 
 
-class FakeController:
+class FakeController(FuseReader, FuseWriter):
     """In-memory simulation only; cannot access BAR0 or physical fuses."""
 
     simulation = True
