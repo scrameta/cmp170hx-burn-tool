@@ -465,6 +465,112 @@ def format_plan_review(
     return lines
 
 
+def format_fuse_controller_state(plan: Plan, reader, *, allow_vout_override: bool = False) -> list[str]:
+    """Decode and format the live/fake GA100 fuse controller registers, PLM, VRM, and armed state."""
+    health = reader.health()
+    host = reader.host()
+    ctrl = health.fusectrl
+    state_val = (ctrl >> 16) & 0x1F
+    cmd_val = ctrl & 0x3
+    idle_str = "IDLE (state=4)" if (not is_poison(ctrl) and state_val == 4 and cmd_val == 0) else (
+        "POISON!" if is_poison(ctrl) else f"NON-IDLE (state={state_val}, cmd={cmd_val})"
+    )
+    rwl = (health.debugctrl >> 1) & 1
+    efp_str = str(health.efp) if health.efp is not None else "n/a"
+    dfp_str = str(health.dfp) if health.dfp is not None else "n/a"
+    sbfe_str = str(health.sbfe) if health.sbfe is not None else "n/a"
+    wsec_str = str(health.wdata_wr_secure) if health.wdata_wr_secure is not None else "n/a"
+    resense_str = str(health.resense_disable) if health.resense_disable is not None else "n/a"
+    plm_f4_str = hex32(health.plm_f4) if health.plm_f4 is not None else "n/a"
+
+    health_issues = evaluate_health(health, plan, allow_vout_override=allow_vout_override)
+    host_issues = evaluate_host(host, require_hold=True)
+    if health_issues or host_issues:
+        verdict = "NOT READY (" + "; ".join(health_issues + host_issues) + ")"
+    elif health.efp == 1 and health.sbfe == 0 and (health.en_sw & 1) == 1:
+        verdict = "ARMED & WRITE-READY (EFP=1, DSOV=0, CRC=0x55, SBFE=0, PLMs OPEN)"
+    else:
+        verdict = "PASSIVE GOLDILOCKS OK (DSOV=0, CRC=0x55, PLM_f8 OPEN; needs SENSE_CTRL + arm before CMD_PROGRAM)"
+
+    lines = [
+        "=== FUSE CONTROLLER STATE (BAR0 0x0082xxxx) ===",
+        f"  FUSECTRL (0x820000) : {hex32(ctrl)}  [{idle_str}]",
+        f"  DEBUGCTRL(0x820060) : {hex32(health.debugctrl)}  [RWL={rwl} — NEVER WRITTEN]",
+        f"  CRC / DSOV          : CRC(0x820068)={hex32(health.crc)} ({'OK' if health.crc == 0x55 else 'BAD!'}) | DSOV(0x820084)={hex32(health.dsov)} ({'GOLDILOCKS' if health.dsov == 0 else 'LOCKED'})",
+        f"  Sense / Arm Flags   : EFP(0x820078)={efp_str}  DFP(0x82007C)={dfp_str}  RESENSE_DIS(0x821058)={resense_str}",
+        f"  Override / Shadow   : EN_SW(0x820040)={hex32(health.en_sw)}  SBFE(0x821108)={sbfe_str}  WDATA_WR_SEC(0x82048C)={wsec_str}",
+        f"  PLM Gates           : PLM_f4(0x8200F4)={plm_f4_str}  PLM_f8(0x8200F8)={hex32(health.plm_f8)} ({'OPEN' if health.plm_f8 & 1 else 'CLOSED!'})  PLM_fc(0x8200FC)={hex32(health.plm)}",
+        f"  VRM / Host          : READ_VOUT={health.vout_mv:.1f} mV  STATUS_WORD={format_pmbus_status(health.status_word)}  driver={host.bound_driver or 'none'}  hold={host.hold_active}",
+        f"  Controller Verdict  : {verdict}",
+    ]
+    return lines
+
+
+def format_pcie_write_plan(
+    row: int,
+    word: int,
+    health,
+    *,
+    skip_sense: bool = False,
+    old_block: int | None = None,
+) -> list[str]:
+    """Format the exact ordered 32-bit aligned PCIe BAR0 MMIO writes for programming one FF row."""
+    lines = [
+        f"=== EXACT PCIE BAR0 MMIO WRITES TO BE ISSUED (row {row}, word {hex32(word)}) ===",
+    ]
+    try:
+        ff = decode_ff(word)
+        analysis = analyze_ff_block(ff.chain, ff.block, ff.data, old_block)
+        fields_str = ", ".join(f.name for f in analysis["fields"]) or "NONE (UNKNOWN BLOCK!)"
+        delta_str = (
+            f" | block 0x{old_block:04x}->0x{ff.data:04x}"
+            if old_block is not None
+            else f" | block data=0x{ff.data:04x}"
+        )
+        lines.append(
+            f"  FF Decode : chain={ff.chain} block={ff.block} data=0x{ff.data:04x} (IFF bit5=0){delta_str}"
+        )
+        lines.append(f"  Fields    : {fields_str}")
+        for w in analysis["warnings"]:
+            lines.append(f"  WARNING   : {w}")
+    except BurnError as exc:
+        lines.append(f"  WARNING   : INVALID FF WORD — {exc}")
+
+    already_sensed = health.efp == 1
+    sense_note = (
+        "SKIPPED (EFP=1 already; only one SENSE_CTRL per glitch window)"
+        if already_sensed
+        else ("SKIPPED (--override-skip-sense)" if skip_sense else "RUNS ONCE (restores EFP 0->1, keeps DSOV=0)")
+    )
+
+    lines.append("  --- Phase 1: Arm Fuse Controller (aligned 32-bit BAR0 stores) ---")
+    if already_sensed or skip_sense:
+        lines.append(f"   [1] SENSE_CTRL (0x00820000 <- 0x00000003) : {sense_note}")
+    else:
+        lines.append("   [1] WR32 BAR0+0x00820040  EN_SW_OVERRIDE   <- 0x00000001  (verify bit0=1)")
+        lines.append("   [2] WR32 BAR0+0x0082048C  WDATA_WR_SECURE  <- 0x00000000  (open PLM_f4 -> 0xffffffff)")
+        lines.append("   [3] WR32 BAR0+0x0082000C  FUSEWDATA        <- 0x00000000  (no-burn safety latch; verify rd==0)")
+        lines.append("   [4] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
+        lines.append("   [5] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000003  (CMD_SENSE_CTRL; poll IDLE, verify EFP=1/DSOV=0/CRC=0x55)")
+    lines.append("   [6] WR32 BAR0+0x00820040  EN_SW_OVERRIDE   <- 0x00000001  (ensure volatile SW override=1)")
+    lines.append("   [7] WR32 BAR0+0x00821108  SBFE_SHADOW      <- 0x00000000  (clear SBFE shadow)")
+    lines.append("   [8] WR32 BAR0+0x0082048C  WDATA_WR_SECURE  <- 0x00000000  (verify all 12 armed invariants)")
+    lines.append("  --- Phase 2: Single-Record Program (CMD_PROGRAM = 2) ---")
+    lines.append("   [9] RD32 BAR0+0x00820004  FUSEADDR         -> save orig_addr")
+    lines.append("  [10] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
+    lines.append(f"  [11] WR32 BAR0+0x00820004  FUSEADDR         <- {hex32(row)}  (select EMPTY FF row {row}; verify latch)")
+    lines.append(f"  [12] WR32 BAR0+0x0082000C  FUSEWDATA        <- {hex32(word)}  (stage FF word; verify readback)")
+    lines.append("  [13] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000002  (CMD_PROGRAM; poll IDLE, halt on 0xBADF/0xBAD0)")
+    lines.append("  [14] WR32 BAR0+0x00820004  FUSEADDR         <- orig_addr   (restore FUSEADDR)")
+    lines.append("  --- Phase 3: Mandatory Read-Back (CMD_READ = 1) & Post-Write Gate ---")
+    lines.append("  [15] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000000  (CMD_IDLE)")
+    lines.append(f"  [16] WR32 BAR0+0x00820004  FUSEADDR         <- {hex32(row)}  (select row {row})")
+    lines.append(f"  [17] WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000001  (CMD_READ; verify FUSEDATA(0x820008) == {hex32(word)})")
+    lines.append("  [18] POST-WRITE GATE       full health/PMBus/host check + second CMD_READ verify")
+    lines.append("  GUARANTEES: single aligned 32-bit stores only | DEBUGCTRL (0x820060) NEVER written | FUSEDATA (0x820008) read-only")
+    return lines
+
+
 class ManualConsole:
     """Simple, clear, journaled manual fuse-controller console."""
 
@@ -583,6 +689,12 @@ class ManualConsole:
                 self.show(out)
             self.journal.append(event="manual_status")
             return True
+        if cmd in ("state", "fuse-state"):
+            self._cmd_state()
+            return True
+        if cmd == "preview":
+            self._cmd_preview(args)
+            return True
         if cmd == "sense":
             self._cmd_sense()
             return True
@@ -617,6 +729,8 @@ class ManualConsole:
         self.show(
             "Commands:\n"
             "  status                         Show full health, host, die ID, and mask status\n"
+            "  state                          Show detailed GA100 fuse controller registers & armed state\n"
+            "  preview <word> [row]           Show fuse state + exact PCIe BAR0 MMIO writes (NO writes)\n"
             "  sense                          Run opt-in active_sense_readonly() and diff health\n"
             "  scan                           Double-scan FPF window and prove next free row\n"
             "  row <index>                    Read one FPF row (with poison & diff check)\n"
@@ -625,9 +739,52 @@ class ManualConsole:
             "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, LnkCap2)\n"
             "  diff                           Diff current FPF rows & fields vs console start\n"
             "  overrides                      Show active overrides & unbreakable invariants\n"
-            "  write <target> <word> <decode> Write ONE record through full safety gates\n"
+            "  write <target> <word> <decode> Preview exact PCIe BAR0 writes + write ONE gated record\n"
             "  quit                           Exit manual console"
         )
+
+    def _cmd_state(self) -> None:
+        for out in format_fuse_controller_state(
+            self.plan, self.reader, allow_vout_override=self.overrides.vout_range
+        ):
+            self.show(out)
+        self.journal.append(event="manual_fuse_state", health=self.reader.health().serializable())
+
+    def _show_write_preview(self, word: int, row: int | None = None) -> int:
+        if row is None:
+            row, _ = scan_slots(self.plan, self.reader, override_slot=self.overrides.slot)
+        old_blk = None
+        try:
+            ff = decode_ff(word)
+            cur_rows = {
+                r: self.reader.fuse_row(r)
+                for r in range(self.plan.first_row, self.plan.last_row + 1)
+            }
+            blocks, _ = _safe_replay_rows(cur_rows)
+            old_blk = blocks.get(ff.chain, {}).get(ff.block, 0)
+        except Exception:
+            old_blk = None
+        for out in format_fuse_controller_state(
+            self.plan, self.reader, allow_vout_override=self.overrides.vout_range
+        ):
+            self.show(out)
+        for out in format_pcie_write_plan(
+            row,
+            word,
+            self.reader.health(),
+            skip_sense=self.overrides.skip_active_sense,
+            old_block=old_blk,
+        ):
+            self.show(out)
+        return row
+
+    def _cmd_preview(self, args: list[str]) -> None:
+        if not (1 <= len(args) <= 2):
+            raise BurnError("usage: preview <32-bit-hex-word> [row]")
+        word = u32(args[0], "word")
+        row = int(args[1], 0) if len(args) == 2 else None
+        resolved_row = self._show_write_preview(word, row=row)
+        self.journal.append(event="manual_preview_writes", row=resolved_row, word=hex32(word))
 
     def _cmd_sense(self) -> None:
         before = self.reader.health()
@@ -837,6 +994,11 @@ class ManualConsole:
         dry_run = (not self.execute) and (not getattr(self.reader, "simulation", False))
         if dry_run:
             self.show("NOTE: console is READ-ONLY — running write as DRY-RUN preview only.")
+
+        try:
+            self._show_write_preview(word)
+        except BurnError:
+            pass  # let process_records surface the exact preflight/slot-proof error & journal it
 
         self.journal.append(
             event="manual_console_write_request",

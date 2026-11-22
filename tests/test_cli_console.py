@@ -345,6 +345,50 @@ class TestCLIAndConsole(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("REFUSED --execute", err)
 
+    def test_manual_console_fuse_state_and_pcie_write_preview(self):
+        from vfi_burn.ffrecord import encode_ff
+
+        plan = Plan.load(self.plan_path)
+        w_pcie = encode_ff(2, 47, 0x0000)
+        ctl = FakeController(
+            fields={"GPC_DISABLE": 0x85},
+            rows={222: 0xABCD00DE, 223: 0x13572468, 224: 0, 225: 0, 226: 0, 227: 0},
+        )
+        lines: list[str] = []
+        cmds = iter([
+            "state",
+            f"preview 0x{w_pcie:08x}",
+            f"write PCIE_GEN4 0x{w_pcie:08x} Clear Gen4 disable flag",
+            "",  # cancel at confirmation after seeing exact PCIe writes!
+            "quit",
+        ])
+        with Journal(self.journal_path) as j:
+            rc = ManualConsole(
+                plan,
+                ctl,
+                ctl,
+                j,
+                overrides=Overrides(no_test_receipt=True),
+                input_fn=lambda prompt="": next(cmds),
+                show=lines.append,
+            ).run()
+        self.assertEqual(rc, 0)
+        out = "\n".join(lines)
+        self.assertIn("FUSE CONTROLLER STATE (BAR0 0x0082xxxx)", out)
+        self.assertIn("FUSECTRL (0x820000)", out)
+        self.assertIn("DEBUGCTRL(0x820060)", out)
+        self.assertIn("EXACT PCIE BAR0 MMIO WRITES TO BE ISSUED (row 224", out)
+        self.assertIn("WR32 BAR0+0x00820040  EN_SW_OVERRIDE   <- 0x00000001", out)
+        self.assertIn("WR32 BAR0+0x00820004  FUSEADDR         <- 0x000000e0", out)
+        self.assertIn(f"WR32 BAR0+0x0082000C  FUSEWDATA        <- 0x{w_pcie:08x}", out)
+        self.assertIn("WR32 BAR0+0x00820000  FUSECTRL         <- 0x00000002  (CMD_PROGRAM", out)
+        self.assertIn("DEBUGCTRL (0x820060) NEVER written", out)
+        # Cancelled before confirming -> row 224 must still be empty!
+        self.assertEqual(ctl.fuse_row(224), 0)
+        events = [json.loads(l)["event"] for l in self.journal_path.read_text().splitlines()]
+        self.assertIn("manual_fuse_state", events)
+        self.assertIn("manual_preview_writes", events)
+
 
 if __name__ == "__main__":
     unittest.main()

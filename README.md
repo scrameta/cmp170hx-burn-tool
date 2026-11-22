@@ -129,12 +129,16 @@ On live hardware (`--execute`), each record additionally requires typing the exa
 #### 5. `[8]` Granular Manual Overrides & `[10]` Offline 32-Bit FF Word Decoder
 ![vfi_burn Manual Overrides and FF Word Decoder](docs/screenshots/05-overrides-and-decode.png)
 
+#### 6. `[9]` Manual Low-Level Console — Fuse Controller State & Exact PCIe BAR0 MMIO Writes Preview
+Running `preview <word> [row]` (and automatically before any confirmation prompt in `write <target> <word> <decode>`) shows the complete decoded GA100 fuse controller register state (`FUSECTRL`, `DEBUGCTRL`, `CRC`, `DSOV`, `EFP/DFP/RESENSE_DIS`, `EN_SW/SBFE/WDATA_WR_SEC`, `PLM_f4/f8/fc`, VRM rail, host hold) followed by the exact ordered 32-bit aligned PCIe BAR0 MMIO writes that will be issued — before touching a single register.
+![vfi_burn Manual Console Fuse State and Exact PCIe BAR0 Writes](docs/screenshots/06-manual-console-writes.png)
+
 ---
 
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (78 tests):
+# Run the full offline test suite (79 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:
