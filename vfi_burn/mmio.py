@@ -1,6 +1,6 @@
 """Safe aligned 32-bit BAR0 MMIO helpers.
 
-Enforces BURN_SPEC safety invariant #3:
+Safety invariant:
 Every MMIO access is a single aligned 32-bit load/store via
 ``memoryview(buf)[offset:offset+4].cast("I")``, NEVER ``struct.pack_into``.
 Memoryviews are released immediately so underlying ``mmap`` objects can be closed cleanly.

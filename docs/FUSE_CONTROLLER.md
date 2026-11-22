@@ -194,7 +194,7 @@ Key properties of this machine:
 - **`SENSE_CTRL` sets `SBFE = 1` as a side effect**, which blocks FF programming. That is why `arm()`
   must run *after* sense and write `SBFE_SHADOW = 0`.
 - **A closed `PLM_f8` is never re-opened in software.** `CTRL_WR_SECURE` exists, but writing it would
-  hide the "frame too deep" signal (BURN_SPEC §3/§6), so `arm()` refuses instead.
+  hide the "frame too deep" signal, so `arm()` refuses instead.
 - **The armed state persists across records in the same window.** Multiple records (test row, then
   real records after `CONTINUE SAME WINDOW`) are each programmed from `Armed`. `program_row()` calls
   `arm()` every time, which is idempotent and re-asserts all 12 invariants.
@@ -509,6 +509,6 @@ and [`AlignedMMIO.write32()`](../vfi_burn/mmio.py) separately refuses `DEBUGCTRL
 | `FUSECTRL` not idle within timeout | `poll_idle()` | Unit hung | Pre-trigger: refuse. Post-trigger: `HALT_UNVERIFIED` |
 | Read-back ≠ intended | `program_row()`, engine | Partial or wrong program | `HALT_UNVERIFIED`; do not retry, do not advance |
 
-The guiding rule (BURN_SPEC §6): automatic decisions only ever resolve toward *not writing*. The
+The guiding rule: automatic decisions only ever resolve toward *not writing*. The
 controller never retries a program, never re-issues `SENSE_CTRL` in the same window, and never
 "recovers and continues" after poison.

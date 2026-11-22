@@ -77,7 +77,7 @@ class FuseControllerHAL(ABC):
 
     @abstractmethod
     def read_health_registers(self) -> Health:
-        """Read health/arming registers in spec order (FUSECTRL first, stopping on poison)."""
+        """Read health/arming registers in safe order (FUSECTRL first, stopping on poison)."""
 
     @abstractmethod
     def read_row(self, row: int, *, timeout_s: float = 0.2) -> int:

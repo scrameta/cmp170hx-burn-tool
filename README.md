@@ -21,7 +21,7 @@ It sits downstream of:
 - your **voltage-glitch / hold setup** (e.g. [`dalzyu/pico-ga100vfi`](https://github.com/dalzyu/pico-ga100vfi), [`darkmaniac7/cmp170hx-8gb-vfi-tools`](https://github.com/darkmaniac7/cmp170hx-8gb-vfi-tools)) — `vfi_burn` never glitches, dips NVVDD, or pulses `PEX_RST`;
 - your **offline floorplan / fuse planner** (e.g. [`sayhellotojungle/cmp170hx-ffcalc`](https://github.com/sayhellotojungle/cmp170hx-ffcalc), [`kprinssu/ga100-ff-tools`](https://github.com/kprinssu/ga100-ff-tools)) — `vfi_burn` can directly import `cmp170hx-ffcalc` plans and independently decode/verify every FF word.
 
-Design philosophy (see [`BURN_SPEC.md`](BURN_SPEC.md)):
+Design philosophy:
 - **Passive dry-run by default**: `vfi_burn burn` performs passive preflight and slot proving without firing active sense or programming fuses unless you explicitly opt in (`--sense` / `--execute`).
 - **One record at a time, mandatory read-back**: no batching, no automatic retries, and the row pointer never advances until both read-back and the full post-write health/host gate pass.
 - **Full audit trail**: every read, preflight/sense pass or failure, override, confirmation, write attempt (`fsync`ed *before* touching hardware), halt, and cold verification is appended to an exclusively locked (`flock`), mode-`0600` JSONL journal.
@@ -93,7 +93,6 @@ docs/
   cmd_line.md          # Command-line reference, offline simulation & live bench workflow
   FUSE_CONTROLLER.md   # How the GA100 fuse controller works (state machines + programming sequence)
   screenshots/         # Terminal screenshots captured in offline simulation mode
-BURN_SPEC.md           # Original design spec and safety invariants
 adapter_template.py    # ABC-backed template for custom hardware adapters
 ```
 
@@ -106,7 +105,6 @@ adapter_template.py    # ABC-backed template for custom hardware adapters
 - **[Interactive Menu Guide (`docs/menu_driven.md`)](docs/menu_driven.md)** *(recommended for bench use)* — SSH/serial/tmux-friendly numbered menu (`python3 -m vfi_burn` or `python3 -m vfi_burn menu`), read-only by default on live hardware, covering plan import/review, live status, active sense, dry-run preview, single-window (`--stage all`) and split-window burns, overrides, the staged `preview` → `apply` manual console, FF word decoding, and cold-boot verification, complete with an offline screenshot walkthrough.
 - **[Command-Line Interface (`docs/cmd_line.md`)](docs/cmd_line.md)** — scriptable subcommands (`plan`, `decode`, `import-ffcalc`, `snapshot`, `inspect`, `burn`, `simulate`, `manual`, `verify-cold`), offline simulation examples, step-by-step live hardware bench workflow, and low-level `manual` diagnostics/console commands.
 - **[GA100 Fuse Controller Reference (`docs/FUSE_CONTROLLER.md`)](docs/FUSE_CONTROLLER.md)** — register map, `FUSECTRL` command FSM, locked → Goldilocks → sensed → armed security state machine, and read/sense/arm/program sequence diagrams.
-- **[Design Specification (`BURN_SPEC.md`)](BURN_SPEC.md)** — original design specification and safety invariants.
 
 ---
 

@@ -1,4 +1,4 @@
-"""Interactive manual fuse-controller console (BURN_SPEC §7).
+"""Interactive manual fuse-controller console.
 
 Manual means the operator chooses what to read or which single record to write;
 the safety gates (aligned 32-bit stores, empty target slot, mandatory read-back,

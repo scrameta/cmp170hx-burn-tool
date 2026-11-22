@@ -728,7 +728,7 @@ def import_ffcalc_plan(
       - Computes exact before/after disable masks and SM counts from full FF replay.
 
     ``base_sm_ceiling`` is required: it is community/operator knowledge the card cannot
-    supply (BURN_SPEC §4), and defaulting it to the full-die 128 made the check vacuous.
+    supply, and defaulting it to the full-die 128 made the check vacuous.
     """
     if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
         raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")

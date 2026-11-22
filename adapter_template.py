@@ -42,7 +42,7 @@ class MyLiveReader(FuseReader):
         )
 
     def health(self) -> Health:
-        # CRITICAL ORDER (BURN_SPEC §5): read FUSECTRL FIRST, then DSOV, CRC, PLM,
+        # CRITICAL ORDER: read FUSECTRL FIRST, then DSOV, CRC, PLM,
         # PLM_f8, and EN_SW.
         raise NotImplementedError("fresh BAR0 register reads (FUSECTRL first)")
 
