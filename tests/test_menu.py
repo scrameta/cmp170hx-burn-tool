@@ -342,6 +342,34 @@ class TestBurnMenu(unittest.TestCase):
         # Well-understood Gen4 bit should NOT trigger a warning
         self.assertNotIn("[row 227 / UNLOCK_PCIE_GEN4]", out)
 
+    def test_menu_experimental_registers_readonly_view(self):
+        exp_fake = json.loads(self.fake_path.read_text())
+        exp_fake["registers"] = {
+            "0x00820228": "0x00000000",  # FUSE_ECC_EN
+            "0x00820224": "0x00000001",  # FUSE_SS_DP
+            "0x0082059c": "0x00000005",  # FUSE_SS_FFMA
+            "0x00823814": "0x00000233",  # FEAT_READOUT_0
+            "0x00823818": "0x016db6ed",  # FEAT_READOUT_1
+        }
+        exp_fake_path = self.work / "exp_menu_fake.json"
+        exp_fake_path.write_text(json.dumps(exp_fake))
+        exp_fake_path.chmod(0o600)
+
+        session = MenuSession(
+            plan_path=str(self.plan_path),
+            fake_path=str(exp_fake_path),
+            journal_path=str(self.journal_path),
+        )
+        rc, out, _ = self._run_menu(session, ["12", "0"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[12] Experimental Registers", out)
+        self.assertIn("=== EXPERIMENTAL READ-ONLY REGISTERS", out)
+        self.assertIn("FUSE_ECC_EN", out)
+        self.assertIn("DISABLED (CMP/consumer)", out)
+        self.assertIn("MAX THROTTLE (5; CMP)", out)
+        events = [e["event"] for e in self._journal_events()]
+        self.assertIn("manual_experimental_read", events)
+
 
 if __name__ == "__main__":
     unittest.main()

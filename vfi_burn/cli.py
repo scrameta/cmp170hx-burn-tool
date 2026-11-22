@@ -25,7 +25,13 @@ from .backend import (
     snapshot_data,
     write_private_json,
 )
-from .console import ManualConsole, format_plan_review, format_status_report
+from .console import (
+    ManualConsole,
+    format_experimental_report,
+    format_plan_review,
+    format_status_report,
+    read_experimental_registers,
+)
 from .engine import (
     Journal,
     Overrides,
@@ -39,10 +45,17 @@ from .engine import (
     verify_cold_snapshot,
 )
 from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
-from .ga100 import GA100LiveAdapter
+from .ga100 import EXPERIMENTAL_INSPECT_REGS, GA100LiveAdapter, decode_experimental_register
 from .menu import BurnMenu, MenuSession
 from .mmio import resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
+
+_EXP_BY_ADDR = {r.address: r for r in EXPERIMENTAL_INSPECT_REGS}
+_EXP_BY_NAME = {}
+for _r in EXPERIMENTAL_INSPECT_REGS:
+    _EXP_BY_NAME[_r.name] = _r
+    for _a in _r.aliases:
+        _EXP_BY_NAME[_a] = _r
 
 
 def prompt_confirm(prompt: str, token: str) -> bool:
@@ -314,6 +327,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly invoke SENSE_CTRL active sense (confirmed with 'SENSE' on live hardware)",
     )
     inspect_p.add_argument(
+        "--experimental",
+        action="store_true",
+        help="also print the full read-only experimental GA100 register table (FUSE_ECC_EN, FUSE_SS_*, SKU, readouts)",
+    )
+    inspect_p.add_argument(
         "--journal",
         help="private mode-0600 audit JSONL (recommended so inspect/sense results and failures are logged)",
     )
@@ -378,6 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     man_sub = manual_p.add_subparsers(dest="action", required=True)
 
     man_sub.add_parser("status", help="print full health, host, die ID, and mask status (never writes)")
+    man_sub.add_parser(
+        "experimental",
+        help="print full read-only experimental GA100 register table (FUSE_ECC_EN, FUSE_SS_*, SKU, readouts)",
+    )
 
     rr = man_sub.add_parser("read-row", help="read a single fuse row (works even if card is faulted/cold)")
     rr.add_argument("row", type=lambda s: int(s, 0))
@@ -386,10 +408,13 @@ def build_parser() -> argparse.ArgumentParser:
     rrs.add_argument("start", type=lambda s: int(s, 0))
     rrs.add_argument("end", type=lambda s: int(s, 0))
 
-    rg = man_sub.add_parser("read-reg", help="read aligned 32-bit MMIO reg (hex or FUSECTRL/DEBUGCTRL/PLM_F8)")
+    rg = man_sub.add_parser(
+        "read-reg",
+        help="read aligned 32-bit MMIO reg (hex, FUSECTRL/DEBUGCTRL/PLM_F8, or experimental name like FUSE_ECC_EN)",
+    )
     rg.add_argument("address")
 
-    rf = man_sub.add_parser("read-field", help="read named decoded field")
+    rf = man_sub.add_parser("read-field", help="read named decoded field (including experimental names)")
     rf.add_argument("name")
 
     mc = man_sub.add_parser("console", help="interactive manual fuse-controller console")
@@ -605,6 +630,13 @@ def main(argv=None) -> int:
         if args.cmd == "inspect":
             for line in format_status_report(p, backend):
                 print(line)
+            exp_readings: dict[str, int] | None = None
+            if args.experimental:
+                exp_readings, exp_poisoned = read_experimental_registers(backend)
+                for line in format_experimental_report(
+                    backend, readings=exp_readings, poisoned=exp_poisoned
+                ):
+                    print(line)
             journal = Journal(args.journal) if args.journal else None
             try:
                 if args.sense and not args.fake:
@@ -631,6 +663,11 @@ def main(argv=None) -> int:
                 row, surrounding = scan_slots(p, backend)
                 if journal is not None:
                     h_snap, host_snap = _capture_inspect_snapshot(backend)
+                    extra_j = (
+                        {"experimental_registers": {k: hex32(v) for k, v in exp_readings.items()}}
+                        if exp_readings is not None
+                        else {}
+                    )
                     journal.append(
                         event="inspect_result",
                         plan_sha256=p.content_hash,
@@ -640,6 +677,7 @@ def main(argv=None) -> int:
                         health=h_snap,
                         host=host_snap,
                         status="PASS",
+                        **extra_j,
                     )
             except Exception as exc:
                 if journal is not None:
@@ -757,6 +795,20 @@ def main(argv=None) -> int:
                 with Journal(args.journal) as j:
                     j.append(event="manual_status", pci_id=backend.pci_id())
                 return 0
+            if args.action == "experimental":
+                readings, poisoned = read_experimental_registers(backend)
+                for line in format_experimental_report(
+                    backend, readings=readings, poisoned=poisoned
+                ):
+                    print(line)
+                with Journal(args.journal) as j:
+                    j.append(
+                        event="manual_experimental_read",
+                        pci_id=backend.pci_id(),
+                        skipped_poison=poisoned,
+                        registers={k: hex32(v) for k, v in readings.items()},
+                    )
+                return 0
 
             _warn_if_unhealthy_readonly(p, backend)
             if args.action == "read-row":
@@ -780,13 +832,27 @@ def main(argv=None) -> int:
                 addr = resolve_register_address(args.address)
                 value = backend.register(addr)
                 warn = "  [POISON!]" if is_poison(value) else ""
-                print(f"reg {hex32(addr)} = {hex32(value)}{warn}")
+                exp = _EXP_BY_ADDR.get(addr)
+                extra = (
+                    f"  [EXPERIMENTAL: {exp.name} — {decode_experimental_register(exp, value)}; "
+                    f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
+                    if exp is not None
+                    else ""
+                )
+                print(f"reg {hex32(addr)} = {hex32(value)}{warn}{extra}")
                 with Journal(args.journal) as j:
                     j.append(event="manual_read_reg", address=hex32(addr), value=hex32(value))
             elif args.action == "read-field":
                 value = backend.field(args.name)
                 warn = "  [POISON!]" if is_poison(value) else ""
-                print(f"{args.name} = {hex32(value)}{warn}")
+                exp = _EXP_BY_NAME.get(args.name.strip().upper())
+                extra = (
+                    f"  [EXPERIMENTAL: {decode_experimental_register(exp, value)}; "
+                    f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
+                    if exp is not None
+                    else ""
+                )
+                print(f"{args.name} = {hex32(value)}{warn}{extra}")
                 with Journal(args.journal) as j:
                     j.append(event="manual_read_field", field=args.name, value=hex32(value))
             return 0

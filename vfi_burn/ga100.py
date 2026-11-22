@@ -12,6 +12,7 @@ NEVER struct.pack_into). DEBUGCTRL (0x00820060) is never written.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import mmap
 import os
 from pathlib import Path
@@ -65,6 +66,283 @@ FUSECTRL_IDLE_STATE = 4
 FUSECTRL_CMD_MASK = 0x1F
 DEBUGCTRL_RWL_BIT = 1 << 1       # 0 = main array; 1 = RIR macro (NEVER set)
 
+
+@dataclass(frozen=True)
+class ExperimentalRegister:
+    """Read-only experimental GA100 register for cross-variant inspection (never burned)."""
+
+    name: str
+    address: int
+    category: str
+    cmp170hx_ref: str
+    a100_ref: str
+    description: str
+    aliases: tuple[str, ...] = ()
+
+
+# Experimental read-only inspection catalog (from GA100 cross-variant MMIO reference table).
+# These registers are NOT mapped in FF burn plans and are strictly read-only in vfi_burn.
+EXPERIMENTAL_INSPECT_REGS: tuple[ExperimentalRegister, ...] = (
+    # --- ECC & feature control OTP fuses ---
+    ExperimentalRegister(
+        "FUSE_ECC_EN",
+        0x00820228,
+        "ECC & Feature Fuses",
+        "0x0",
+        "0x1",
+        "OPT_ECC_EN; ECC enable OTP fuse (bit 0; 0=CMP/consumer, 1=A100/Pro)",
+        aliases=("OPT_ECC_EN",),
+    ),
+    ExperimentalRegister(
+        "FUSE_FEAT_OVR_DIS",
+        0x008203F0,
+        "ECC & Feature Fuses",
+        "0x0",
+        "0x0",
+        "OPT_FEATURE_FUSES_OVERRIDE_DISABLE; 0=HS feature overrides available",
+        aliases=("OPT_FEATURE_FUSES_OVERRIDE_DISABLE",),
+    ),
+    ExperimentalRegister(
+        "FUSE_HALF_FBPA_EN",
+        0x0082049C,
+        "ECC & Feature Fuses",
+        "0x0",
+        "0x0",
+        "OPT_HALF_FBPA_ENABLE; per-FBPA half-capacity fuse mask (24-bit)",
+        aliases=("OPT_HALF_FBPA_ENABLE",),
+    ),
+    ExperimentalRegister(
+        "FUSE_FB_CONFIG",
+        0x00820328,
+        "ECC & Feature Fuses",
+        "0x0",
+        "0x0",
+        "OPT_FB_CONFIG; 4-bit memory topology selector",
+        aliases=("OPT_FB_CONFIG",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SKU_ID",
+        0x00821060,
+        "ECC & Feature Fuses",
+        "0x68",
+        "0x54/0x5b/0x7b",
+        "OPT_SKU_ID; 8-bit SKU identifier (170HX 10G=0x68, A100=0x54/0x5b/0x7b)",
+        aliases=("OPT_SKU_ID",),
+    ),
+    # --- SM speed select OTP fuses (FMA / Tensor Core throttle) ---
+    ExperimentalRegister(
+        "FUSE_SS_DP",
+        0x00820224,
+        "SM Speed Select OTP Fuses",
+        "0x1",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_DP; FP64 throttle (1-bit: 0=full, 1=reduced)",
+        aliases=("OPT_SM_SPEED_SELECT_DP",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_FFMA",
+        0x0082059C,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_FFMA; FP32 FMA throttle (3-bit: 0=full..5=max)",
+        aliases=("OPT_SM_SPEED_SELECT_FFMA",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_FMLA16",
+        0x008207D4,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_FMLA16; FP16 MLA/Tensor throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_FMLA16",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_FMLA32",
+        0x008207D8,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_FMLA32; FP32 MLA/Tensor throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_FMLA32",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_IMLA0",
+        0x008207DC,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_IMLA0; INT MLA0 / DP4A throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_IMLA0",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_IMLA1",
+        0x008207E0,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_IMLA1; INT MLA1 throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_IMLA1",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_IMLA2",
+        0x008207E4,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_IMLA2; INT MLA2 throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_IMLA2",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_IMLA3",
+        0x008207E8,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_IMLA3; INT MLA3 throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_IMLA3",),
+    ),
+    ExperimentalRegister(
+        "FUSE_SS_IMLA4",
+        0x008207EC,
+        "SM Speed Select OTP Fuses",
+        "0x5",
+        "0x0",
+        "OPT_SM_SPEED_SELECT_IMLA4; INT MLA4 throttle (3-bit)",
+        aliases=("OPT_SM_SPEED_SELECT_IMLA4",),
+    ),
+    # --- Feature override & readout chain (L3/HS-gated runtime state) ---
+    ExperimentalRegister(
+        "FEAT_OVR_ECC_PLM",
+        0x00823800,
+        "Feature Override & Readout Chain",
+        "0xffffff8f",
+        "0xffffff8f",
+        "FEATURE_OVERRIDE_ECC PLM (0xffffff8f = L3/HS writable)",
+    ),
+    ExperimentalRegister(
+        "FEAT_OVR_PLM",
+        0x00823804,
+        "Feature Override & Readout Chain",
+        "0xffffff8f",
+        "0xffffff8f",
+        "FEATURE_OVERRIDE PLM (self-sealing, L3/HS writable)",
+    ),
+    ExperimentalRegister(
+        "FEAT_OVR_ECC",
+        0x0082380C,
+        "Feature Override & Readout Chain",
+        "0x00888888",
+        "0x00001111/0x00110111",
+        "Per-unit ECC override (SM_LRF/L1/LTC/DRAM/CBU)",
+    ),
+    ExperimentalRegister(
+        "FEAT_OVR_ECC_1",
+        0x00823810,
+        "Feature Override & Readout Chain",
+        "0x002aaaaa",
+        "0x00104015/0x00104104",
+        "Per-unit ECC override 1 (icache/FECS/GPCCS/PMU/HUBMMU)",
+    ),
+    ExperimentalRegister(
+        "FEAT_OVR_ECC_2",
+        0x0082382C,
+        "Feature Override & Readout Chain",
+        "0x0000000a",
+        "0x00000000/0x00000001",
+        "Per-unit ECC override 2 (LTC_CBC/SM_URF)",
+    ),
+    ExperimentalRegister(
+        "FEAT_READOUT_0",
+        0x00823814,
+        "Feature Override & Readout Chain",
+        "0x00000233",
+        "0xef8ff100",
+        "Effective Quadro[5:0] + ECC[31:12] status readout (RO)",
+    ),
+    ExperimentalRegister(
+        "FEAT_READOUT_1",
+        0x00823818,
+        "Feature Override & Readout Chain",
+        "0x016db6ed",
+        "0x00000000",
+        "Effective SM speed-select throttle readout across all 9 units (RO)",
+    ),
+    ExperimentalRegister(
+        "FEAT_READOUT_2",
+        0x00823828,
+        "Feature Override & Readout Chain",
+        "0x00000000",
+        "0x00000007",
+        "Effective row-remapper + ECC LTC_CBC/SM_URF readout (RO)",
+    ),
+    ExperimentalRegister(
+        "FBPA_ECC_CTRL",
+        0x009A0470,
+        "Feature Override & Readout Chain",
+        "0x00000000",
+        "0x00000041",
+        "Broadcast FBPA DRAM ECC control register",
+    ),
+)
+
+EXPERIMENTAL_REGS_BY_NAME: dict[str, int] = {}
+for _exp in EXPERIMENTAL_INSPECT_REGS:
+    EXPERIMENTAL_REGS_BY_NAME[_exp.name] = _exp.address
+    for _alias in _exp.aliases:
+        EXPERIMENTAL_REGS_BY_NAME[_alias] = _exp.address
+
+
+def decode_experimental_register(reg: ExperimentalRegister, value: int) -> str:
+    """Return a concise human-readable interpretation of a read-only experimental register."""
+    if value == 0xFFFFFFFF:
+        return "LINK/BAR0 DOWN (0xffffffff)"
+    if is_poison(value):
+        return f"POISON/UNREACHABLE (0x{value:08x})"
+    name = reg.name
+    if name == "FUSE_ECC_EN":
+        return "ENABLED (A100/Pro)" if (value & 1) else "DISABLED (CMP/consumer)"
+    if name == "FUSE_FEAT_OVR_DIS":
+        return "LOCKED (overrides disabled)" if (value & 1) else "OPEN (HS override path available)"
+    if name == "FUSE_HALF_FBPA_EN":
+        return "NONE (full FBPA capacity)" if value == 0 else f"HALF-CAPACITY MASK 0x{value:x}"
+    if name == "FUSE_FB_CONFIG":
+        return f"topology selector {value & 0xF}"
+    if name == "FUSE_SKU_ID":
+        known_skus = {
+            0x68: "CMP 170HX (10GB ref)",
+            0x54: "A100 PCIe 40GB",
+            0x5B: "A100 SXM4 40GB",
+            0x7B: "A100 PCIe 80GB",
+            0x8E: "Drive A100 32GB",
+        }
+        sku_note = known_skus.get(value & 0xFF, "other/unlisted SKU")
+        return f"SKU 0x{value & 0xFF:02x} ({sku_note})"
+    if name == "FUSE_SS_DP":
+        return "THROTTLED (reduced FP64)" if (value & 1) else "FULL SPEED (unthrottled)"
+    if name.startswith("FUSE_SS_"):
+        v = value & 0x7
+        if v == 0:
+            return "FULL SPEED (0)"
+        if v == 5:
+            return "MAX THROTTLE (5; CMP)"
+        return f"THROTTLED (level {v})"
+    if name == "FEAT_READOUT_0":
+        ecc_bits = (value >> 12) & 0xFFFFF
+        quadro_bits = value & 0x3F
+        ecc_state = "ECC ACTIVE" if ecc_bits else "ECC OFF"
+        return f"{ecc_state} (ECC[31:12]=0x{ecc_bits:05x}, Quadro[5:0]=0x{quadro_bits:02x})"
+    if name == "FEAT_READOUT_1":
+        return "NO ACTIVE THROTTLE (0x0)" if value == 0 else f"THROTTLE ACTIVE (0x{value:08x})"
+    if name == "FEAT_READOUT_2":
+        return "ECC/REMAP OFF (0x0)" if value == 0 else f"ACTIVE FLAGS 0x{value:x}"
+    if name == "FBPA_ECC_CTRL":
+        return "DRAM ECC OFF" if value == 0 else f"DRAM ECC ACTIVE (0x{value:x})"
+    if name in ("FEAT_OVR_ECC_PLM", "FEAT_OVR_PLM"):
+        return "L3/HS writable" if value == 0xFFFFFF8F else f"PLM 0x{value:08x}"
+    return reg.description
+
+
 # Option / defect registers (fused registers used as ground truth; OEM FW can mask status regs).
 OPTION_REGS: dict[str, int] = {
     "GPC_DISABLE": 0x00820350,
@@ -100,6 +378,7 @@ OPTION_REGS: dict[str, int] = {
     "PCIE_DEVIDB": 0x0082056C,
     **{f"TPC_GPC{i}_DISABLE": 0x00820760 + 4 * i for i in range(TOTAL_GPC)},
     **{f"TPC_GPC{i}_STATUS": 0x00820C38 + 4 * i for i in range(TOTAL_GPC)},
+    **EXPERIMENTAL_REGS_BY_NAME,
 }
 
 
@@ -788,6 +1067,13 @@ class GA100LiveAdapter:
         ):
             val = self.field(fname)
             fields[fname] = val if fname == "SM_COUNT" else f"0x{val:08x}"
+        experimental_registers: dict[str, str] = {}
+        if not is_poison(self.controller.rd(REG_FUSECTRL)):
+            for exp in EXPERIMENTAL_INSPECT_REGS:
+                try:
+                    experimental_registers[exp.name] = f"0x{self.controller.rd(exp.address):08x}"
+                except Exception as exc:
+                    experimental_registers[exp.name] = f"ERR:{exc}"
         return {
             "pci_id": pci,
             "cold_boot": True,
@@ -796,4 +1082,5 @@ class GA100LiveAdapter:
             "die_rows": die_rows,
             "fpf_rows": fpf_rows,
             "fields": fields,
+            "experimental_registers": experimental_registers,
         }

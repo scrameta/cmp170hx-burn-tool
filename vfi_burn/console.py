@@ -33,8 +33,141 @@ from .ffrecord import (
     decode_ff,
     replay_ff_rows,
 )
-from .mmio import resolve_register_address
+from .ga100 import EXPERIMENTAL_INSPECT_REGS, decode_experimental_register
+from .mmio import REG_FUSECTRL, resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, u32
+
+_EXP_BY_ADDR = {reg.address: reg for reg in EXPERIMENTAL_INSPECT_REGS}
+_EXP_BY_NAME = {}
+for _reg in EXPERIMENTAL_INSPECT_REGS:
+    _EXP_BY_NAME[_reg.name] = _reg
+    for _alias in _reg.aliases:
+        _EXP_BY_NAME[_alias] = _reg
+
+
+def read_experimental_registers(
+    reader, *, fusectrl: int | None = None
+) -> tuple[dict[str, int], bool]:
+    """Read EXPERIMENTAL_INSPECT_REGS safely (read-only).
+
+    Checks FUSECTRL first and immediately stops without touching other BAR0 registers
+    if FUSECTRL is poisoned or link-down (0xFFFFFFFF).
+    Returns ``(readings_by_name, skipped_due_to_poison)``.
+    """
+    if fusectrl is None:
+        try:
+            fusectrl = reader.register(REG_FUSECTRL)
+        except Exception:
+            try:
+                fusectrl = reader.health().fusectrl
+            except Exception:
+                fusectrl = None
+    if fusectrl is not None and (fusectrl == 0xFFFFFFFF or is_poison(fusectrl)):
+        return {}, True
+
+    readings: dict[str, int] = {}
+    for reg in EXPERIMENTAL_INSPECT_REGS:
+        val: int | None = None
+        try:
+            val = reader.register(reg.address)
+        except Exception:
+            try:
+                val = reader.field(reg.name)
+            except Exception:
+                val = None
+        if val is not None:
+            readings[reg.name] = val
+    return readings, False
+
+
+def format_experimental_report(
+    reader,
+    *,
+    fusectrl: int | None = None,
+    readings: dict[str, int] | None = None,
+    poisoned: bool | None = None,
+) -> list[str]:
+    """Format the full read-only experimental GA100 register readout & reference table."""
+    if readings is None or poisoned is None:
+        readings, poisoned = read_experimental_registers(reader, fusectrl=fusectrl)
+    lines = [
+        "=== EXPERIMENTAL READ-ONLY REGISTERS (UNMAPPED IN FF PLANS — NEVER BURNED) ===",
+        "  NOTE: Diagnostic BAR0 readouts from GA100 cross-variant research (170HX vs A100).",
+        "        These are NOT mapped to FF burn chains and are never written by vfi_burn.",
+    ]
+    if poisoned:
+        lines.append(
+            "  SKIPPED: FUSECTRL is poisoned/link-down — refusing further BAR0 reads for safety."
+        )
+        return lines
+
+    if not readings:
+        lines.append(
+            "  NOTE: Target snapshot has no experimental registers populated (showing reference map)."
+        )
+
+    current_cat: str | None = None
+    for reg in EXPERIMENTAL_INSPECT_REGS:
+        if reg.category != current_cat:
+            current_cat = reg.category
+            lines.append(f"  [{current_cat}]")
+        ref_str = f"170HX={reg.cmp170hx_ref} / A100={reg.a100_ref}"
+        if reg.name in readings:
+            val = readings[reg.name]
+            note = decode_experimental_register(reg, val)
+            lines.append(
+                f"    {reg.name:18} ({hex32(reg.address)}) = {hex32(val)}  | {note}  [{ref_str}]"
+            )
+        else:
+            lines.append(
+                f"    {reg.name:18} ({hex32(reg.address)}) = {'n/a':10}  | {reg.description}  [{ref_str}]"
+            )
+    return lines
+
+
+def _format_experimental_compact_lines(readings: dict[str, int]) -> list[str]:
+    """Build compact summary lines for format_status_report when experimental regs are present."""
+    parts: list[str] = []
+    if "FUSE_ECC_EN" in readings:
+        v = readings["FUSE_ECC_EN"]
+        parts.append(f"FUSE_ECC_EN={hex32(v)} ({decode_experimental_register(_EXP_BY_NAME['FUSE_ECC_EN'], v)})")
+    if "FUSE_SKU_ID" in readings:
+        v = readings["FUSE_SKU_ID"]
+        parts.append(f"FUSE_SKU_ID={hex32(v)} ({decode_experimental_register(_EXP_BY_NAME['FUSE_SKU_ID'], v)})")
+    ss_names = (
+        "FUSE_SS_FFMA",
+        "FUSE_SS_FMLA16",
+        "FUSE_SS_FMLA32",
+        "FUSE_SS_IMLA0",
+        "FUSE_SS_IMLA1",
+        "FUSE_SS_IMLA2",
+        "FUSE_SS_IMLA3",
+        "FUSE_SS_IMLA4",
+    )
+    ss_vals = [readings[n] for n in ss_names if n in readings]
+    if "FUSE_SS_DP" in readings or ss_vals:
+        dp_part = f"DP={readings['FUSE_SS_DP'] & 1}" if "FUSE_SS_DP" in readings else ""
+        if ss_vals:
+            uniq = sorted(set(ss_vals))
+            if len(uniq) == 1:
+                tag = "FULL" if uniq[0] == 0 else ("MAX THROTTLE" if uniq[0] == 5 else f"level {uniq[0]}")
+                vec_part = f"FMA/MLA(x{len(ss_vals)})=all 0x{uniq[0]:x} [{tag}]"
+            else:
+                vec_part = f"FMA/MLA(x{len(ss_vals)})=mixed ({','.join(f'0x{x:x}' for x in uniq)})"
+        else:
+            vec_part = ""
+        ss_join = ", ".join(p for p in (dp_part, vec_part) if p)
+        parts.append(f"SM_SPEED_SELECT({ss_join})")
+    for rname in ("FEAT_READOUT_0", "FEAT_READOUT_1", "FBPA_ECC_CTRL"):
+        if rname in readings:
+            v = readings[rname]
+            parts.append(f"{rname}={hex32(v)} ({decode_experimental_register(_EXP_BY_NAME[rname], v)})")
+    if not parts:
+        return []
+    lines = ["  Experimental : (read-only, NOT in FF burn plans — use 'experimental' / '--experimental' for full table)"]
+    for p in parts:
+        lines.append(f"    - {p}")
+    return lines
 
 
 def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = False) -> list[str]:
@@ -109,6 +242,10 @@ def format_status_report(plan: Plan, reader, *, allow_vout_override: bool = Fals
             mask_parts.append(f"{field}=ERR({exc})")
     if mask_parts:
         lines.append("  Masks        : " + "; ".join(mask_parts))
+
+    exp_readings, _ = read_experimental_registers(reader, fusectrl=health.fusectrl)
+    if exp_readings:
+        lines.extend(_format_experimental_compact_lines(exp_readings))
 
     all_issues = host_issues + health_issues + die_bad
     if not all_issues:
@@ -699,6 +836,9 @@ class ManualConsole:
         if cmd in ("state", "fuse-state"):
             self._cmd_state()
             return True
+        if cmd in ("experimental", "exp"):
+            self._cmd_experimental()
+            return True
         if cmd == "preview":
             self._cmd_preview(args)
             return True
@@ -746,6 +886,7 @@ class ManualConsole:
             "Commands:\n"
             "  status                         Show full health, host, die ID, and mask status\n"
             "  state                          Show detailed GA100 fuse controller registers & armed state\n"
+            "  experimental (exp)             Read-only table of experimental GA100 regs (ECC/SS/SKU/readouts)\n"
             "  preview <word> [row]           Inspect fuse state + exact PCIe BAR0 MMIO writes & stage\n"
             "  preview <target> <word> <desc> Inspect exact PCIe BAR0 writes & stage with custom label\n"
             "  apply                          Execute the exact staged preview (no re-typing; gated)\n"
@@ -754,8 +895,8 @@ class ManualConsole:
             "  scan                           Double-scan FPF window and prove next free row\n"
             "  row <index>                    Read one FPF row (with poison & diff check)\n"
             "  rows <start> <end>             Read a range of FPF rows (max 128)\n"
-            "  reg <addr|FUSECTRL|DEBUGCTRL|PLM_F8>  Read aligned 32-bit MMIO register\n"
-            "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, LnkCap2)\n"
+            "  reg <addr|NAME>                Read aligned 32-bit MMIO reg (e.g. FUSECTRL, FUSE_ECC_EN)\n"
+            "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, FUSE_ECC_EN)\n"
             "  diff                           Diff current FPF rows & fields vs console start\n"
             "  overrides                      Show active overrides & unbreakable invariants\n"
             "  write <target> <word> <decode> One-step preview + gated write (prefer preview -> apply)\n"
@@ -768,6 +909,16 @@ class ManualConsole:
         ):
             self.show(out)
         self.journal.append(event="manual_fuse_state", health=self.reader.health().serializable())
+
+    def _cmd_experimental(self) -> None:
+        readings, poisoned = read_experimental_registers(self.reader)
+        for out in format_experimental_report(self.reader, readings=readings, poisoned=poisoned):
+            self.show(out)
+        self.journal.append(
+            event="manual_experimental_read",
+            skipped_poison=poisoned,
+            registers={k: hex32(v) for k, v in readings.items()},
+        )
 
     def _show_write_preview(self, word: int, row: int | None = None) -> int:
         if row is None:
@@ -1010,11 +1161,18 @@ class ManualConsole:
 
     def _cmd_reg(self, args: list[str]) -> None:
         if len(args) != 1:
-            raise BurnError("usage: reg <addr|FUSECTRL|DEBUGCTRL|PLM_F8>")
+            raise BurnError("usage: reg <addr|FUSECTRL|DEBUGCTRL|PLM_F8|FUSE_ECC_EN|...>")
         addr = resolve_register_address(args[0])
         val = self.reader.register(addr)
         warn = "  [POISON!]" if is_poison(val) else ""
-        self.show(f"reg {hex32(addr)} = {hex32(val)}{warn}")
+        exp = _EXP_BY_ADDR.get(addr)
+        extra = (
+            f"  [EXPERIMENTAL: {exp.name} — {decode_experimental_register(exp, val)}; "
+            f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
+            if exp is not None
+            else ""
+        )
+        self.show(f"reg {hex32(addr)} = {hex32(val)}{warn}{extra}")
         self.journal.append(event="manual_read_reg", address=hex32(addr), value=hex32(val))
 
     def _cmd_field(self, args: list[str]) -> None:
@@ -1023,7 +1181,14 @@ class ManualConsole:
         name = args[0]
         val = self.reader.field(name)
         warn = "  [POISON!]" if is_poison(val) else ""
-        self.show(f"{name} = {hex32(val)}{warn}")
+        exp = _EXP_BY_NAME.get(name.strip().upper())
+        extra = (
+            f"  [EXPERIMENTAL: {decode_experimental_register(exp, val)}; "
+            f"170HX={exp.cmp170hx_ref} / A100={exp.a100_ref}]"
+            if exp is not None
+            else ""
+        )
+        self.show(f"{name} = {hex32(val)}{warn}{extra}")
         self.journal.append(event="manual_read_field", field=name, value=hex32(val))
 
     def _cmd_diff(self) -> None:
