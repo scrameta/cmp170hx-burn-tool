@@ -129,12 +129,27 @@ class Harness(unittest.TestCase):
         c=copy.deepcopy(self.controller)
         prior = c.fuse_row
         count=[0]
+        def counting(i):
+            count[0]+=1
+            return prior(i)
+        c.fuse_row=counting
+        pointer, _ = scan_slots(self.plan, c)
+        self.assertEqual(pointer, 223)
+        self.assertEqual(count[0], self.plan.last_row - self.plan.first_row + 1)
+
+        c=copy.deepcopy(self.controller)
+        prior = c.fuse_row
+        count=[0]
         def unstable(i):
             count[0]+=1
             return prior(i) ^ 1 if count[0]>6 else prior(i)
         c.fuse_row=unstable
         with self.assertRaisesRegex(BurnError, 'changed between scans'):
-            scan_slots(self.plan,c)
+            scan_slots(self.plan, c, passes=2)
+
+        for bad_passes in (0, -1, True):
+            with self.assertRaisesRegex(BurnError, 'passes'):
+                scan_slots(self.plan, self.controller, passes=bad_passes)
 
     def test_defective_bit_refused(self):
         r=replace(self.plan.records[1], from_disable=0x85, to_disable=0x80)
