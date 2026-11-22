@@ -3,6 +3,7 @@ from .backend import FakeController, Health, Host, MissingWriter, has_verified_w
 from .engine import Journal, Overrides, check_health, check_plan, preflight, process_records, scan_slots
 from .ffrecord import FFRecord, decode_ff, encode_ff, import_ffcalc_plan, replay_ff_rows, simulate_ff_write
 from .ga100 import GA100FuseController, GA100LiveAdapter
+from .menu import BurnMenu, MenuSession
 from .mmio import AlignedMMIO, ReadOnlyMMIO
 from .model import BurnError, Plan, Record
 
@@ -11,6 +12,7 @@ __version__ = "0.3.0"
 __all__ = [
     "AlignedMMIO",
     "BurnError",
+    "BurnMenu",
     "FFRecord",
     "FakeController",
     "GA100FuseController",
@@ -18,6 +20,7 @@ __all__ = [
     "Health",
     "Host",
     "Journal",
+    "MenuSession",
     "MissingWriter",
     "Overrides",
     "Plan",

@@ -40,6 +40,7 @@ from .engine import (
 )
 from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
 from .ga100 import GA100LiveAdapter
+from .menu import BurnMenu, MenuSession
 from .mmio import resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
 
@@ -216,12 +217,38 @@ def _warn_if_unhealthy_readonly(plan: Plan, backend) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vfi_burn",
-        description="CMP 170HX 8 GB FF fuse-burn safety controller (passive dry-run by default)",
+        description=(
+            "CMP 170HX 8 GB FF fuse-burn safety controller "
+            "(run with no subcommand or 'menu' for the interactive menu; passive dry-run by default)"
+        ),
     )
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     def add_plan(p: argparse.ArgumentParser) -> None:
         p.add_argument("--plan", required=True, help="private mode-0600 per-card plan JSON")
+
+    menu_p = sub.add_parser(
+        "menu",
+        help="high-level interactive menu interface (also launched when vfi_burn is run with no arguments)",
+    )
+    menu_p.add_argument("--plan", default=None, help="optional pre-loaded mode-0600 per-card plan JSON")
+    menu_g = menu_p.add_mutually_exclusive_group(required=False)
+    menu_g.add_argument("--bdf", default=None, help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
+    menu_g.add_argument("--adapter", default=None, help="custom owner-supplied live module:factory")
+    menu_g.add_argument("--fake", default=None, help="synthetic mode-0600 JSON controller snapshot")
+    _add_live_hw_args(menu_p)
+    menu_p.add_argument(
+        "--journal",
+        default="private/session.jsonl",
+        help="private mode-0600 audit JSONL (default: private/session.jsonl)",
+    )
+    menu_p.add_argument("--receipt", default=None, help="optional cold-verified test receipt path")
+    menu_p.add_argument(
+        "--execute",
+        action="store_true",
+        help="start with Live Execute mode armed (still requires TTY + per-record confirmations)",
+    )
+    _add_override_args(menu_p, allow_debugctrl=True)
 
     plan_p = sub.add_parser("plan", help="pure offline plan validation and review; never touches hardware")
     add_plan(plan_p)
@@ -463,6 +490,24 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     backend = None
     try:
+        if args.cmd is None:
+            return BurnMenu(MenuSession()).run()
+
+        if args.cmd == "menu":
+            session = MenuSession(
+                plan_path=args.plan,
+                bdf=args.bdf,
+                pico_port=args.port,
+                assume_vout_mv=args.assume_vout_mv,
+                adapter_spec=args.adapter,
+                fake_path=args.fake,
+                journal_path=args.journal,
+                receipt_path=args.receipt,
+                execute_live=bool(args.execute),
+                overrides=_overrides_from_args(args),
+            )
+            return BurnMenu(session).run()
+
         if args.cmd == "decode":
             word = u32(args.word, "word")
             ff = decode_ff(word)

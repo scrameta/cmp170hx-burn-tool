@@ -65,13 +65,15 @@ vfi_burn/
   backend.py     # Reader/Writer protocols, MissingWriter, FakeController, atomic 0600 JSON I/O
   engine.py      # Fail-closed state machine, Overrides, PMBus decode, flock Journal, verify_cold
   console.py     # Interactive manual console & status formatter
-  cli.py         # CLI entry point (plan, decode, import-ffcalc, snapshot, inspect, burn, simulate, manual, verify-cold)
+  menu.py        # High-level numbered interactive menu (SSH/tmux-friendly, read-only by default)
+  cli.py         # CLI entry point (menu, plan, decode, import-ffcalc, snapshot, inspect, burn, simulate, manual, verify-cold)
 tests/
   test_engine.py       # Core state machine, gates, overrides, pre-trigger check, journal locking
   test_ga100.py        # Hardware-accurate GA100 fuse-controller FSM & end-to-end Goldilocks tests
   test_ffrecord.py     # FF codec, Kate/ffcalc vectors, replay, SM math, ffcalc importer tests
   test_mmio.py         # AlignedMMIO, ReadOnlyMMIO, DEBUGCTRL guard, mmap close tests
   test_cli_console.py  # CLI, faulted-card read diagnostics, dry-run, interactive console tests
+  test_menu.py         # High-level interactive menu workflow, Live Execute guard & CLI entry tests
 examples/              # Synthetic-only example plan/fake/cold files (NEVER put real die IDs here)
 BURN_SPEC.md           # Original design spec and safety invariants
 adapter_template.py    # Template for custom hardware adapters
@@ -79,10 +81,38 @@ adapter_template.py    # Template for custom hardware adapters
 
 ---
 
+## Interactive Menu Interface (Recommended for Bench Use)
+
+Running `vfi_burn` with **no arguments** (or with `menu` plus optional pre-filled flags) launches a plain numbered menu designed for SSH/serial/tmux sessions (no fragile `curses`, full scrollback preserved):
+
+```bash
+# Launch empty menu and configure everything interactively:
+python3 -m vfi_burn
+
+# Launch pre-loaded for offline simulation (no GPU touched):
+python3 -m vfi_burn menu \
+  --plan private/plan.json \
+  --fake private/fake.json \
+  --journal private/session.jsonl
+
+# Launch pre-loaded for a live bench session (starts in LIVE READ-ONLY / DRY-RUN mode):
+sudo python3 -m vfi_burn menu \
+  --plan private/plan.json \
+  --bdf 0000:05:00.0 \
+  --port /dev/ttyACM0 \
+  --journal private/session.jsonl
+```
+
+The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JSONL journal, and typed confirmations:
+- **Safe by default on live hardware**: opens in `LIVE READ-ONLY / DRY-RUN` mode. Physical burns (`[6]` Single-Window `--stage all` or `[7]` Split-Window) are refused before opening BAR0 until you explicitly enable Live Execute in `[1] Setup -> [g]` by typing `ENABLE LIVE WRITES` (or pass `--execute`), and switching targets automatically resets Live Execute back to `OFF`.
+- **Full end-to-end bench flow in one place**: `[1]` Setup / import `cmp170hx-ffcalc` plan, `[2]` Offline Plan Review, `[3]` Live Status & Passive Inspection, `[4]` Active Sense (`SENSE_CTRL`), `[5]` Passive Dry-Run Preview, `[6]` Single-Window Burn (no-op test row → `CONTINUE SAME WINDOW` → real records), `[7]` Split-Window Burn, `[8]` Granular Manual Overrides, `[9]` Manual Low-Level Console, `[10]` Offline FF Word Decoder, `[11]` Cold-Boot Snapshot & Verify.
+
+---
+
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (70 tests):
+# Run the full offline test suite (77 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:
