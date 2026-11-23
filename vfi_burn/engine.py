@@ -85,6 +85,12 @@ class Overrides:
 
 
 def _poison(name: str, value: int) -> None:
+    """Refuse a poisoned REGISTER value (FUSECTRL, option shadows, PCIe config, ...).
+
+    Not for fuse-row data: ``FuseReader.fuse_row``/``die_row`` raise on a fuse-unit
+    error themselves, and a returned row value is OTP data, which can legitimately
+    start 0xBADx (an FF record whose block data is 0xBAD0..0xBADF).
+    """
     if is_poison(value):
         raise BurnError(f"{name} poison/fuse-unit error: {hex32(value)}")
 
@@ -185,7 +191,6 @@ def check_host_readonly_safe(host: Host) -> None:
 def check_die_rows(plan: Plan, reader) -> None:
     for i, value in plan.die_rows.items():
         actual = reader.die_row(i)
-        _poison(f"die row {i}", actual)
         if actual != value:
             raise BurnError(
                 f"DIE ID MISMATCH row {i}: expected {hex32(value)}, got {hex32(actual)}"
@@ -294,7 +299,6 @@ def preflight(
         if check_die:
             for i, value in plan.die_rows.items():
                 actual = reader.die_row(i)
-                _poison(f"post-sense die row {i}", actual)
                 if actual != value:
                     raise BurnError(f"die ID changed after active sense: row {i}")
         if compare_masks:
@@ -320,7 +324,6 @@ def resolve_fpf_pointer(
         if row_idx not in full_rows:
             raise BurnError(f"FPF row {row_idx} missing from scan result")
         v = full_rows[row_idx]
-        _poison(f"FPF row {row_idx}", v)
         a.append(v)
 
     empty = plan.empty_word
@@ -801,7 +804,6 @@ def detect_plan_progress(
                     next_row=row_idx,
                 )
             word = reader.fuse_row(row_idx)
-            _poison(f"FPF row {row_idx}", word)
             if word == plan.empty_word:
                 if offset == 0:
                     return PlanProgress(
@@ -864,7 +866,6 @@ def detect_plan_progress(
     j_row = _journal_test_row(plan, journal_path)
     if j_row is not None and plan.first_row <= j_row <= plan.last_row:
         w = reader.fuse_row(j_row)
-        _poison(f"FPF row {j_row}", w)
         if w == plan.records[0].word:
             return _match_from(j_row)
 
@@ -882,7 +883,6 @@ def detect_plan_progress(
     pointer = plan.last_row + 1
     for r in range(plan.first_row, plan.last_row + 1):
         w = reader.fuse_row(r)
-        _poison(f"FPF row {r}", w)
         if w == plan.empty_word:
             pointer = r
             break
@@ -975,7 +975,6 @@ def _write_verify_or_halt(
         raise BurnError(f"HALT: row {pointer} may be partially programmed; do NOT retry: {exc}") from exc
     try:
         readback = reader.fuse_row(pointer)
-        _poison(f"row {pointer} readback", readback)
         if readback != record.word:
             raise BurnError(
                 f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
@@ -1603,7 +1602,6 @@ def process_records(
             )
 
         previous = reader.fuse_row(pointer)
-        _poison(f"FPF row {pointer}", previous)
         if previous != plan.empty_word:
             raise BurnError(
                 f"row {pointer} not empty immediately before write "
@@ -1696,7 +1694,6 @@ def process_records(
             check_host(reader.host())
             check_health(reader.health(), plan)
             pre_slot = reader.fuse_row(pointer)
-            _poison(f"pre-trigger FPF row {pointer}", pre_slot)
             if pre_slot != plan.empty_word:
                 raise BurnError(
                     f"row {pointer} changed during confirmation ({hex32(pre_slot)})"

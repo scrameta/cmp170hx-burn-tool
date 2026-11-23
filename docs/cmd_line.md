@@ -31,7 +31,7 @@ Run `python3 -m vfi_burn <command> --help` for the full list of flags.
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (103 tests):
+# Run the full offline test suite (182 tests):
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:

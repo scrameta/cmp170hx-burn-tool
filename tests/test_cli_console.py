@@ -75,7 +75,9 @@ class TestCLIAndConsole(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertIn("0xbadf510e", out)
-        self.assertIn("POISON!", out)
+        # Row values are OTP data once the reader returns them (GA100 read_row raises on a
+        # real fuse-unit error), so a 0xBADx row is labelled as data, not poison.
+        self.assertIn("returned by the reader as OTP data", out)
         self.assertIn("NOT in a write-ready goldilocks state", err)
 
         code, out, err = self._run_cli(

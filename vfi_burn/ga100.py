@@ -171,6 +171,29 @@ class GA100FuseController(FuseControllerHAL):
             )
         return ctrl
 
+    def _confirm_bad_prefixed_row_data(self, row: int, val: int) -> None:
+        """Decide whether a 0xBADxxxxx FUSEDATA value is a fuse-unit error or real OTP data.
+
+        FUSEDATA returns the raw 32-bit row. An FF record's top 16 bits are its block data,
+        so a legitimate record with data 0xBAD0..0xBADF reads back as 0xBADxxxxx. Treat it
+        as an error only if the controller is unhealthy straight after the read (FUSECTRL
+        poisoned / not idle, or PMC_BOOT_0 bad: raised by the helpers) or a second FUSEDATA
+        read disagrees. Otherwise it is data and the caller gets it unchanged.
+        """
+        ctrl = self._check_fusectrl_first()
+        if not is_fusectrl_idle(ctrl):
+            raise BurnError(
+                f"FUSEDATA {val:#010x} reading row {row} with FUSECTRL not idle ({ctrl:#010x}): "
+                "treating as fuse-unit error"
+            )
+        self._check_bar0_alive()
+        again = self.rd(REG_FUSEDATA)
+        if again != val:
+            raise BurnError(
+                f"FUSEDATA unstable reading row {row} ({val:#010x} then {again:#010x}): "
+                "treating as fuse-unit error"
+            )
+
     def _check_bar0_alive(self) -> None:
         self._check_fusectrl_first()
         pmc = self.rd(REG_PMC_BOOT_0)
@@ -241,7 +264,7 @@ class GA100FuseController(FuseControllerHAL):
             self.poll_idle(timeout_s)
             val = self.rd(REG_FUSEDATA)
             if is_poison(val):
-                raise BurnError(f"FUSEDATA poisoned ({val:#010x}) reading row {row}")
+                self._confirm_bad_prefixed_row_data(row, val)
             return val
         finally:
             try:

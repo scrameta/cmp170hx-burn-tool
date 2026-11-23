@@ -266,10 +266,8 @@ class Plan:
                         f"fpf.baseline_ff_rows row {r_idx} contains empty_word (0x{empty_word:08x}); "
                         "store only the contiguous occupied prefix"
                     )
-                if is_poison(word):
-                    raise BurnError(
-                        f"fpf.baseline_ff_rows row {r_idx} word 0x{word:08x} matches poison prefix"
-                    )
+                # No poison test: baseline rows are OTP data from a cold dump, and a real FF
+                # record with block data 0xBAD0..0xBADF reads 0xBADxxxxx.
                 if (word >> 5) & 1:
                     raise BurnError(
                         f"fpf.baseline_ff_rows row {r_idx} word 0x{word:08x} has IFF bit 5 set"
@@ -348,7 +346,8 @@ class Plan:
                 )
             if is_poison(r.word):
                 raise BurnError(
-                    f"record {r.name!r} word 0x{r.word:08x} matches poison prefix (0xBADF/0xBAD0)"
+                    f"record {r.name!r} word 0x{r.word:08x} has 0xBADx block data: deliberately "
+                    "not burned (it would read back like a fuse-unit error at the moment of programming)"
                 )
             if r.mask_field and (r.mask_field not in expected_masks or r.mask_field not in defects):
                 raise BurnError(f"missing cold mask or genuine defect mask for {r.mask_field}")
