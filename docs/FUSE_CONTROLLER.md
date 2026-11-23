@@ -193,6 +193,13 @@ Key properties of this machine:
   If `EFP == 0` but `RESENSE_DISABLE == 1`, the window is unusable: cold boot and re-glitch.
 - **`SENSE_CTRL` sets `SBFE = 1` as a side effect**, which blocks FF programming. That is why `arm()`
   must run *after* sense and write `SBFE_SHADOW = 0`.
+- **Option shadows are unsensed until `SENSE_CTRL`.** The glitch mis-senses the row 0/1 control
+  fuses (giving `DSOV = 0`, `EFP = 0`) and leaves the option shadows (`OPT_*_DISABLE`, their status
+  aliases and the `*_DEFECTIVE` registers) unsensed: they read `0`. `SENSE_CTRL` senses them
+  (`EFP` 0→1, `DSOV` stays 0). Fuse *rows* read with `CMD_READ` are unaffected. vfi_burn therefore
+  compares identity masks only after sense; before it, the exact signature `DSOV = 0`, `EFP = 0`,
+  every compared shadow `0` defers the comparison in read-only/dry-run paths and refuses `--execute`.
+  Anything else (a partly sensed frame, `EFP = 1`) is compared and must match.
 - **A closed `PLM_f8` is never re-opened in software.** `CTRL_WR_SECURE` exists, but writing it would
   hide the "frame too deep" signal, so `arm()` refuses instead.
 - **The armed state persists across records in the same window.** Multiple records (test row, then

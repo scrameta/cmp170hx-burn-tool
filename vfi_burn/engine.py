@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 import json
 
 from .backend import Health, Host, MissingWriter
@@ -191,14 +192,62 @@ def check_die_rows(plan: Plan, reader) -> None:
             )
 
 
-def check_masks(expected_masks: dict[str, int], reader) -> None:
-    for field, expected in expected_masks.items():
+UNSENSED_SHADOWS_NOTE = (
+    "Option shadows not sensed yet (DSOV=0, EFP=0, every compared option register reads 0): "
+    "a Goldilocks frame before SENSE_CTRL. Identity masks are compared after SENSE_CTRL."
+)
+
+
+def option_shadows_unsensed(health: Health | None, readings: dict[str, int]) -> bool:
+    """True only for the documented pre-SENSE Goldilocks signature.
+
+    The glitch mis-senses the row 0/1 control fuses (DSOV=0, EFP=0) and leaves the
+    option shadows unsensed, so they read 0 until SENSE_CTRL re-senses them
+    (cmp170hx-8gb-vfi-tools docs/SWEET_SPOT.md, "the sentinel trap"). CMD_READ of
+    fuse rows is unaffected. A normally booted card has DSOV=1, and a partly sensed
+    frame has some nonzero shadow, so neither matches this and both are compared.
+    """
+    if health is None or health.dsov != 0 or health.efp != 0 or not readings:
+        return False
+    return all(v == 0 for v in readings.values())
+
+
+def check_masks(
+    expected_masks: dict[str, int],
+    reader,
+    *,
+    health: Health | None = None,
+    allow_unsensed: bool = False,
+    show: Callable[[str], None] | None = None,
+) -> bool:
+    """Compare live option shadows with the plan's cold-boot masks.
+
+    Returns True if compared, False if skipped because the shadows are provably
+    unsensed (only when ``allow_unsensed``; read-only/dry-run paths). With
+    ``health`` given and the unsensed signature present but not allowed, refuses
+    with an explicit "run SENSE_CTRL first" error instead of a misleading mismatch.
+    """
+    readings: dict[str, int] = {}
+    for field in expected_masks:
         actual = reader.field(field)
         _poison(f"field {field}", actual)
+        readings[field] = actual
+    if option_shadows_unsensed(health, readings):
+        if not allow_unsensed:
+            raise BurnError(
+                "option shadows are unsensed (DSOV=0, EFP=0, all read 0): SENSE_CTRL has not run "
+                "in this frame, so identity masks cannot be verified and nothing may be burned"
+            )
+        if show is not None:
+            show(UNSENSED_SHADOWS_NOTE)
+        return False
+    for field, expected in expected_masks.items():
+        actual = readings[field]
         if actual != expected:
             raise BurnError(
                 f"IDENTITY MISMATCH {field}: expected {hex32(expected)}, got {hex32(actual)}"
             )
+    return True
 
 
 def preflight(
@@ -210,8 +259,15 @@ def preflight(
     check_die: bool = True,
     expected_masks: dict[str, int] | None = None,
     overrides: Overrides | None = None,
+    show: Callable[[str], None] | None = None,
 ) -> str:
-    """Run fresh hardware/simulator preflight checks and return current boot_id."""
+    """Run fresh hardware/simulator preflight checks and return current boot_id.
+
+    Option-shadow masks are compared AFTER the active sense when one is requested:
+    in a Goldilocks frame they are unsensed (read 0) until SENSE_CTRL. Without an
+    active sense, the documented unsensed signature skips the comparison with a
+    note (read-only preflight); everything else is compared as before.
+    """
     ov = overrides or Overrides()
     host = reader.host()
     check_host(host)
@@ -221,13 +277,16 @@ def preflight(
     check_health(h, plan)
     if check_die:
         check_die_rows(plan, reader)
-    if match_masks and not ov.mask_mismatch:
-        check_masks(expected_masks if expected_masks is not None else plan.expected_masks, reader)
+    masks = expected_masks if expected_masks is not None else plan.expected_masks
+    compare_masks = match_masks and not ov.mask_mismatch
+    if compare_masks and not active_sense:
+        check_masks(masks, reader, health=h, allow_unsensed=True, show=show)
     if active_sense:
         reader.active_sense_readonly()
         # The sense itself may have destroyed this frame: read everything AGAIN and require EFP=1.
+        h_after = reader.health()
         check_health(
-            reader.health(),
+            h_after,
             plan,
             require_efp_one=True,
         )
@@ -238,6 +297,9 @@ def preflight(
                 _poison(f"post-sense die row {i}", actual)
                 if actual != value:
                     raise BurnError(f"die ID changed after active sense: row {i}")
+        if compare_masks:
+            # EFP=1 now, so the unsensed exemption can no longer apply: shadows must match.
+            check_masks(masks, reader, health=h_after)
     return host.boot_id
 
 
@@ -1356,7 +1418,24 @@ def process_records(
 
     if not ov.mask_mismatch:
         try:
-            check_masks(assumed, reader)
+            # A passive dry-run in a Goldilocks frame sees unsensed (zero) shadows: skip the
+            # comparison with a journaled note. Real burns never skip it: --execute refuses
+            # unsensed shadows, and after active sense EFP=1 so the exemption cannot apply.
+            masks_compared = check_masks(
+                assumed,
+                reader,
+                health=reader.health(),
+                allow_unsensed=dry_run,
+                show=show,
+            )
+            if not masks_compared:
+                journal.append(
+                    event="mask_check_deferred",
+                    stage=stage,
+                    plan_sha256=plan.content_hash,
+                    reason="option shadows unsensed (DSOV=0, EFP=0, all compared fields read 0)",
+                    dry_run=True,
+                )
         except Exception as exc:
             h_snap, host_snap = _capture_snapshot(reader)
             journal.append(

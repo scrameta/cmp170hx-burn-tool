@@ -77,8 +77,15 @@ python3 -m vfi_burn plan --plan private/plan.json
 # 3. After holding a Goldilocks frame with your glitcher, inspect (passive first):
 sudo python3 -m vfi_burn inspect --plan private/plan.json \
   --bdf 0000:05:00.0 --journal private/session.jsonl
+#    Before SENSE_CTRL the option shadows are UNSENSED and read 0 (the glitch mis-senses the
+#    row 0/1 control fuses: DSOV=0, EFP=0). Passive inspect therefore prints
+#    "Option shadows not sensed yet ..." and defers the identity-mask comparison; identity
+#    still rests on die rows 8..15 and the FF prefix (CMD_READ of rows is unaffected).
+#    `inspect --sense` (or the burn itself) compares every mask AFTER SENSE_CTRL.
 
-# 4. Passive dry-run preview (does NOT run SENSE_CTRL or write fuses):
+# 4. Passive dry-run preview (does NOT run SENSE_CTRL or write fuses). In a pre-SENSE
+#    frame the mask comparison is deferred the same way and journaled as
+#    `mask_check_deferred`; add --sense to compare masks in the dry-run:
 sudo python3 -m vfi_burn burn --plan private/plan.json \
   --bdf 0000:05:00.0 \
   --stage all --journal private/session.jsonl

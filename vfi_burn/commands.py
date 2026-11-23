@@ -341,7 +341,7 @@ def execute_inspect(
                         command="inspect",
                         plan_sha256=p.content_hash,
                     )
-            boot = preflight(p, backend, active_sense=sense)
+            boot = preflight(p, backend, active_sense=sense, show=io.show)
             row, surrounding = scan_slots(p, backend)
             if journal is not None:
                 h_snap, host_snap = _capture_inspect_snapshot(backend)

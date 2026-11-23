@@ -13,6 +13,7 @@ Provides:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 import struct
 
 from .ffrecord import TOTAL_GPC, compute_sm_count
@@ -125,6 +126,10 @@ class SimulatedGA100PCIe(MMIOBus):
       - FUSEWDATA latches only when PLM_F4 == 0xFFFFFFFF
       - CMD_READ latches rows[FUSEADDR] into FUSEDATA
       - CMD_SENSE_CTRL sets EFP=1, SBFE=1, RESENSE_DISABLE=1 while preserving DSOV=0
+      - option shadows listed in ``unsensed_option_regs`` read 0 until a successful
+        CMD_SENSE_CTRL: in a real Goldilocks frame the glitch leaves them unsensed
+        (cmp170hx-8gb-vfi-tools SWEET_SPOT.md "the sentinel trap"); fuse ROWS read via
+        CMD_READ are unaffected
       - CMD_PROGRAM performs OTP 0->1 bitwise OR into rows[FUSEADDR] only when armed
     """
 
@@ -135,8 +140,11 @@ class SimulatedGA100PCIe(MMIOBus):
         registers: dict[int, int] | None = None,
         goldilocks: bool = True,
         lnkcap2: int = 0x06,
+        unsensed_option_regs: Iterable[int] = (),
     ) -> None:
         self.rows: dict[int, int] = {i: 0 for i in range(TOTAL_FUSE_ROWS)}
+        # Stored values are the cold-boot truth; reads return 0 until SENSE_CTRL senses them.
+        self.unsensed: set[int] = {int(a) for a in unsensed_option_regs}
         if rows:
             self.rows.update({int(k): int(v) & 0xFFFFFFFF for k, v in rows.items()})
         self.regs: dict[int, int] = {
@@ -178,6 +186,8 @@ class SimulatedGA100PCIe(MMIOBus):
     def read32(self, offset: int) -> int:
         self._validate_offset(offset)
         self.reads.append(offset)
+        if offset in self.unsensed:
+            return 0
         return self.regs.get(offset, 0)
 
     def write32(self, offset: int, value: int, *, allow_debugctrl: bool = False) -> None:
@@ -225,10 +235,12 @@ class SimulatedGA100PCIe(MMIOBus):
                     self.regs[REG_EFP_STATUS] = 1
                     self.regs[REG_SBFE_SHADOW] = 1
                     self.regs[REG_RESENSE_DISABLE] = 1
+                    self.unsensed.clear()
                     return
                 self.regs[REG_EFP_STATUS] = 1
                 self.regs[REG_SBFE_SHADOW] = 1
                 self.regs[REG_RESENSE_DISABLE] = 1
+                self.unsensed.clear()  # SENSE_CTRL senses the option shadows (DSOV stays 0)
                 return
             if cmd == CMD_PROGRAM:
                 self.program_calls += 1
@@ -298,11 +310,16 @@ class SimulatedGA100Adapter(FuseReader, FuseWriter):
             if health.resense_disable is not None:
                 merged_regs[REG_RESENSE_DISABLE] = health.resense_disable
         eff_lnkcap2 = self._fields.get("LnkCap2", lnkcap2)
+        goldilocks = health is None or health.dsov == 0
+        efp = merged_regs.get(REG_EFP_STATUS, 0 if goldilocks else 1)
+        # A pre-SENSE Goldilocks frame (DSOV=0, EFP=0) has unsensed option shadows.
+        unsensed = set(OPTION_REGS.values()) if goldilocks and efp == 0 else set()
         self.pcie = SimulatedGA100PCIe(
             rows=merged_rows,
             registers=merged_regs,
-            goldilocks=(health is None or health.dsov == 0),
+            goldilocks=goldilocks,
             lnkcap2=eff_lnkcap2,
+            unsensed_option_regs=unsensed,
         )
         self.bus = TracingMMIOBus(self.pcie)
         self.controller = GA100FuseController(self.bus, read_only=False, sleep=lambda _: None)
