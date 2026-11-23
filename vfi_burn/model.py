@@ -199,6 +199,31 @@ class Plan:
         if not isinstance(d, dict):
             raise BurnError("plan root must be a JSON object")
         if d.get("schema_version") != 1:
+            raw_recs = d.get("records")
+            raw_burn = d.get("burn")
+            if (
+                isinstance(raw_recs, list)
+                and raw_recs
+                and isinstance(raw_recs[0], dict)
+                and "encoded" in raw_recs[0]
+                and "row" in raw_recs[0]
+            ):
+                raise BurnError(
+                    "only schema_version=1 is understood — this looks like a ga100-ff-tools plan "
+                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ga100-ff-tools' "
+                    "or menu [1] Setup -> [h]"
+                )
+            if (
+                isinstance(raw_burn, list)
+                and raw_burn
+                and isinstance(raw_burn[0], dict)
+                and "record" in raw_burn[0]
+            ):
+                raise BurnError(
+                    "only schema_version=1 is understood — this looks like a cmp170hx-ffcalc burn plan "
+                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ffcalc' "
+                    "or menu [1] Setup -> [b]"
+                )
             raise BurnError("only schema_version=1 is understood")
 
         card = _req(d, "card", "plan")

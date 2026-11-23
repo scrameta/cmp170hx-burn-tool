@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import json
+import re
+import shlex
 import sys
 
 from .backend import (
@@ -39,9 +41,12 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
+from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
+from .fuses import DIE_ID_ROWS
 from .ga100 import GA100LiveAdapter
-from .model import BurnError, Plan, require_private_file, u32
+from .model import BurnError, Plan, SKU_CMP170HX_8GB, require_private_file, u32
+
+_BDF_INPUT_RE = re.compile(r"^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 
 @dataclass
@@ -93,11 +98,33 @@ class BurnMenu:
         except (EOFError, KeyboardInterrupt):
             return False
 
-    def _load_plan(self) -> Plan:
+    def _validate_plan_for_setup(self, p: Plan) -> None:
+        check_plan(
+            p,
+            allow_unmapped_ff=True,
+            allow_undetermined_ceiling=self.s.overrides.undetermined_ceiling,
+        )
+        try:
+            check_plan(
+                p,
+                allow_unmapped_ff=False,
+                allow_undetermined_ceiling=self.s.overrides.undetermined_ceiling,
+            )
+        except BurnError as exc:
+            self.show(
+                f"NOTE: plan contains opt-in/override-gated record(s) ({exc}); "
+                "burning will require [7] Overrides -> [8] Allow unknown/unmapped FF & missing mask."
+            )
+
+    def _load_plan(self, *, for_review: bool = False) -> Plan:
         if not self.s.plan_path:
             raise BurnError("no plan selected yet — choose [1] Setup to load or import a plan")
         p = Plan.load(self.s.plan_path)
-        check_plan(p)
+        check_plan(
+            p,
+            allow_unmapped_ff=(for_review or self.s.overrides.unmapped_ff),
+            allow_undetermined_ceiling=self.s.overrides.undetermined_ceiling,
+        )
         return p
 
     def _target_label(self) -> str:
@@ -175,7 +202,7 @@ class BurnMenu:
         self.show(f"  Journal   : {self.s.journal_path}" + (f" | Receipt: {self.s.receipt_path}" if self.s.receipt_path else ""))
         self.show(f"  Overrides : {ov_str}")
         self.show("-" * 72)
-        self.show("   [1] Setup / Load Plan, Import ffcalc, Target BDF & Mode")
+        self.show("   [1] Setup / Load Plan, Import ffcalc / ga100-ff-tools, Target BDF & Mode")
         self.show("   [2] Review Plan & Expected Outcome (enabled/disabled, unknown fuses, FF rows)")
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
@@ -238,15 +265,16 @@ class BurnMenu:
             self.show(f"  [e] Select journal path          (current: {self.s.journal_path})")
             self.show(f"  [f] Select test receipt path     (current: {self.s.receipt_path or 'none'})")
             self.show(f"  [g] Toggle Live Execute mode     (current: {'ON' if self.s.execute_live else 'OFF (safe)'})")
+            self.show("  [h] Import ga100-ff-tools plan(s) + dump + defects -> new 0600 plan")
             self.show("  [0] Back to main menu")
-            sub = self.input_fn("Setup [a-g, 0]: ").strip().lower()
+            sub = self.input_fn("Setup [a-h, 0]: ").strip().lower()
             if sub in ("0", "", "b0", "back"):
                 return
             if sub == "a":
                 path = self._ask("Path to mode-0600 plan JSON", self.s.plan_path)
                 if path:
                     p = Plan.load(path)
-                    check_plan(p)
+                    self._validate_plan_for_setup(p)
                     self.s.plan_path = path
                     self.show(f"Loaded valid plan ({len(p.records)} records, sha={p.content_hash[:12]}).")
             elif sub == "b":
@@ -262,7 +290,49 @@ class BurnMenu:
                 )
                 write_private_json(out, plan_dict)
                 loaded = Plan.load(out)
-                check_plan(loaded)
+                self._validate_plan_for_setup(loaded)
+                self.s.plan_path = out
+                self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
+            elif sub == "h":
+                raw_plans = self._ask("ga100-ff-tools plan JSON path(s) (space- or comma-separated)")
+                plan_list = shlex.split(raw_plans.replace(",", " ")) if raw_plans else []
+                if not plan_list:
+                    raise BurnError("at least one ga100-ff-tools plan JSON path is required")
+                dp = self._ask("ga100-ff-tools ff_dump.py JSON path")
+                dfp = self._ask("ga100-ff-tools read_defects.py JSON path")
+                die_src = self._ask(
+                    "Die ID rows 8..15 source (blank if in dump, JSON path, or live PCI BDF)",
+                    self.s.bdf,
+                )
+                out = self._ask("Output mode-0600 plan path", "private/plan.json")
+                base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
+                if not base_sm_s:
+                    raise BurnError("SM ceiling is required; the card cannot supply it")
+                live_die: dict[int, int] | None = None
+                die_path: str | None = None
+                if die_src:
+                    if _BDF_INPUT_RE.match(die_src.strip().lower()):
+                        with GA100LiveAdapter(die_src.strip(), writable=False) as backend:
+                            check_host_readonly_safe(backend.host())
+                            pci = backend.pci_id()
+                            if pci != SKU_CMP170HX_8GB:
+                                raise BurnError(
+                                    f"unexpected PCI ID {pci} at {die_src} (expected {SKU_CMP170HX_8GB})"
+                                )
+                            live_die = {r: backend.die_row(r) for r in DIE_ID_ROWS}
+                    else:
+                        die_path = die_src
+                plan_dict = import_ga100_ff_tools_plan(
+                    plan_list,
+                    dp,
+                    dfp,
+                    base_sm_ceiling=int(base_sm_s, 0),
+                    die_rows=live_die,
+                    die_rows_path=die_path,
+                )
+                write_private_json(out, plan_dict)
+                loaded = Plan.load(out)
+                self._validate_plan_for_setup(loaded)
                 self.s.plan_path = out
                 self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
             elif sub == "c":
@@ -305,7 +375,7 @@ class BurnMenu:
 
     # ------------------------------------------------------------------ [2] Review Plan
     def _menu_review_plan(self) -> None:
-        p = self._load_plan()
+        p = self._load_plan(for_review=True)
         backend = None
         owned = False
         has_target = bool(self.s.fake_path or self.s.bdf or self.s.adapter_spec)
@@ -317,14 +387,19 @@ class BurnMenu:
                 backend, owned = None, False
         try:
             self.show("")
-            for line in format_plan_review(p, reader=backend, override_slot=self.s.overrides.slot):
+            for line in format_plan_review(
+                p,
+                reader=backend,
+                override_slot=self.s.overrides.slot,
+                allow_undetermined_ceiling=self.s.overrides.undetermined_ceiling,
+            ):
                 self.show(line)
         finally:
             self._close_if_owned(backend, owned)
 
     # ------------------------------------------------------------------ [3] Status & Inspect
     def _menu_status_inspect(self) -> None:
-        p = self._load_plan()
+        p = self._load_plan(for_review=True)
         backend, owned = self._open_backend(writable=False)
         try:
             check_host_readonly_safe(backend.host())
@@ -674,7 +749,7 @@ class BurnMenu:
             finally:
                 self._close_if_owned(backend, owned)
         elif pick == "2":
-            p = self._load_plan()
+            p = self._load_plan(for_review=True)
             cold_path = require_private_file(self._ask("Cold snapshot JSON path", "private/cold.json"), "cold snapshot")
             stage = self._ask("Verification stage (test or real)", "real")
             receipt_out = self._ask("Optional receipt output path (blank to skip)", "private/test.receipt" if stage == "test" else "")

@@ -21,6 +21,7 @@ from .commands import (
     execute_burn,
     execute_decode,
     execute_import_ffcalc,
+    execute_import_ga100_ff_tools,
     execute_inspect,
     execute_manual,
     execute_menu,
@@ -178,6 +179,67 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="prepend a proved zero-effect no-op FF test row (default: enabled; disabling requires burn[0] to already be a no-op)",
+    )
+
+    imp_ga_p = sub.add_parser(
+        "import-ga100-ff-tools",
+        help="convert one or more ga100-ff-tools plan JSONs + ff_dump.py + read_defects.py into a mode-0600 vfi_burn plan",
+    )
+    imp_ga_p.add_argument(
+        "--plans",
+        nargs="+",
+        required=True,
+        help="one or more mode-0600 ga100-ff-tools plan JSONs from one ffcard.py derive run "
+        "(e.g. *_plan_0_noop.json *_plan_sm_hbm.json [*_plan_pcie.json *_plan_nvlink.json])",
+    )
+    imp_ga_p.add_argument(
+        "--dump",
+        required=True,
+        help="mode-0600 ga100-ff-tools ff_dump.py JSON (covering rows 222..486+)",
+    )
+    imp_ga_p.add_argument(
+        "--defects",
+        required=True,
+        help="mode-0600 ga100-ff-tools read_defects.py JSON",
+    )
+    imp_ga_p.add_argument("--out", required=True, help="output path for new mode-0600 vfi_burn plan JSON")
+    imp_ga_p.add_argument(
+        "--base-sm",
+        type=int,
+        required=True,
+        help="REQUIRED operator-supplied non-defective SM ceiling for this SKU (e.g. 122); "
+        "the card cannot tell you this",
+    )
+    imp_ga_p.add_argument("--override-sm", type=int, default=None)
+    imp_ga_p.add_argument(
+        "--die-rows-from",
+        default=None,
+        help="mode-0600 JSON supplying Die ID rows 8..15 (vfi_burn snapshot, ff_dump.py --start 8, "
+        "ffcalc dump, or plain {\"8\":...,\"15\":...}); unnecessary if --dump already includes rows 8..15",
+    )
+    imp_ga_p.add_argument(
+        "--bdf",
+        default=None,
+        help="read Die ID rows 8..15 read-only from the live CMP 170HX GPU (e.g. 0000:05:00.0)",
+    )
+    imp_ga_p.add_argument(
+        "--link-cap2-before",
+        type=lambda s: int(s, 0),
+        default=0x06,
+        help="reviewed current PCIe LnkCap2 (default 0x06)",
+    )
+    imp_ga_p.add_argument(
+        "--link-cap2-after",
+        type=lambda s: int(s, 0),
+        default=0x1E,
+        help="expected LnkCap2 after PCIe records burn (default 0x1E); ignored if no PCIe records",
+    )
+    imp_ga_p.add_argument(
+        "--prepend-noop-test",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="auto by default: reuse included 0_noop test record if present, else prepend a proved no-op test row "
+        "(--no-prepend-noop-test refuses unless the first record is already a verified no-op)",
     )
 
     snap_p = sub.add_parser(
@@ -360,6 +422,22 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             out=args.out,
             base_sm=args.base_sm,
             override_sm=args.override_sm,
+            prepend_noop_test=args.prepend_noop_test,
+            link_cap2_before=args.link_cap2_before,
+            link_cap2_after=args.link_cap2_after,
+            io=io,
+        )
+
+    if cmd == "import-ga100-ff-tools":
+        return execute_import_ga100_ff_tools(
+            plans=args.plans,
+            dump=args.dump,
+            defects=args.defects,
+            out=args.out,
+            base_sm=args.base_sm,
+            override_sm=args.override_sm,
+            die_rows_from=args.die_rows_from,
+            bdf=args.bdf,
             prepend_noop_test=args.prepend_noop_test,
             link_cap2_before=args.link_cap2_before,
             link_cap2_after=args.link_cap2_after,

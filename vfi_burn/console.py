@@ -328,10 +328,24 @@ def format_plan_review(
     *,
     reader=None,
     override_slot: int | None = None,
+    allow_undetermined_ceiling: bool = False,
 ) -> list[str]:
     """Build a complete pre-burn plan review: FF rows taken/remaining, enabled/disabled outcome,
     and an audit of unknown, unmapped, or poorly understood fuse changes."""
-    final_masks = check_plan(plan)
+    final_masks = check_plan(
+        plan,
+        allow_unmapped_ff=True,
+        allow_undetermined_ceiling=allow_undetermined_ceiling,
+    )
+    strict_unmapped_note: str | None = None
+    try:
+        check_plan(
+            plan,
+            allow_unmapped_ff=False,
+            allow_undetermined_ceiling=allow_undetermined_ceiling,
+        )
+    except BurnError as exc:
+        strict_unmapped_note = str(exc)
     lines: list[str] = []
 
     # Optional read-only scan of current FF rows if a live or fake reader is attached.
@@ -596,9 +610,13 @@ def format_plan_review(
     # ------------------------------------------------------------------ 5. Unknown / Poorly Understood Fuse Audit
     lines.append("")
     lines.append("=== UNKNOWN / UNMAPPED / POORLY UNDERSTOOD FUSE AUDIT ===")
-    if audit_warnings:
+    if audit_warnings or strict_unmapped_note:
         for w in audit_warnings:
             lines.append(f"  WARNING: {w}")
+        if strict_unmapped_note:
+            lines.append(
+                f"  BURN GATE: strict burn requires --override-unmapped-ff (menu [7] -> [8]): {strict_unmapped_note}"
+            )
     else:
         lines.append(
             "  PASS: All planned changes map to well-understood GA100 fields; "

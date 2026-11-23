@@ -6,6 +6,7 @@ journaling, and execution without touching ``argparse``.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -39,8 +40,9 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan
+from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
 from .fuses import (
+    DIE_ID_ROWS,
     EXPERIMENTAL_BY_ADDR,
     EXPERIMENTAL_BY_NAME,
     decode_experimental_register,
@@ -49,7 +51,7 @@ from .ga100 import GA100LiveAdapter
 from .journal import Journal
 from .menu import BurnMenu, MenuSession
 from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
+from .model import BurnError, Plan, Record, SKU_CMP170HX_8GB, is_poison, require_private_file, u32
 from .sim_pcie import SimulatedGA100Adapter, sim_pcie_from_file
 
 
@@ -224,6 +226,28 @@ def execute_decode(word_raw: str, *, io: CommandIO | None = None) -> int:
     return 0
 
 
+def read_live_die_rows(bdf: str) -> dict[int, int]:
+    """Read Die ID rows 8..15 read-only from a live CMP 170HX GPU."""
+    with GA100LiveAdapter(bdf, writable=False) as backend:
+        check_host_readonly_safe(backend.host())
+        pci = backend.pci_id()
+        if pci != SKU_CMP170HX_8GB:
+            raise BurnError(f"unexpected PCI ID {pci} at {bdf} (expected {SKU_CMP170HX_8GB})")
+        return {r: backend.die_row(r) for r in DIE_ID_ROWS}
+
+
+def _check_imported_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
+    final_masks = check_plan(loaded, allow_unmapped_ff=True)
+    try:
+        check_plan(loaded, allow_unmapped_ff=False)
+    except BurnError as exc:
+        io.show(
+            f"NOTE: plan contains opt-in/override-gated record(s) ({exc}); "
+            "burning will require --override-unmapped-ff (or menu [7] -> [8])."
+        )
+    return final_masks
+
+
 def execute_import_ffcalc(
     *,
     burn_plan: str,
@@ -248,8 +272,45 @@ def execute_import_ffcalc(
     )
     write_private_json(out, plan_dict)
     loaded = Plan.load(out)
-    final_masks = check_plan(loaded)
+    final_masks = _check_imported_plan(loaded, io)
     io.show(f"Imported ffcalc plan to {out} (mode 0600):")
+    _print_plan_summary(loaded, final_masks, io)
+    return 0
+
+
+def execute_import_ga100_ff_tools(
+    *,
+    plans: Sequence[str],
+    dump: str,
+    defects: str,
+    out: str,
+    base_sm: int,
+    override_sm: int | None = None,
+    die_rows_from: str | None = None,
+    bdf: str | None = None,
+    prepend_noop_test: bool | None = None,
+    link_cap2_before: int = 0x06,
+    link_cap2_after: int = 0x1E,
+    io: CommandIO | None = None,
+) -> int:
+    io = io or CommandIO()
+    live_die = read_live_die_rows(bdf) if bdf else None
+    plan_dict = import_ga100_ff_tools_plan(
+        plans,
+        dump,
+        defects,
+        base_sm_ceiling=base_sm,
+        override_sm_ceiling=override_sm,
+        die_rows=live_die,
+        die_rows_path=die_rows_from,
+        prepend_noop_test=prepend_noop_test,
+        link_cap2_before=link_cap2_before,
+        link_cap2_after=link_cap2_after,
+    )
+    write_private_json(out, plan_dict)
+    loaded = Plan.load(out)
+    final_masks = _check_imported_plan(loaded, io)
+    io.show(f"Imported ga100-ff-tools plan to {out} (mode 0600):")
     _print_plan_summary(loaded, final_masks, io)
     return 0
 
@@ -285,7 +346,7 @@ def execute_plan_review(
 ) -> int:
     io = io or CommandIO()
     p = Plan.load(plan_path)
-    check_plan(p)
+    check_plan(p, allow_unmapped_ff=True)
     if target is not None and target.has_target:
         with open_target(target, writable=False) as backend:
             for line in format_plan_review(p, reader=backend):
@@ -308,7 +369,7 @@ def execute_inspect(
 ) -> int:
     io = io or CommandIO()
     p = Plan.load(plan_path)
-    check_plan(p)
+    check_plan(p, allow_unmapped_ff=True)
     with open_target(target, writable=False) as backend:
         for line in format_status_report(p, backend):
             io.show(line)
@@ -405,8 +466,12 @@ def execute_burn(
 ) -> int:
     io = io or CommandIO()
     p = Plan.load(plan_path)
-    check_plan(p)
     ov = overrides or Overrides()
+    check_plan(
+        p,
+        allow_undetermined_ceiling=ov.undetermined_ceiling,
+        allow_unmapped_ff=ov.unmapped_ff,
+    )
     dry_run = not execute
     with open_target(target, writable=execute) as backend:
         if not dry_run:
@@ -459,8 +524,12 @@ def execute_simulate(
     if not target.is_simulated:
         raise BurnError("simulate requires --fake or --sim-pcie")
     p = Plan.load(plan_path)
-    check_plan(p)
     ov = overrides or Overrides()
+    check_plan(
+        p,
+        allow_undetermined_ceiling=ov.undetermined_ceiling,
+        allow_unmapped_ff=ov.unmapped_ff,
+    )
     with open_target(target, writable=False) as backend:
         with Journal(journal_path) as j:
             process_records(
@@ -582,8 +651,13 @@ def execute_manual(
 ) -> int:
     io = io or CommandIO()
     p = Plan.load(plan_path)
-    check_plan(p)
     ov = overrides or Overrides()
+    check_plan(
+        p,
+        allow_manual_debugctrl=ov.allow_manual_debugctrl,
+        allow_undetermined_ceiling=ov.undetermined_ceiling,
+        allow_unmapped_ff=ov.unmapped_ff,
+    )
     want_write = action in ("write-record", "console") and bool(execute) and not target.is_simulated
 
     with open_target(target, writable=want_write) as backend:
@@ -723,7 +797,7 @@ def execute_verify_cold(
 ) -> int:
     io = io or CommandIO()
     p = Plan.load(plan_path)
-    check_plan(p)
+    check_plan(p, allow_unmapped_ff=True)
     cp = require_private_file(cold_path, "cold snapshot")
     try:
         cold_data = json.loads(cp.read_text(encoding="utf-8"))
