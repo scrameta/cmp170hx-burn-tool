@@ -121,7 +121,7 @@ adapter_template.py    # ABC-backed template for custom hardware adapters
 - Mandatory `CMD_READ` read-back + post-write health/host gate + second `CMD_READ`; immediate `HALT_UNVERIFIED` with no retry and no pointer advance on any error
 - Failures strictly before `CMD_PROGRAM` are journaled as `aborted_pre_trigger` (`write_issued=false`), not as a possibly-partial `HALT_UNVERIFIED`
 - `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` are held back from the `attempt` journal entry until the record's outcome is fsynced (Ctrl-C or an SSH drop cannot land mid-program); `FUSEWDATA` is reset to the `0` no-burn latch after every program
-- Any `0xBADxxxxx` read is treated as poison (same test as `cmp170hx-8gb-vfi-tools`)
+- Any `0xBADxxxxx` register read is treated as poison (same test as `cmp170hx-8gb-vfi-tools`). A fuse *row* reading `0xBADxxxxx` is real OTP data (an FF record with block data `0xBAD0..0xBADF`) unless the controller is unhealthy straight after the read or a second read differs; such records are never burned
 - Real-stage `verify-cold` requires `fpf_rows` and fails if any journaled row reads `0` after the cold boot
 
 ### Granular Manual Overrides (No blanket `--force`)

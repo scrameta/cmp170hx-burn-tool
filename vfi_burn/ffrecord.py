@@ -681,10 +681,14 @@ def make_noop_test_record(ff_rows: dict[int, int]) -> dict:
     candidates = [
         b for b in sorted(chain1)
         if fields_in_block(1, b) and (1, b) not in DEVICE_ID_DENIED_BLOCKS
+        # 0xBADx block data is legal OTP but is never burned (Plan.load / program_row refuse
+        # such payloads), so it cannot serve as the no-op test row.
+        and (chain1[b] >> 4) != 0xBAD
     ]
     if not candidates:
         raise BurnError(
-            "cannot derive no-op test record: no existing known chain-1 FF rows in dump"
+            "cannot derive no-op test record: no existing known chain-1 FF rows in dump "
+            "(excluding blocks whose data is 0xBAD0..0xBADF)"
         )
     blk = 7 if 7 in candidates else candidates[0]
     data = chain1[blk]

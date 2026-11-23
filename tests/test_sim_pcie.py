@@ -181,6 +181,10 @@ class TestSimulatedPCIeAndHALTracing(unittest.TestCase):
             write_private_json(snap_path, adapter.to_snapshot_dict())
             reloaded = sim_pcie_from_file(snap_path)
             self.assertEqual(reloaded.fuse_row(222), encode_ff(1, 7, 0x0123))
+            # Pre-SENSE Goldilocks: the option shadow is unsensed (reads 0) but its stored
+            # cold value round-trips and appears once SENSE_CTRL senses it.
+            self.assertEqual(reloaded.field("FBP_DISABLE"), 0)
+            reloaded.active_sense_readonly()
             self.assertEqual(reloaded.field("FBP_DISABLE"), 0x852)
 
 

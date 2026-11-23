@@ -466,7 +466,7 @@ class Harness(unittest.TestCase):
         base = json.loads((ROOT / 'examples/plan.example.json').read_text())
         for label, mutate, regex in [
             ('empty_word', lambda d: d['records'][1].update(word='0x00000000'), 'empty_word'),
-            ('poison_word', lambda d: d['records'][1].update(word='0xBADF1234'), 'poison prefix'),
+            ('poison_word', lambda d: d['records'][1].update(word='0xBADF1234'), '0xBADx block data'),
             ('dup_name', lambda d: d['records'][1].update(name='FAKE_TEST'), 'duplicate record name'),
         ]:
             with self.subTest(case=label):

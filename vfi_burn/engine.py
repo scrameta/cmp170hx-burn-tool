@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 import json
 
 from .backend import Health, Host, MissingWriter
@@ -84,6 +85,12 @@ class Overrides:
 
 
 def _poison(name: str, value: int) -> None:
+    """Refuse a poisoned REGISTER value (FUSECTRL, option shadows, PCIe config, ...).
+
+    Not for fuse-row data: ``FuseReader.fuse_row``/``die_row`` raise on a fuse-unit
+    error themselves, and a returned row value is OTP data, which can legitimately
+    start 0xBADx (an FF record whose block data is 0xBAD0..0xBADF).
+    """
     if is_poison(value):
         raise BurnError(f"{name} poison/fuse-unit error: {hex32(value)}")
 
@@ -184,21 +191,68 @@ def check_host_readonly_safe(host: Host) -> None:
 def check_die_rows(plan: Plan, reader) -> None:
     for i, value in plan.die_rows.items():
         actual = reader.die_row(i)
-        _poison(f"die row {i}", actual)
         if actual != value:
             raise BurnError(
                 f"DIE ID MISMATCH row {i}: expected {hex32(value)}, got {hex32(actual)}"
             )
 
 
-def check_masks(expected_masks: dict[str, int], reader) -> None:
-    for field, expected in expected_masks.items():
+UNSENSED_SHADOWS_NOTE = (
+    "Option shadows not sensed yet (DSOV=0, EFP=0, every compared option register reads 0): "
+    "a Goldilocks frame before SENSE_CTRL. Identity masks are compared after SENSE_CTRL."
+)
+
+
+def option_shadows_unsensed(health: Health | None, readings: dict[str, int]) -> bool:
+    """True only for the documented pre-SENSE Goldilocks signature.
+
+    The glitch mis-senses the row 0/1 control fuses (DSOV=0, EFP=0) and leaves the
+    option shadows unsensed, so they read 0 until SENSE_CTRL re-senses them
+    (cmp170hx-8gb-vfi-tools docs/SWEET_SPOT.md, "the sentinel trap"). CMD_READ of
+    fuse rows is unaffected. A normally booted card has DSOV=1, and a partly sensed
+    frame has some nonzero shadow, so neither matches this and both are compared.
+    """
+    if health is None or health.dsov != 0 or health.efp != 0 or not readings:
+        return False
+    return all(v == 0 for v in readings.values())
+
+
+def check_masks(
+    expected_masks: dict[str, int],
+    reader,
+    *,
+    health: Health | None = None,
+    allow_unsensed: bool = False,
+    show: Callable[[str], None] | None = None,
+) -> bool:
+    """Compare live option shadows with the plan's cold-boot masks.
+
+    Returns True if compared, False if skipped because the shadows are provably
+    unsensed (only when ``allow_unsensed``; read-only/dry-run paths). With
+    ``health`` given and the unsensed signature present but not allowed, refuses
+    with an explicit "run SENSE_CTRL first" error instead of a misleading mismatch.
+    """
+    readings: dict[str, int] = {}
+    for field in expected_masks:
         actual = reader.field(field)
         _poison(f"field {field}", actual)
+        readings[field] = actual
+    if option_shadows_unsensed(health, readings):
+        if not allow_unsensed:
+            raise BurnError(
+                "option shadows are unsensed (DSOV=0, EFP=0, all read 0): SENSE_CTRL has not run "
+                "in this frame, so identity masks cannot be verified and nothing may be burned"
+            )
+        if show is not None:
+            show(UNSENSED_SHADOWS_NOTE)
+        return False
+    for field, expected in expected_masks.items():
+        actual = readings[field]
         if actual != expected:
             raise BurnError(
                 f"IDENTITY MISMATCH {field}: expected {hex32(expected)}, got {hex32(actual)}"
             )
+    return True
 
 
 def preflight(
@@ -210,8 +264,15 @@ def preflight(
     check_die: bool = True,
     expected_masks: dict[str, int] | None = None,
     overrides: Overrides | None = None,
+    show: Callable[[str], None] | None = None,
 ) -> str:
-    """Run fresh hardware/simulator preflight checks and return current boot_id."""
+    """Run fresh hardware/simulator preflight checks and return current boot_id.
+
+    Option-shadow masks are compared AFTER the active sense when one is requested:
+    in a Goldilocks frame they are unsensed (read 0) until SENSE_CTRL. Without an
+    active sense, the documented unsensed signature skips the comparison with a
+    note (read-only preflight); everything else is compared as before.
+    """
     ov = overrides or Overrides()
     host = reader.host()
     check_host(host)
@@ -221,13 +282,16 @@ def preflight(
     check_health(h, plan)
     if check_die:
         check_die_rows(plan, reader)
-    if match_masks and not ov.mask_mismatch:
-        check_masks(expected_masks if expected_masks is not None else plan.expected_masks, reader)
+    masks = expected_masks if expected_masks is not None else plan.expected_masks
+    compare_masks = match_masks and not ov.mask_mismatch
+    if compare_masks and not active_sense:
+        check_masks(masks, reader, health=h, allow_unsensed=True, show=show)
     if active_sense:
         reader.active_sense_readonly()
         # The sense itself may have destroyed this frame: read everything AGAIN and require EFP=1.
+        h_after = reader.health()
         check_health(
-            reader.health(),
+            h_after,
             plan,
             require_efp_one=True,
         )
@@ -235,9 +299,11 @@ def preflight(
         if check_die:
             for i, value in plan.die_rows.items():
                 actual = reader.die_row(i)
-                _poison(f"post-sense die row {i}", actual)
                 if actual != value:
                     raise BurnError(f"die ID changed after active sense: row {i}")
+        if compare_masks:
+            # EFP=1 now, so the unsensed exemption can no longer apply: shadows must match.
+            check_masks(masks, reader, health=h_after)
     return host.boot_id
 
 
@@ -247,18 +313,18 @@ def resolve_fpf_pointer(
     *,
     override_slot: int | None = None,
 ) -> tuple[int, list[tuple[int, int]]]:
-    """Validate poison, contiguity, and bounds on already-read FPF rows and return ``(pointer, nearby)``.
+    """Validate contiguity and bounds on already-read FPF rows and return ``(pointer, nearby)``.
 
-    Requires every row in ``plan.first_row..plan.last_row`` to be present in ``full_rows``.
+    Requires every row in ``plan.first_row..plan.last_row`` to be present in ``full_rows``
+    (row-level fuse-unit errors are raised by ``FuseReader.fuse_row``).
     When ``override_slot`` is provided (after explicit operator confirmation), enforces
-    poison checks, row bounds, and that the chosen slot reads ``plan.empty_word``.
+    row bounds and that the chosen slot reads ``plan.empty_word``.
     """
     a: list[int] = []
     for row_idx in range(plan.first_row, plan.last_row + 1):
         if row_idx not in full_rows:
             raise BurnError(f"FPF row {row_idx} missing from scan result")
         v = full_rows[row_idx]
-        _poison(f"FPF row {row_idx}", v)
         a.append(v)
 
     empty = plan.empty_word
@@ -440,7 +506,10 @@ def reconcile(
             f"{record.name}: payload equals FPF empty_word ({hex32(plan.empty_word)})"
         )
     if is_poison(record.word):
-        raise BurnError(f"{record.name}: payload {hex32(record.word)} matches poison prefix")
+        raise BurnError(
+            f"{record.name}: payload {hex32(record.word)} has 0xBADx block data: deliberately "
+            "not burned (it would read back like a fuse-unit error at the moment of programming)"
+        )
     if is_debugctrl_target(record.target) and not allow_manual_debugctrl:
         raise BurnError("DEBUGCTRL must never be included in an automatic plan")
 
@@ -739,7 +808,6 @@ def detect_plan_progress(
                     next_row=row_idx,
                 )
             word = reader.fuse_row(row_idx)
-            _poison(f"FPF row {row_idx}", word)
             if word == plan.empty_word:
                 if offset == 0:
                     return PlanProgress(
@@ -802,7 +870,6 @@ def detect_plan_progress(
     j_row = _journal_test_row(plan, journal_path)
     if j_row is not None and plan.first_row <= j_row <= plan.last_row:
         w = reader.fuse_row(j_row)
-        _poison(f"FPF row {j_row}", w)
         if w == plan.records[0].word:
             return _match_from(j_row)
 
@@ -820,7 +887,6 @@ def detect_plan_progress(
     pointer = plan.last_row + 1
     for r in range(plan.first_row, plan.last_row + 1):
         w = reader.fuse_row(r)
-        _poison(f"FPF row {r}", w)
         if w == plan.empty_word:
             pointer = r
             break
@@ -913,7 +979,6 @@ def _write_verify_or_halt(
         raise BurnError(f"HALT: row {pointer} may be partially programmed; do NOT retry: {exc}") from exc
     try:
         readback = reader.fuse_row(pointer)
-        _poison(f"row {pointer} readback", readback)
         if readback != record.word:
             raise BurnError(
                 f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
@@ -1356,7 +1421,24 @@ def process_records(
 
     if not ov.mask_mismatch:
         try:
-            check_masks(assumed, reader)
+            # A passive dry-run in a Goldilocks frame sees unsensed (zero) shadows: skip the
+            # comparison with a journaled note. Real burns never skip it: --execute refuses
+            # unsensed shadows, and after active sense EFP=1 so the exemption cannot apply.
+            masks_compared = check_masks(
+                assumed,
+                reader,
+                health=reader.health(),
+                allow_unsensed=dry_run,
+                show=show,
+            )
+            if not masks_compared:
+                journal.append(
+                    event="mask_check_deferred",
+                    stage=stage,
+                    plan_sha256=plan.content_hash,
+                    reason="option shadows unsensed (DSOV=0, EFP=0, all compared fields read 0)",
+                    dry_run=True,
+                )
         except Exception as exc:
             h_snap, host_snap = _capture_snapshot(reader)
             journal.append(
@@ -1524,7 +1606,6 @@ def process_records(
             )
 
         previous = reader.fuse_row(pointer)
-        _poison(f"FPF row {pointer}", previous)
         if previous != plan.empty_word:
             raise BurnError(
                 f"row {pointer} not empty immediately before write "
@@ -1617,7 +1698,6 @@ def process_records(
             check_host(reader.host())
             check_health(reader.health(), plan)
             pre_slot = reader.fuse_row(pointer)
-            _poison(f"pre-trigger FPF row {pointer}", pre_slot)
             if pre_slot != plan.empty_word:
                 raise BurnError(
                     f"row {pointer} changed during confirmation ({hex32(pre_slot)})"

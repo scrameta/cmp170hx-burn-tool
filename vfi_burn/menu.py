@@ -332,7 +332,9 @@ class BurnMenu:
                 self.show(line)
             with Journal(self.s.journal_path) as j:
                 try:
-                    boot = preflight(p, backend, active_sense=False, overrides=self.s.overrides)
+                    boot = preflight(
+                        p, backend, active_sense=False, overrides=self.s.overrides, show=self.show
+                    )
                     row, surrounding = scan_slots(p, backend, override_slot=self.s.overrides.slot)
                     self.show(f"\nPASSIVE INSPECTION OK | boot={boot} | proved next free row={row}")
                     for i, v in surrounding:

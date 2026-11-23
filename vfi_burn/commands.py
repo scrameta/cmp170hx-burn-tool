@@ -341,7 +341,7 @@ def execute_inspect(
                         command="inspect",
                         plan_sha256=p.content_hash,
                     )
-            boot = preflight(p, backend, active_sense=sense)
+            boot = preflight(p, backend, active_sense=sense, show=io.show)
             row, surrounding = scan_slots(p, backend)
             if journal is not None:
                 h_snap, host_snap = _capture_inspect_snapshot(backend)
@@ -662,7 +662,7 @@ def execute_manual(
         if action == "read-row":
             assert row is not None
             value = backend.fuse_row(row)
-            warn = "  [POISON!]" if is_poison(value) else ""
+            warn = "  [0xBADx prefix: returned by the reader as OTP data]" if is_poison(value) else ""
             io.show(f"row {row} = {hex32(value)}{warn}")
             with Journal(journal_path) as j:
                 j.append(event="manual_read_row", row=row, value=hex32(value))
@@ -674,7 +674,7 @@ def execute_manual(
             for row_idx in range(start, end + 1):
                 val = backend.fuse_row(row_idx)
                 values[str(row_idx)] = hex32(val)
-                warn = "  [POISON!]" if is_poison(val) else ""
+                warn = "  [0xBADx prefix: returned by the reader as OTP data]" if is_poison(val) else ""
                 io.show(f"  row {row_idx:4d}: {hex32(val)}{warn}")
             with Journal(journal_path) as j:
                 j.append(event="manual_read_rows", start=start, end=end, values=values)

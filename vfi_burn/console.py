@@ -19,6 +19,7 @@ from .engine import (
     evaluate_health,
     evaluate_host,
     hex32,
+    option_shadows_unsensed,
     process_records,
     resolve_fpf_pointer,
     scan_fpf_rows,
@@ -226,10 +227,8 @@ def format_status_report(plan: Plan, reader) -> list[str]:
     die_bad: list[str] = []
     for idx, expected in sorted(plan.die_rows.items()):
         try:
-            actual = reader.die_row(idx)
-            if is_poison(actual):
-                die_bad.append(f"row {idx}=POISON({hex32(actual)})")
-            elif actual != expected:
+            actual = reader.die_row(idx)  # raises on a fuse-unit error; values are OTP data
+            if actual != expected:
                 die_bad.append(f"row {idx}={hex32(actual)}!=exp({hex32(expected)})")
         except Exception as exc:
             die_bad.append(f"row {idx}=ERR({exc})")
@@ -237,14 +236,29 @@ def format_status_report(plan: Plan, reader) -> list[str]:
         "  Die ID (8-15): MATCH" if not die_bad else "  Die ID (8-15): MISMATCH — " + ", ".join(die_bad)
     )
 
+    mask_readings: dict[str, int] = {}
+    mask_errors: dict[str, str] = {}
+    for field in sorted(plan.expected_masks):
+        try:
+            mask_readings[field] = reader.field(field)
+        except Exception as exc:
+            mask_errors[field] = str(exc)
+    unsensed_masks = not mask_errors and option_shadows_unsensed(health, mask_readings)
     mask_parts: list[str] = []
     for field, expected in sorted(plan.expected_masks.items()):
-        try:
-            actual = reader.field(field)
-            tag = "POISON!" if is_poison(actual) else ("OK" if actual == expected else f"exp {hex32(expected)}")
-            mask_parts.append(f"{field}={hex32(actual)} ({tag})")
-        except Exception as exc:
-            mask_parts.append(f"{field}=ERR({exc})")
+        if field in mask_errors:
+            mask_parts.append(f"{field}=ERR({mask_errors[field]})")
+            continue
+        actual = mask_readings[field]
+        if is_poison(actual):
+            tag = "POISON!"
+        elif unsensed_masks:
+            tag = f"unsensed pre-SENSE; cold exp {hex32(expected)}"
+        elif actual == expected:
+            tag = "OK"
+        else:
+            tag = f"exp {hex32(expected)}"
+        mask_parts.append(f"{field}={hex32(actual)} ({tag})")
     if mask_parts:
         lines.append("  Masks        : " + "; ".join(mask_parts))
 
@@ -329,9 +343,7 @@ def format_plan_review(
         try:
             rows: dict[int, int] = {}
             for row_idx in range(plan.first_row, plan.last_row + 1):
-                val = reader.fuse_row(row_idx)
-                if is_poison(val):
-                    raise BurnError(f"row {row_idx} reads poisoned ({hex32(val)})")
+                val = reader.fuse_row(row_idx)  # raises on a fuse-unit error
                 rows[row_idx] = val
             current_rows = rows
             try:
@@ -932,7 +944,7 @@ class ManualConsole:
             "  staged / clear                 Show or discard the currently staged write\n"
             "  sense                          Run opt-in active_sense_readonly() and diff health\n"
             "  scan                           Double-scan FPF window and prove next free row\n"
-            "  row <index>                    Read one FPF row (with poison & diff check)\n"
+            "  row <index>                    Read one FPF row (with diff vs console start)\n"
             "  rows <start> <end>             Read a range of FPF rows (max 128)\n"
             "  reg <addr|NAME>                Read aligned 32-bit MMIO reg (e.g. FUSECTRL, FUSE_ECC_EN)\n"
             "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, FUSE_ECC_EN)\n"
@@ -1175,11 +1187,7 @@ class ManualConsole:
             for i in range(self.plan.first_row, self.plan.last_row + 1)
         ]
         for idx, val in rows:
-            tag = (
-                "POISON!"
-                if is_poison(val)
-                else ("EMPTY" if val == self.plan.empty_word else "WRITTEN")
-            )
+            tag = "EMPTY" if val == self.plan.empty_word else "WRITTEN"
             self.show(f"  row {idx:4d}: {hex32(val)}  [{tag}]")
         try:
             pointer, _ = resolve_fpf_pointer(self.plan, dict(rows), override_slot=self.overrides.slot)
@@ -1194,7 +1202,7 @@ class ManualConsole:
             raise BurnError("usage: row <index>")
         idx = int(args[0], 0)
         val = self.reader.fuse_row(idx)
-        warn = "  [POISON!]" if is_poison(val) else ""
+        warn = "  [0xBADx prefix: returned by the reader as OTP data]" if is_poison(val) else ""
         changed = ""
         if idx in self.baseline_rows and self.baseline_rows[idx] != val:
             changed = f"  (was {hex32(self.baseline_rows[idx])})"
@@ -1211,7 +1219,7 @@ class ManualConsole:
         for idx in range(start, end + 1):
             val = self.reader.fuse_row(idx)
             values[str(idx)] = hex32(val)
-            warn = "  [POISON!]" if is_poison(val) else ""
+            warn = "  [0xBADx prefix: returned by the reader as OTP data]" if is_poison(val) else ""
             self.show(f"  row {idx:4d}: {hex32(val)}{warn}")
         self.journal.append(event="manual_read_rows", start=start, end=end, values=values)
 

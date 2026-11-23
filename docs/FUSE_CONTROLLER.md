@@ -193,6 +193,13 @@ Key properties of this machine:
   If `EFP == 0` but `RESENSE_DISABLE == 1`, the window is unusable: cold boot and re-glitch.
 - **`SENSE_CTRL` sets `SBFE = 1` as a side effect**, which blocks FF programming. That is why `arm()`
   must run *after* sense and write `SBFE_SHADOW = 0`.
+- **Option shadows are unsensed until `SENSE_CTRL`.** The glitch mis-senses the row 0/1 control
+  fuses (giving `DSOV = 0`, `EFP = 0`) and leaves the option shadows (`OPT_*_DISABLE`, their status
+  aliases and the `*_DEFECTIVE` registers) unsensed: they read `0`. `SENSE_CTRL` senses them
+  (`EFP` 0→1, `DSOV` stays 0). Fuse *rows* read with `CMD_READ` are unaffected. vfi_burn therefore
+  compares identity masks only after sense; before it, the exact signature `DSOV = 0`, `EFP = 0`,
+  every compared shadow `0` defers the comparison in read-only/dry-run paths and refuses `--execute`.
+  Anything else (a partly sensed frame, `EFP = 1`) is compared and must match.
 - **A closed `PLM_f8` is never re-opened in software.** `CTRL_WR_SECURE` exists, but writing it would
   hide the "frame too deep" signal, so `arm()` refuses instead.
 - **The armed state persists across records in the same window.** Multiple records (test row, then
@@ -266,7 +273,8 @@ sequenceDiagram
     Ctl->>FUSE: read FUSEADDR (verify latched == row)
     Ctl->>FUSE: write FUSECTRL = 1 (CMD_READ)
     Ctl->>FUSE: poll FUSECTRL until idle
-    FUSE-->>Ctl: read FUSEDATA (refuse if 0xBADxxxxx)
+    FUSE-->>Ctl: read FUSEDATA
+    Ctl->>FUSE: if FUSEDATA is 0xBADxxxxx: re-check FUSECTRL (idle, not poisoned),\nPMC_BOOT_0, and re-read FUSEDATA (must be equal); else error
     Ctl->>FUSE: if idle, write FUSEADDR = original
 ```
 
@@ -503,7 +511,8 @@ and [`AlignedMMIO.write32()`](../vfi_burn/mmio.py) separately refuses `DEBUGCTRL
 | Observation | Where detected | Meaning | Action |
 |---|---|---|---|
 | `FUSECTRL == 0xFFFFFFFF` | `_check_fusectrl_first()` | BAR0 dead / decode off / link lost | Stop; park or power cycle |
-| Any `0xBADxxxxx` (`0xBADF...` poison, `0xBAD0...` fuse unit) | every read path | PRI error / fuse unit not answering | Stop all BAR0 reads; cold boot. Before a write: too deep. After a write: assess the row on cold boot |
+| Any `0xBADxxxxx` register read (`0xBADF...` poison, `0xBAD0...` fuse unit) | every register read path | PRI error / fuse unit not answering | Stop all BAR0 reads; cold boot. Before a write: too deep. After a write: assess the row on cold boot |
+| `FUSEDATA` (a fuse row) reads `0xBADxxxxx` | `read_row()` | Either a fuse-unit error **or real OTP data**: an FF record's top 16 bits are its block data, so data `0xBAD0..0xBADF` reads this way | Error (stop, as above) only if `FUSECTRL` is poisoned / not idle or `PMC_BOOT_0` is bad straight after the read, or a second `FUSEDATA` read differs. Otherwise it is row data. Records with `0xBADx` data are still never *burned* (`Plan.load`, `program_row`) |
 | `PLM_f8` bit 0 clear (`0xFFFFFFFE`) | health gate, `sense_ctrl()`, `arm()` | Host access revoked: frame too deep | Abort; re-hunt shallower / slower slew, never deeper |
 | `DSOV` back to `1` | health gate, after sense | Goldilocks window lost | Cold boot, re-glitch |
 | `EFP == 0` but `RESENSE_DISABLE == 1` | `sense_ctrl()` | Sense already consumed, programming not enabled | Cold boot, re-glitch |
