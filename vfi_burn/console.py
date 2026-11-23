@@ -19,6 +19,7 @@ from .engine import (
     evaluate_health,
     evaluate_host,
     hex32,
+    option_shadows_unsensed,
     process_records,
     resolve_fpf_pointer,
     scan_fpf_rows,
@@ -235,14 +236,29 @@ def format_status_report(plan: Plan, reader) -> list[str]:
         "  Die ID (8-15): MATCH" if not die_bad else "  Die ID (8-15): MISMATCH — " + ", ".join(die_bad)
     )
 
+    mask_readings: dict[str, int] = {}
+    mask_errors: dict[str, str] = {}
+    for field in sorted(plan.expected_masks):
+        try:
+            mask_readings[field] = reader.field(field)
+        except Exception as exc:
+            mask_errors[field] = str(exc)
+    unsensed_masks = not mask_errors and option_shadows_unsensed(health, mask_readings)
     mask_parts: list[str] = []
     for field, expected in sorted(plan.expected_masks.items()):
-        try:
-            actual = reader.field(field)
-            tag = "POISON!" if is_poison(actual) else ("OK" if actual == expected else f"exp {hex32(expected)}")
-            mask_parts.append(f"{field}={hex32(actual)} ({tag})")
-        except Exception as exc:
-            mask_parts.append(f"{field}=ERR({exc})")
+        if field in mask_errors:
+            mask_parts.append(f"{field}=ERR({mask_errors[field]})")
+            continue
+        actual = mask_readings[field]
+        if is_poison(actual):
+            tag = "POISON!"
+        elif unsensed_masks:
+            tag = f"unsensed pre-SENSE; cold exp {hex32(expected)}"
+        elif actual == expected:
+            tag = "OK"
+        else:
+            tag = f"exp {hex32(expected)}"
+        mask_parts.append(f"{field}={hex32(actual)} ({tag})")
     if mask_parts:
         lines.append("  Masks        : " + "; ".join(mask_parts))
 
@@ -928,7 +944,7 @@ class ManualConsole:
             "  staged / clear                 Show or discard the currently staged write\n"
             "  sense                          Run opt-in active_sense_readonly() and diff health\n"
             "  scan                           Double-scan FPF window and prove next free row\n"
-            "  row <index>                    Read one FPF row (with poison & diff check)\n"
+            "  row <index>                    Read one FPF row (with diff vs console start)\n"
             "  rows <start> <end>             Read a range of FPF rows (max 128)\n"
             "  reg <addr|NAME>                Read aligned 32-bit MMIO reg (e.g. FUSECTRL, FUSE_ECC_EN)\n"
             "  field <name>                   Read named decoded field (e.g. GPC_DISABLE, FUSE_ECC_EN)\n"

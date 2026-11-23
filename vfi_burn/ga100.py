@@ -470,7 +470,10 @@ class GA100FuseController(FuseControllerHAL):
                     f"(chain {ff.chain} block {ff.block})"
                 )
             if is_poison(word):
-                raise BurnError(f"REFUSED: payload 0x{word:08x} matches poison prefix")
+                raise BurnError(
+                    f"REFUSED: payload 0x{word:08x} has 0xBADx block data: deliberately not burned "
+                    "(it would read back like a fuse-unit error at the moment of programming)"
+                )
 
             self.arm()
 

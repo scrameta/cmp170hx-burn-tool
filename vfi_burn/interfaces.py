@@ -121,7 +121,7 @@ class FuseReader(ABC):
 
     @abstractmethod
     def die_row(self, index: int) -> int:
-        """Read one cold Die ID row (8..15)."""
+        """Read one cold Die ID row (8..15); must raise BurnError on a fuse-unit error."""
 
     @abstractmethod
     def field(self, name: str) -> int:
@@ -129,7 +129,7 @@ class FuseReader(ABC):
 
     @abstractmethod
     def fuse_row(self, index: int) -> int:
-        """Read one 32-bit fuse row via CMD_READ."""
+        """Read one 32-bit fuse row via CMD_READ; must raise BurnError on a fuse-unit error."""
 
     @abstractmethod
     def register(self, address: int) -> int:

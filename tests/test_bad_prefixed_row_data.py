@@ -50,14 +50,16 @@ class FaultAfterRead(SimulatedGA100PCIe):
             return 0xBADF5040 if self.fault != "unstable" else v
         if self.fault == "fusectrl" and offset == REG_FUSECTRL and self.fusedata_reads:
             return 0xBADF5040  # poll_idle saw idle; the error shows only after FUSEDATA
+        if self.fault == "not_idle" and offset == REG_FUSECTRL and self.fusedata_reads:
+            return 0xE0050001  # non-idle state=5/cmd=1 after FUSEDATA read
         if self.fault == "pmc" and offset == REG_PMC_BOOT_0:
             return 0xFFFFFFFF
         return v
 
 
 class TestReadRow(unittest.TestCase):
-    def ctl(self, mmio):
-        return GA100FuseController(mmio, read_only=True, sleep=lambda _: None)
+    def ctl(self, mmio, *, read_only: bool = True):
+        return GA100FuseController(mmio, read_only=read_only, sleep=lambda _: None)
 
     def test_bad_prefixed_row_is_returned_as_data_when_controller_healthy(self):
         mmio = SimulatedGA100PCIe(rows={222: BAD_DATA_WORD})
@@ -66,6 +68,11 @@ class TestReadRow(unittest.TestCase):
     def test_fusectrl_poisoned_after_read_is_an_error(self):
         mmio = FaultAfterRead(fault="fusectrl", rows={222: 0x12345678})
         with self.assertRaisesRegex(BurnError, "FUSECTRL poisoned"):
+            self.ctl(mmio).read_row(222)
+
+    def test_fusectrl_not_idle_after_read_is_an_error(self):
+        mmio = FaultAfterRead(fault="not_idle", rows={222: 0x12345678})
+        with self.assertRaisesRegex(BurnError, "FUSECTRL not idle"):
             self.ctl(mmio).read_row(222)
 
     def test_unstable_fusedata_is_an_error(self):
@@ -77,6 +84,11 @@ class TestReadRow(unittest.TestCase):
         mmio = FaultAfterRead(fault="pmc", rows={222: 0x12345678})
         with self.assertRaisesRegex(BurnError, "PMC_BOOT_0"):
             self.ctl(mmio).read_row(222)
+
+    def test_program_row_refuses_bad_prefixed_payload_with_clear_reason(self):
+        mmio = SimulatedGA100PCIe()
+        with self.assertRaisesRegex(BurnError, "0xBADx block data"):
+            self.ctl(mmio, read_only=False).program_row(224, BAD_DATA_WORD)
 
 
 class TestNoopPicker(unittest.TestCase):

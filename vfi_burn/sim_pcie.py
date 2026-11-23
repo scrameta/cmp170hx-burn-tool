@@ -311,9 +311,10 @@ class SimulatedGA100Adapter(FuseReader, FuseWriter):
                 merged_regs[REG_RESENSE_DISABLE] = health.resense_disable
         eff_lnkcap2 = self._fields.get("LnkCap2", lnkcap2)
         goldilocks = health is None or health.dsov == 0
+        dsov = merged_regs.get(REG_DSOV_STATUS, 0 if goldilocks else 1)
         efp = merged_regs.get(REG_EFP_STATUS, 0 if goldilocks else 1)
         # A pre-SENSE Goldilocks frame (DSOV=0, EFP=0) has unsensed option shadows.
-        unsensed = set(OPTION_REGS.values()) if goldilocks and efp == 0 else set()
+        unsensed = set(OPTION_REGS.values()) if dsov == 0 and efp == 0 else set()
         self.pcie = SimulatedGA100PCIe(
             rows=merged_rows,
             registers=merged_regs,

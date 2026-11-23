@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from vfi_burn.console import format_status_report
 from vfi_burn.engine import (
     Journal,
     Overrides,
@@ -22,7 +23,7 @@ from vfi_burn.engine import (
     process_records,
 )
 from vfi_burn.ffrecord import FF_ROW_MAX, FF_ROW_MIN, encode_ff
-from vfi_burn.fuses import DIE_ID_ROWS, OPTION_REGS
+from vfi_burn.fuses import DIE_ID_ROWS, OPTION_REGS, REG_DSOV_STATUS
 from vfi_burn.ga100 import CMD_PROGRAM
 from vfi_burn.interfaces import Health
 from vfi_burn.model import BurnError, Plan, canonical_ff_prefix_sha256
@@ -170,6 +171,34 @@ class TestGoldilocksPreflight(unittest.TestCase):
         self.assertNotIn("mask_check_deferred", events)
         self.assertEqual(ad.pcie.program_calls, 2)
         self.assertEqual(ad.field("FBP_DISABLE"), 0x852, "shadows are sensed after SENSE_CTRL")
+
+    def test_status_report_labels_unsensed_shadows_before_sense_and_ok_after_sense(self):
+        ad = self.goldilocks()
+        plan = self.plan()
+        before = "\n".join(format_status_report(plan, ad))
+        self.assertIn("FBP_DISABLE=0x00000000 (unsensed pre-SENSE; cold exp 0x00000852)", before)
+        self.assertNotIn("(exp 0x00000852)", before)
+
+        # Partly sensed frame must NOT get the unsensed label.
+        ad.pcie.unsensed.discard(OPTION_REGS["FBPA_DISABLE"])
+        partly = "\n".join(format_status_report(plan, ad))
+        self.assertIn("FBP_DISABLE=0x00000000 (exp 0x00000852)", partly)
+        self.assertNotIn("unsensed pre-SENSE", partly)
+
+        # After SENSE_CTRL, shadows match cold expectations as OK.
+        ad.active_sense_readonly()
+        after = "\n".join(format_status_report(plan, ad))
+        self.assertIn("FBP_DISABLE=0x00000852 (OK)", after)
+        self.assertNotIn("unsensed pre-SENSE", after)
+
+    def test_sim_adapter_explicit_dsov_one_register_does_not_mark_shadows_unsensed(self):
+        ad = SimulatedGA100Adapter(
+            die=self.die,
+            rows=dict(BASE_ROWS),
+            fields=dict(EXPECTED),
+            registers={REG_DSOV_STATUS: 1},
+        )
+        self.assertEqual(ad.field("FBP_DISABLE"), 0x852)
 
 
 if __name__ == "__main__":

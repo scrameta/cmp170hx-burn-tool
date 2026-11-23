@@ -313,11 +313,12 @@ def resolve_fpf_pointer(
     *,
     override_slot: int | None = None,
 ) -> tuple[int, list[tuple[int, int]]]:
-    """Validate poison, contiguity, and bounds on already-read FPF rows and return ``(pointer, nearby)``.
+    """Validate contiguity and bounds on already-read FPF rows and return ``(pointer, nearby)``.
 
-    Requires every row in ``plan.first_row..plan.last_row`` to be present in ``full_rows``.
+    Requires every row in ``plan.first_row..plan.last_row`` to be present in ``full_rows``
+    (row-level fuse-unit errors are raised by ``FuseReader.fuse_row``).
     When ``override_slot`` is provided (after explicit operator confirmation), enforces
-    poison checks, row bounds, and that the chosen slot reads ``plan.empty_word``.
+    row bounds and that the chosen slot reads ``plan.empty_word``.
     """
     a: list[int] = []
     for row_idx in range(plan.first_row, plan.last_row + 1):
@@ -505,7 +506,10 @@ def reconcile(
             f"{record.name}: payload equals FPF empty_word ({hex32(plan.empty_word)})"
         )
     if is_poison(record.word):
-        raise BurnError(f"{record.name}: payload {hex32(record.word)} matches poison prefix")
+        raise BurnError(
+            f"{record.name}: payload {hex32(record.word)} has 0xBADx block data: deliberately "
+            "not burned (it would read back like a fuse-unit error at the moment of programming)"
+        )
     if is_debugctrl_target(record.target) and not allow_manual_debugctrl:
         raise BurnError("DEBUGCTRL must never be included in an automatic plan")
 
