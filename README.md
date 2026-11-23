@@ -19,7 +19,7 @@
 
 It sits downstream of:
 - your **voltage-glitch / hold setup** (e.g. [`dalzyu/pico-ga100vfi`](https://github.com/dalzyu/pico-ga100vfi), [`darkmaniac7/cmp170hx-8gb-vfi-tools`](https://github.com/darkmaniac7/cmp170hx-8gb-vfi-tools)) — `vfi_burn` never glitches, dips NVVDD, or pulses `PEX_RST`;
-- your **offline floorplan / fuse planner** (e.g. [`sayhellotojungle/cmp170hx-ffcalc`](https://github.com/sayhellotojungle/cmp170hx-ffcalc), [`kprinssu/ga100-ff-tools`](https://github.com/kprinssu/ga100-ff-tools)) — `vfi_burn` can directly import `cmp170hx-ffcalc` plans and independently decode/verify every FF word.
+- your **offline floorplan / fuse planner** (e.g. [`sayhellotojungle/cmp170hx-ffcalc`](https://github.com/sayhellotojungle/cmp170hx-ffcalc), [`kprinssu/ga100-ff-tools`](https://github.com/kprinssu/ga100-ff-tools)) — `vfi_burn` can directly import both `cmp170hx-ffcalc` (`import-ffcalc`) and `ga100-ff-tools` (`import-ga100-ff-tools`) plans and independently decode/verify every FF word.
 
 Design philosophy:
 - **Passive dry-run by default**: `vfi_burn burn` performs passive preflight and slot proving without firing active sense or programming fuses unless you explicitly opt in (`--sense` / `--execute`).

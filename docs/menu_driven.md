@@ -42,7 +42,7 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 
 | Option | Action |
 |---|---|
-| `[1]` | Setup / import `cmp170hx-ffcalc` plan |
+| `[1]` | Setup / load plan / import `cmp170hx-ffcalc` (`[b]`) or `ga100-ff-tools` (`[h]`) plan |
 | `[2]` | Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit) |
 | `[3]` | Live Status & Passive Inspection |
 | `[4]` | Active Sense (`SENSE_CTRL`) |
