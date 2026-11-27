@@ -812,6 +812,131 @@ class TestPCIGPUDiscoveryAndPicker(unittest.TestCase):
         self.assertEqual(rc2, 1)
         self.assertIn("Detected PCI GPUs:", "\n".join(shown2))
 
+    def test_10gb_2082_label_and_lnkcap_wording(self):
+        from vfi_burn.ga100 import DiscoveredGPU, format_gpu_entry
+
+        g10 = DiscoveredGPU(
+            bdf="0000:03:00.0",
+            pci_id="10de:2082",
+            subsystem_id="10de:1557",
+            pci_class="0x030200",
+            name="NVIDIA CMP 170HX 10GB (GA100)",
+            driver="nvidia",
+            bar0_bytes=16 * 1024**2,
+            bar1_bytes=32 * 1024**3,
+            current_link_speed="16.0 GT/s PCIe",
+            current_link_width="4",
+            max_link_speed="2.5 GT/s PCIe",
+            max_link_width="4",
+            is_cmp170hx=False,
+        )
+        text = "\n".join(format_gpu_entry(g10, index=2))
+        self.assertIn("CMP 170HX 10GB (GA100)", text)
+        self.assertIn("[10GB SKU — tool targets 8GB 10de:20c2]", text)
+        self.assertIn("PCIe x4 @ 16.0 GT/s (LnkCap 2.5 GT/s)", text)
+
+    def test_unload_gpu_drivers_order_pcistub_bind_enable_and_busy_hint(self):
+        import struct
+        from vfi_burn.ga100 import ensure_gpu_detached_interactive, unload_gpu_drivers
+
+        bus_root = self.root / "pci_bus"
+        (bus_root / "drivers" / "pci-stub").mkdir(parents=True)
+        drivers_probe = bus_root / "drivers_probe"
+        drivers_probe.write_text("")
+
+        # Prepare a synthetic CMP 170HX bound to nvidia with COMMAND bit 1 OFF (simulating post-unload)
+        dev = self.sysfs / "0000:05:00.0"
+        (dev / "driver").unlink()
+        nv_drv = self.drivers / "nvidia"
+        nv_drv.mkdir(exist_ok=True)
+        (nv_drv / "unbind").write_text("")
+        (dev / "driver").symlink_to(nv_drv)
+        (dev / "driver_override").write_text("")
+        (dev / "enable").write_text("0\n")
+        cfg = bytearray(256)
+        struct.pack_into("<HHH", cfg, 0, 0x10DE, 0x20C2, 0x0000)  # memory decode OFF
+        (dev / "config").write_bytes(bytes(cfg))
+
+        mods = self.root / "proc_mods_nv"
+        mods.write_text(
+            "nvidia_uvm 1234 0 - Live 0x0\n"
+            "nvidia_drm 1234 0 - Live 0x0\n"
+            "nvidia_modeset 1234 1 nvidia_drm, Live 0x0\n"
+            "nvidia 1234 2 nvidia_modeset,nvidia_uvm, Live 0x0\n"
+        )
+
+        # 1) Declining interactive prompt leaves modules untouched and runs zero commands
+        cmds_declined: list[list[str]] = []
+        ok = ensure_gpu_detached_interactive(
+            "0000:05:00.0",
+            input_fn=lambda _p: "n",
+            show=lambda _s: None,
+            sysfs_root=self.sysfs,
+            pci_bus_root=bus_root,
+            proc_modules_path=mods,
+            runner=lambda cmd: (cmds_declined.append(cmd), (0, "", ""))[1],
+            check_root=False,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(cmds_declined, [])
+
+        # 2) Confirming unloads in reverse-dependency order, binds pci-stub, and enables BAR0 decode
+        cmds_run: list[list[str]] = []
+
+        def _fake_runner(cmd: list[str]):
+            cmds_run.append(cmd)
+            if cmd[:2] == ["modprobe", "-r"]:
+                # Remove that module line from synthetic /proc/modules
+                remaining = [
+                    ln for ln in mods.read_text().splitlines()
+                    if not ln.startswith(cmd[2] + " ")
+                ]
+                mods.write_text("\n".join(remaining) + ("\n" if remaining else ""))
+            return 0, "", ""
+
+        ok2 = ensure_gpu_detached_interactive(
+            "0000:05:00.0",
+            input_fn=lambda _p: "y",
+            show=lambda _s: None,
+            sysfs_root=self.sysfs,
+            pci_bus_root=bus_root,
+            proc_modules_path=mods,
+            runner=_fake_runner,
+            check_root=False,
+        )
+        self.assertTrue(ok2)
+        self.assertEqual(
+            cmds_run[:4],
+            [
+                ["modprobe", "-r", "nvidia_drm"],
+                ["modprobe", "-r", "nvidia_modeset"],
+                ["modprobe", "-r", "nvidia_uvm"],
+                ["modprobe", "-r", "nvidia"],
+            ],
+        )
+        self.assertEqual((dev / "driver_override").read_text().strip(), "pci-stub")
+        self.assertEqual(drivers_probe.read_text().strip(), "0000:05:00.0")
+        self.assertEqual((dev / "enable").read_text().strip(), "1")
+
+        # 3) When modprobe -r fails because nvidia-persistenced holds /dev/nvidiactl, report PID + hint
+        mods.write_text("nvidia 1234 1 - Live 0x0\n")
+        fake_proc = self.root / "fake_proc"
+        p_fd = fake_proc / "4321" / "fd"
+        p_fd.mkdir(parents=True)
+        (fake_proc / "4321" / "comm").write_text("nvidia-persistenced\n")
+        (p_fd / "3").symlink_to("/dev/nvidiactl")
+        with self.assertRaisesRegex(BurnError, r"(?s)pid 4321 \(nvidia-persistenced\).*systemctl stop nvidia-persistenced"):
+            unload_gpu_drivers(
+                "0000:05:00.0",
+                show=lambda _s: None,
+                runner=lambda _cmd: (1, "", "modprobe: FATAL: Module nvidia is in use."),
+                sysfs_root=self.sysfs,
+                pci_bus_root=bus_root,
+                proc_modules_path=mods,
+                proc_root=fake_proc,
+                check_root=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

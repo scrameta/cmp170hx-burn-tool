@@ -28,8 +28,11 @@ from .ga100 import (
     GA100FuseController,
     GA100LiveAdapter,
     discover_pci_gpus,
+    ensure_gpu_detached_interactive,
     format_gpu_entry,
+    inspect_gpu_driver_blockers,
     prompt_select_gpu_bdf,
+    unload_gpu_drivers,
 )
 from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, MMIOBus, MMIOReadBus
 from .menu import BurnMenu, MenuSession

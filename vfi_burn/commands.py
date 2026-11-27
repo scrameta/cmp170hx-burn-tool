@@ -45,7 +45,7 @@ from .fuses import (
     EXPERIMENTAL_BY_NAME,
     decode_experimental_register,
 )
-from .ga100 import GA100LiveAdapter, prompt_select_gpu_bdf
+from .ga100 import GA100LiveAdapter, ensure_gpu_detached_interactive, prompt_select_gpu_bdf
 from .journal import Journal
 from .menu import BurnMenu, MenuSession
 from .menuconfig import run_menuconfig
@@ -264,6 +264,16 @@ def execute_configure(
             io.show("No GPU selected; cancelled.")
             return 1
         target = replace(target, bdf=picked)
+
+    if target.bdf and not target.is_simulated:
+        if not ensure_gpu_detached_interactive(
+            target.bdf,
+            input_fn=io.input_fn,
+            show=io.show,
+            sysfs_root=sysfs_root,
+        ):
+            io.show("Cancelled — nvidia/nouveau must be unloaded before reading BAR0.")
+            return 1
 
     with open_target(target, writable=False) as backend:
         check_host_readonly_safe(backend.host())

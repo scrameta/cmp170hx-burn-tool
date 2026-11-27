@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
 import time
 
 from .ffrecord import (
@@ -652,7 +653,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         self._bdf_lock = BDFLock(self.bdf, lock_dir=lock_dir)
         try:
             # Verify PCI config memory decode is on before mapping BAR0.
-            cfg = self._read_pci_config()
+            try:
+                cfg = self._read_pci_config()
+            except PermissionError as exc:
+                raise BurnError(
+                    f"root privileges are required to read PCI config ({self._sysfs / 'config'}) — re-run with sudo"
+                ) from exc
             if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
                 raise BurnError("PCI config space reads 0xFFFFFFFF (link down); park/power-cycle card")
             cmd = struct.unpack_from("<H", cfg, 4)[0]
@@ -663,7 +669,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
                 )
 
             res0 = self._sysfs / "resource0"
-            self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
+            try:
+                self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
+            except PermissionError as exc:
+                raise BurnError(
+                    f"root privileges are required to access PCI BAR0 ({res0}) — re-run with sudo"
+                ) from exc
             self._mm = mmap.mmap(
                 self._fd, BAR0_MAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
             )
@@ -916,7 +927,7 @@ _DEFAULT_PCI_IDS_PATHS: tuple[str, ...] = (
 
 _KNOWN_PCI_GPU_NAMES: dict[str, str] = {
     "10de:20c2": "NVIDIA CMP 170HX 8GB (GA100)",
-    "10de:2082": "NVIDIA CMP 170HX (GA100)",
+    "10de:2082": "NVIDIA CMP 170HX 10GB (GA100)",
     "10de:20b0": "NVIDIA A100 SXM4 40GB",
     "10de:20b2": "NVIDIA A100 SXM4 80GB",
     "10de:20b5": "NVIDIA A100 PCIe 80GB",
@@ -929,6 +940,7 @@ _KNOWN_PCI_GPU_NAMES: dict[str, str] = {
     "10de:2684": "NVIDIA GeForce RTX 4090",
     "10de:2330": "NVIDIA H100 SXM5 80GB",
     "10de:2331": "NVIDIA H100 PCIe 80GB",
+    "8086:e20b": "Intel Arc B580 (Battlemage)",
 }
 
 
@@ -1277,7 +1289,12 @@ def format_gpu_entry(gpu: DiscoveredGPU, *, index: int | None = None, current: b
     prefix = f"  [{index:2d}]" if index is not None else "  "
     cur_mark = "*" if current else " "
     sub_str = f"  sub={gpu.subsystem_id}" if gpu.subsystem_id else ""
-    tag = "" if gpu.is_cmp170hx else "  [not CMP 170HX]"
+    if gpu.is_cmp170hx:
+        tag = ""
+    elif gpu.pci_id == "10de:2082":
+        tag = "  [10GB SKU — tool targets 8GB 10de:20c2]"
+    else:
+        tag = "  [not CMP 170HX 8GB]"
     line1 = f"{prefix}{cur_mark}{gpu.bdf}  {gpu.pci_id}  {gpu.name}{sub_str}{tag}"
 
     details: list[str] = []
@@ -1296,10 +1313,10 @@ def format_gpu_entry(gpu: DiscoveredGPU, *, index: int | None = None, current: b
     if gpu.current_link_width and cur_spd:
         link = f"PCIe x{gpu.current_link_width} @ {cur_spd}"
         if max_spd and max_spd != cur_spd:
-            link += f" (max {max_spd})"
+            link += f" (LnkCap {max_spd})"
         details.append(link)
     elif gpu.max_link_width and max_spd:
-        details.append(f"PCIe max x{gpu.max_link_width} @ {max_spd}")
+        details.append(f"PCIe LnkCap x{gpu.max_link_width} @ {max_spd}")
 
     details.append(f"drv={gpu.driver}")
     if gpu.fuse_state:
@@ -1355,4 +1372,249 @@ def prompt_select_gpu_bdf(
             show(f"Selection {idx} outside 1..{len(gpus)}.")
             continue
         return normalize_bdf(raw)
+
+
+# ---------------------------------------------------------------------------
+# Safe host driver unload / pci-stub bind / BAR0 memory-decode enable helper
+# ---------------------------------------------------------------------------
+
+_NVIDIA_UNLOAD_ORDER: tuple[str, ...] = (
+    "nvidia_drm",
+    "nvidia_modeset",
+    "nvidia_uvm",
+    "nvidia_peermem",
+    "nvidia",
+    "nouveau",
+)
+
+
+def _loaded_forbidden_modules(proc_modules_path: Path = Path("/proc/modules")) -> list[str]:
+    """Return loaded ``nvidia*`` / ``nouveau`` modules in safe reverse-dependency unload order."""
+    loaded: set[str] = set()
+    try:
+        text = proc_modules_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        if name == "nvidia" or name.startswith("nvidia_") or name == "nouveau":
+            loaded.add(name)
+    ordered = [m for m in _NVIDIA_UNLOAD_ORDER if m in loaded]
+    # Any additional nvidia_* modules not in the standard list come before core 'nvidia'.
+    extras = sorted(m for m in loaded if m not in ordered)
+    if extras:
+        if "nvidia" in ordered:
+            idx = ordered.index("nvidia")
+            ordered = ordered[:idx] + extras + ordered[idx:]
+        else:
+            ordered = extras + ordered
+    return ordered
+
+
+def inspect_gpu_driver_blockers(
+    bdf: str,
+    *,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    proc_modules_path: Path = Path("/proc/modules"),
+) -> tuple[str | None, list[str]]:
+    """Return ``(bound_driver, loaded_forbidden_modules)`` for ``bdf`` without opening BAR0."""
+    norm = normalize_bdf(bdf)
+    dev_dir = Path(sysfs_root) / norm
+    drv_link = dev_dir / "driver"
+    bound = drv_link.resolve().name if drv_link.exists() else None
+    loaded = _loaded_forbidden_modules(proc_modules_path)
+    return bound, loaded
+
+
+def find_nvidia_open_processes(proc_root: Path = Path("/proc")) -> list[tuple[int, str, str]]:
+    """Find processes holding open ``/dev/nvidia*`` handles via ``/proc/<pid>/fd`` (zero subprocesses)."""
+    holders: list[tuple[int, str, str]] = []
+    if not proc_root.is_dir():
+        return holders
+    seen: set[tuple[int, str]] = set()
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return holders
+    for pdir in entries:
+        if not pdir.name.isdigit():
+            continue
+        pid = int(pdir.name)
+        fd_dir = pdir / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        comm = _read_sysfs_text(pdir / "comm") or f"pid-{pid}"
+        for fd_link in fds:
+            try:
+                target = os.readlink(fd_link)
+            except OSError:
+                continue
+            if target.startswith("/dev/nvidia"):
+                key = (pid, target)
+                if key not in seen:
+                    seen.add(key)
+                    holders.append((pid, comm, target))
+    holders.sort(key=lambda item: (item[0], item[2]))
+    return holders
+
+
+def unload_gpu_drivers(
+    bdf: str,
+    *,
+    show=print,
+    runner=None,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    pci_bus_root: str | Path = "/sys/bus/pci",
+    proc_modules_path: Path = Path("/proc/modules"),
+    proc_root: Path = Path("/proc"),
+    check_root: bool = True,
+) -> None:
+    """Unload ``nvidia`` / ``nouveau`` kernel modules, bind ``bdf`` to ``pci-stub``, and
+    re-enable PCI memory decode (``COMMAND`` bit 1) so BAR0 is safely readable.
+
+    Never kills user processes automatically; if a module is in use, lists the exact PIDs
+    holding ``/dev/nvidia*`` so the operator can stop them cleanly.
+    """
+    norm = normalize_bdf(bdf)
+    if check_root and os.geteuid() != 0:
+        raise BurnError(
+            "root privileges are required to unload nvidia/nouveau drivers — re-run with sudo"
+        )
+
+    def _default_run(cmd: list[str]) -> tuple[int, str, str]:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    run = runner or _default_run
+
+    # 1. Unload loaded nvidia*/nouveau kernel modules in reverse-dependency order.
+    loaded = _loaded_forbidden_modules(proc_modules_path)
+    for mod in loaded:
+        show(f"  Running: modprobe -r {mod}")
+        rc, _out, err = run(["modprobe", "-r", mod])
+        if rc != 0:
+            holders = find_nvidia_open_processes(proc_root)
+            detail_lines = [f"failed to unload kernel module '{mod}' (exit {rc}): {err or 'in use'}"]
+            if holders:
+                detail_lines.append("Processes currently holding /dev/nvidia*:")
+                seen_comms: set[str] = set()
+                for pid, comm, dev in holders[:12]:
+                    detail_lines.append(f"  - pid {pid} ({comm}): {dev}")
+                    seen_comms.add(comm)
+                if "nvidia-persiste" in seen_comms or "nvidia-persistenced" in seen_comms:
+                    detail_lines.append("Hint: stop nvidia-persistenced first: sudo systemctl stop nvidia-persistenced")
+            else:
+                detail_lines.append(
+                    "Hint: stop any display manager / container / nvidia-persistenced using NVIDIA GPUs, then retry."
+                )
+            raise BurnError("\n".join(detail_lines))
+
+    still_loaded = _loaded_forbidden_modules(proc_modules_path)
+    if still_loaded:
+        raise BurnError(
+            f"nvidia/nouveau modules are still loaded after modprobe -r: {', '.join(still_loaded)}"
+        )
+
+    # 2. Ensure target BDF is unbound from any forbidden driver and bound to pci-stub (best effort).
+    dev_dir = Path(sysfs_root) / norm
+    if dev_dir.is_dir():
+        drv_link = dev_dir / "driver"
+        bound = drv_link.resolve().name if drv_link.exists() else None
+        if bound not in (None, "pci-stub"):
+            unbind_path = drv_link / "unbind"
+            if unbind_path.exists():
+                show(f"  Unbinding {norm} from {bound} ...")
+                unbind_path.write_text(f"{norm}\n", encoding="ascii")
+
+        # Try loading pci_stub and surgically binding only this BDF via driver_override + drivers_probe.
+        run(["modprobe", "pci_stub"])
+        bus_root = Path(pci_bus_root)
+        pci_stub_dir = bus_root / "drivers" / "pci-stub"
+        drv_override = dev_dir / "driver_override"
+        drivers_probe = bus_root / "drivers_probe"
+        if pci_stub_dir.is_dir() and drv_override.exists() and drivers_probe.exists():
+            try:
+                drv_override.write_text("pci-stub\n", encoding="ascii")
+                drivers_probe.write_text(f"{norm}\n", encoding="ascii")
+                show(f"  Bound {norm} to pci-stub.")
+            except OSError as exc:
+                show(f"  NOTE: could not bind {norm} to pci-stub ({exc}); leaving unbound.")
+
+        # 3. Unloading nvidia often clears PCI COMMAND bit 1 (Memory Space Enable); re-enable if off.
+        cfg_path = dev_dir / "config"
+        enable_path = dev_dir / "enable"
+        try:
+            with cfg_path.open("rb") as f:
+                cfg = f.read(6)
+            if len(cfg) >= 6:
+                cmd_val = struct.unpack_from("<H", cfg, 4)[0]
+                if (cmd_val & 0x0002) == 0 and enable_path.exists():
+                    show(f"  PCI memory decode is off (COMMAND=0x{cmd_val:04x}); enabling {norm} ...")
+                    enable_path.write_text("1\n", encoding="ascii")
+        except OSError:
+            pass
+
+
+def ensure_gpu_detached_interactive(
+    bdf: str,
+    *,
+    input_fn=input,
+    show=print,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    pci_bus_root: str | Path = "/sys/bus/pci",
+    proc_modules_path: Path = Path("/proc/modules"),
+    proc_root: Path = Path("/proc"),
+    runner=None,
+    check_root: bool = True,
+) -> bool:
+    """Check if ``nvidia``/``nouveau`` blocks safe BAR0 access on ``bdf`` and, if so, offer to
+    unload the driver cleanly after explicit operator confirmation.
+
+    Returns ``True`` when the host is clear to proceed, or ``False`` if the operator declined.
+    """
+    norm = normalize_bdf(bdf)
+    bound, loaded = inspect_gpu_driver_blockers(
+        norm, sysfs_root=sysfs_root, proc_modules_path=proc_modules_path
+    )
+    forbidden_bound = bound not in (None, "pci-stub")
+    if not forbidden_bound and not loaded:
+        return True
+
+    show(f"\nGPU {norm} cannot be accessed safely while nvidia/nouveau is active:")
+    if forbidden_bound:
+        show(f"  - Bound driver   : {bound}")
+    if loaded:
+        show(f"  - Loaded modules : {', '.join(loaded)}")
+    if check_root and os.geteuid() != 0:
+        raise BurnError(
+            "root privileges are required to unload nvidia/nouveau and access PCI BAR0 — re-run with sudo"
+        )
+
+    show("  NOTE: This unloads nvidia/nouveau for ALL NVIDIA GPUs on this host until reloaded or rebooted.")
+    try:
+        ans = input_fn(
+            f"Unload nvidia/nouveau now, bind {norm} to pci-stub, and enable BAR0 decode? [y/N]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans not in ("y", "yes"):
+        return False
+
+    unload_gpu_drivers(
+        norm,
+        show=show,
+        runner=runner,
+        sysfs_root=sysfs_root,
+        pci_bus_root=pci_bus_root,
+        proc_modules_path=proc_modules_path,
+        proc_root=proc_root,
+        check_root=check_root,
+    )
+    return True
+
 

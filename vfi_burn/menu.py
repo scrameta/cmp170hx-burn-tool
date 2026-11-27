@@ -40,7 +40,7 @@ from .engine import (
     verify_cold_snapshot,
 )
 from .ffrecord import decode_ff, fields_in_block
-from .ga100 import GA100LiveAdapter, prompt_select_gpu_bdf
+from .ga100 import GA100LiveAdapter, ensure_gpu_detached_interactive, prompt_select_gpu_bdf
 from .menuconfig import run_menuconfig
 from .model import BurnError, Plan, require_private_file, u32
 from .planner import build_plan_from_config, capture_card_snapshot
@@ -268,6 +268,16 @@ class BurnMenu:
             self.s.bdf = bdf
             self.s.execute_live = False
 
+        if self.s.bdf and not self.s.fake_path and not self.s.adapter_spec:
+            if not ensure_gpu_detached_interactive(
+                self.s.bdf,
+                input_fn=self.input_fn,
+                show=self.show,
+                sysfs_root=self._sysfs_root,
+            ):
+                self.show("Cancelled — nvidia/nouveau must be unloaded before reading BAR0.")
+                return
+
         backend, owned = self._open_backend(writable=False)
         try:
             check_host_readonly_safe(backend.host())
@@ -310,8 +320,9 @@ class BurnMenu:
             self.show(f"  [e] Select journal path          (current: {self.s.journal_path})")
             self.show(f"  [f] Select test receipt path     (current: {self.s.receipt_path or 'none'})")
             self.show(f"  [g] Toggle Live Execute mode     (current: {'ON' if self.s.execute_live else 'OFF (safe)'})")
+            self.show("  [h] Unload nvidia/nouveau driver & bind live GPU to pci-stub")
             self.show("  [0] Back to main menu")
-            sub = self.input_fn("Setup [a-g, 0]: ").strip().lower()
+            sub = self.input_fn("Setup [a-h, 0]: ").strip().lower()
             if sub in ("0", "", "b0", "back"):
                 return
             if sub == "a":
@@ -368,6 +379,26 @@ class BurnMenu:
                         self.show("Live Execute mode ENABLED.")
                     else:
                         self.show("Kept Live Execute mode OFF.")
+            elif sub == "h":
+                bdf = self.s.bdf or prompt_select_gpu_bdf(
+                    current_bdf=None,
+                    input_fn=self.input_fn,
+                    show=self.show,
+                    sysfs_root=self._sysfs_root,
+                )
+                if not bdf:
+                    self.show("No GPU selected.")
+                else:
+                    self.s.bdf = bdf
+                    if ensure_gpu_detached_interactive(
+                        bdf,
+                        input_fn=self.input_fn,
+                        show=self.show,
+                        sysfs_root=self._sysfs_root,
+                    ):
+                        self.show(f"Host is clear for BAR0 access on {bdf}.")
+                    else:
+                        self.show("Driver unload cancelled.")
 
     # ------------------------------------------------------------------ [2] Review Plan
     def _menu_review_plan(self) -> None:
