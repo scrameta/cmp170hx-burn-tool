@@ -60,10 +60,12 @@ class CardSnapshot:
     current_fields: dict[str, int]
     next_free_row: int
     lnkcap2: int = 0x06
+    ff_last_row: int = FF_ROW_MAX
+    iff_record: int = 0
 
     @property
     def free_row_count(self) -> int:
-        return FF_ROW_MAX - self.next_free_row + 1
+        return self.ff_last_row - self.next_free_row + 1
 
     def gpc_defective(self, gpc: int) -> bool:
         return bool((self.defect_masks.get("GPC_DISABLE", 0) >> gpc) & 1)
@@ -138,6 +140,8 @@ def snapshot_from_raw_state(
     defect_masks: dict[str, int],
     shadow_masks: dict[str, int] | None = None,
     lnkcap2: int = 0x06,
+    ff_last_row: int | None = None,
+    iff_record: int = 0,
 ) -> CardSnapshot:
     """Validate raw card readout dicts and construct a ``CardSnapshot``."""
     pci = str(pci_id).strip().lower()
@@ -148,31 +152,61 @@ def snapshot_from_raw_state(
     missing_die = [r for r in DIE_ID_ROWS if r not in die_rows]
     if missing_die:
         raise BurnError(f"missing Die ID rows {missing_die}")
-    missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
+
+    eff_last_row = FF_ROW_MAX if ff_last_row is None else int(ff_last_row)
+    iff_start = int(iff_record) & 0xFFFF
+    if ff_last_row is None and iff_record != 0 and FF_ROW_MIN < iff_start <= 512:
+        eff_last_row = min(FF_ROW_MAX, iff_start - 1)
+    if not (FF_ROW_MIN < eff_last_row <= FF_ROW_MAX):
+        raise BurnError(f"invalid ff_last_row {eff_last_row} (must be in {FF_ROW_MIN + 1}..{FF_ROW_MAX})")
+
+    missing_ff = [r for r in range(FF_ROW_MIN, eff_last_row + 1) if r not in ff_rows]
     if missing_ff:
         raise BurnError(
-            f"FF row readout incomplete (missing {len(missing_ff)} rows, e.g. {missing_ff[:5]})"
+            f"FF row readout incomplete across {FF_ROW_MIN}..{eff_last_row} "
+            f"(missing {len(missing_ff)} rows, e.g. {missing_ff[:5]})"
         )
-    region = [ff_rows[r] for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)]
+    region = [ff_rows[r] for r in range(FF_ROW_MIN, eff_last_row + 1)]
     first_free_idx = next((i for i, v in enumerate(region) if v == FF_EMPTY_WORD), None)
     if first_free_idx is None:
-        raise BurnError("FF region (rows 222..486) is completely full")
+        raise BurnError(f"FF region (rows {FF_ROW_MIN}..{eff_last_row}) is completely full")
     if any(v != FF_EMPTY_WORD for v in region[first_free_idx:]):
-        raise BurnError("FF rows are non-contiguous; cannot safely derive an append plan")
+        runs: list[list[int]] = []
+        for off, val in enumerate(region):
+            if val != FF_EMPTY_WORD:
+                r_idx = FF_ROW_MIN + off
+                if runs and r_idx == runs[-1][1] + 1:
+                    runs[-1][1] = r_idx
+                else:
+                    runs.append([r_idx, r_idx])
+        run_str = ", ".join(f"{a}..{b}" if a != b else str(a) for a, b in runs)
+        iff_note = f" (IFF_RECORD=0x{iff_record:08x})" if iff_record else ""
+        raise BurnError(
+            f"FF rows in {FF_ROW_MIN}..{eff_last_row} are non-contiguous "
+            f"(non-zero runs: {run_str}{iff_note}); cannot safely derive an append plan"
+        )
     next_free_row = FF_ROW_MIN + first_free_idx
     for r in range(FF_ROW_MIN, next_free_row):
         if (ff_rows[r] >> 5) & 1:
             raise BurnError(f"FF row {r} (0x{ff_rows[r]:08x}) has IFF bit 5 set")
 
-    blocks = replay_ff_rows(ff_rows)
+    scoped_ff_rows = {r: int(ff_rows[r]) & 0xFFFFFFFF for r in range(FF_ROW_MIN, eff_last_row + 1)}
+    blocks = replay_ff_rows(scoped_ff_rows)
     decoded = decode_all_fields(blocks)
 
     if shadow_masks is not None:
         for ff_key, sh_val in shadow_masks.items():
             if ff_key in FFCALC_KEY_TO_FIELD and ff_key in decoded and sh_val != decoded[ff_key]:
+                iff_hint = (
+                    f" — note: this card has persistent IFF records (IFF_RECORD=0x{iff_record:08x}, "
+                    f"rows {iff_start}..{(iff_record >> 16) & 0xFFFF}) which can override fuse shadows "
+                    "at boot after FF replay"
+                    if iff_record and iff_start <= FF_ROW_MAX
+                    else " (was the card modified without a cold boot, or is the FF-only model invalid here?)"
+                )
                 raise BurnError(
-                    f"fused shadow {ff_key}=0x{sh_val:x} disagrees with FF replay 0x{decoded[ff_key]:x} "
-                    "(was the card modified without a cold boot, or is the FF-only model invalid here?)"
+                    f"fused shadow {ff_key}=0x{sh_val:x} disagrees with FF replay 0x{decoded[ff_key]:x}"
+                    f"{iff_hint}"
                 )
 
     current_masks = {
@@ -183,13 +217,15 @@ def snapshot_from_raw_state(
     return CardSnapshot(
         pci_id=pci,
         die_rows={r: int(die_rows[r]) & 0xFFFFFFFF for r in DIE_ID_ROWS},
-        ff_rows={r: int(ff_rows[r]) & 0xFFFFFFFF for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)},
+        ff_rows=scoped_ff_rows,
         current_masks=current_masks,
         defect_masks={k: int(v) & 0xFFFFFFFF for k, v in defect_masks.items()},
         current_blocks=blocks,
         current_fields=decoded,
         next_free_row=next_free_row,
         lnkcap2=int(lnkcap2) & 0xFFFFFFFF,
+        ff_last_row=eff_last_row,
+        iff_record=int(iff_record) & 0xFFFFFFFF,
     )
 
 
@@ -205,6 +241,8 @@ def capture_card_snapshot(backend, *, label: str = "GPU") -> CardSnapshot:
             defect_masks=state["defect_masks"],
             shadow_masks=state["shadow_masks"],
             lnkcap2=state["lnkcap2"],
+            ff_last_row=state.get("ff_last_row"),
+            iff_record=state.get("iff_record", 0),
         )
     except BurnError:
         # Let genuine hardware/unsensed/poison errors propagate immediately.
@@ -641,6 +679,7 @@ def build_plan_from_config(
         defect_masks=card.defect_masks,
         planned_items=items,
         pci_id=card.pci_id,
+        ff_last_row=card.ff_last_row,
         base_sm_ceiling=max(card.max_healthy_sm_count(), 1),
         prepend_noop_test=True,
         link_cap2_before=card.lnkcap2,

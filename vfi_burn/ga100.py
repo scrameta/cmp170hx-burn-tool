@@ -880,8 +880,26 @@ def read_ga100_card_state(
             "[4] Active Sense (SENSE_CTRL) first so EFP=1."
         )
 
+    iff_record = 0
+    try:
+        raw_iff = backend.register(REG_IFF_RECORD)
+        if raw_iff == 0xFFFFFFFF or is_poison(raw_iff):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{raw_iff:08x} from IFF_RECORD (0x{REG_IFF_RECORD:08x})"
+            )
+        iff_record = raw_iff
+    except BurnError:
+        raise
+    except Exception:
+        iff_record = 0
+
+    ff_last_row = FF_ROW_MAX
+    iff_start = iff_record & 0xFFFF
+    if iff_record != 0 and FF_ROW_MIN < iff_start <= 512:
+        ff_last_row = min(FF_ROW_MAX, iff_start - 1)
+
     die_rows = {r: backend.die_row(r) for r in DIE_ID_ROWS}
-    ff_rows = {r: backend.fuse_row(r) for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)}
+    ff_rows = {r: backend.fuse_row(r) for r in range(FF_ROW_MIN, ff_last_row + 1)}
 
     defect_masks: dict[str, int] = {}
     for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
@@ -919,6 +937,8 @@ def read_ga100_card_state(
         "pci_id": pci,
         "die_rows": die_rows,
         "ff_rows": ff_rows,
+        "ff_last_row": ff_last_row,
+        "iff_record": iff_record,
         "defect_masks": defect_masks,
         "shadow_masks": shadow_masks,
         "lnkcap2": lnkcap2,

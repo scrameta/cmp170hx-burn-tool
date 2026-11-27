@@ -263,6 +263,42 @@ class TestCardStateReadout(unittest.TestCase):
         with self.assertRaisesRegex(BurnError, "unexpected PCI ID"):
             read_ga100_card_state(adapter2, label="wrong-pci")
 
+    def test_iff_record_caps_ff_last_row_below_486_and_diagnoses_iff_shadow_override(self):
+        from vfi_burn.fuses import REG_IFF_RECORD
+        from vfi_burn.model import SKU_CMP170HX_10GB
+
+        # Simulate a 10GB card whose persistent IFF table starts at row 468 (IFF_RECORD=0x01fb01d4),
+        # with non-zero IFF data occupying rows 468..486.
+        state = _synthetic_card_state(tpc_defs={1: 0x03})
+        state["pci_id"] = SKU_CMP170HX_10GB
+        for r in range(468, 487):
+            state["ff_rows"][r] = 0x0820043D  # non-zero IFF word (bit 5 set)
+
+        adapter = _build_sim_adapter(state, goldilocks=False)
+        adapter.pcie.regs[REG_IFF_RECORD] = 0x01FB01D4  # low16=468, hi16=507
+
+        card = capture_card_snapshot(adapter, label="10gb-iff468")
+        self.assertEqual(card.ff_last_row, 467)
+        self.assertEqual(card.iff_record, 0x01FB01D4)
+        self.assertEqual(card.free_row_count, 467 - card.next_free_row + 1)
+
+        cfg = UnlockConfig.from_card(card)
+        cfg.set_nvlink(True)
+        plan_dict = build_plan_from_config(card, cfg)
+        self.assertEqual(plan_dict["fpf"]["last_row"], 467)
+        self.assertEqual(plan_dict["card"]["pci_id"], SKU_CMP170HX_10GB)
+
+        # If persistent IFF overrides a shadow register so it disagrees with FF replay, report IFF clearly
+        adapter.pcie.regs[FUSES_BY_KEY["gpc_disable"].fused_addr] ^= 0x1
+        with self.assertRaisesRegex(BurnError, r"persistent IFF records.*0x01fb01d4.*rows 468\.\.507"):
+            capture_card_snapshot(adapter, label="10gb-iff-override")
+
+        # Genuine gap inside 222..467 still refuses and lists exact non-zero runs
+        state_gap = _synthetic_card_state()
+        state_gap["ff_rows"][350] = encode_ff(1, 23, 0x0FE8)
+        with self.assertRaisesRegex(BurnError, r"non-contiguous.*non-zero runs:.*350"):
+            snapshot_from_raw_state(**state_gap)
+
 
 class TestUnlockAndLockPlanner(unittest.TestCase):
     def setUp(self):

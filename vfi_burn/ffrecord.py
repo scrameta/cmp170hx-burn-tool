@@ -718,6 +718,7 @@ def build_vfi_plan_from_records(
     defect_masks: dict[str, int],
     planned_items: Sequence[dict],
     pci_id: str = SKU_CMP170HX_8GB,
+    ff_last_row: int = FF_ROW_MAX,
     base_sm_ceiling: int | None = None,
     override_sm_ceiling: int | None = None,
     prepend_noop_test: bool = True,
@@ -737,6 +738,10 @@ def build_vfi_plan_from_records(
         raise BurnError(
             f"{source_name}: unsupported PCI ID {pci!r} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
         )
+    if isinstance(ff_last_row, bool) or not (FF_ROW_MIN < ff_last_row <= FF_ROW_MAX):
+        raise BurnError(
+            f"{source_name}: ff_last_row={ff_last_row!r} must lie in {FF_ROW_MIN + 1}..{FF_ROW_MAX}"
+        )
     if base_sm_ceiling is None:
         gpc_def = defect_masks.get("GPC_DISABLE", 0)
         tpc_defs = [defect_masks.get(f"TPC_GPC{i}_DISABLE", 0) for i in range(TOTAL_GPC)]
@@ -748,21 +753,23 @@ def build_vfi_plan_from_records(
         raise BurnError(f"{source_name}: missing die ID rows {missing_die}")
     die_rows = {str(r): f"0x{die_rows_int[r]:08x}" for r in DIE_ID_ROWS}
 
-    # Row occupancy must be fully known across 222..486.
-    missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
+    # Row occupancy must be fully known across FF_ROW_MIN..ff_last_row (below IFF_RECORD).
+    total_slots = ff_last_row - FF_ROW_MIN + 1
+    missing_ff = [r for r in range(FF_ROW_MIN, ff_last_row + 1) if r not in ff_rows]
     if missing_ff:
         raise BurnError(
-            f"{source_name}: card dump covers only {FF_ROW_MAX - FF_ROW_MIN + 1 - len(missing_ff)} of "
-            f"{FF_ROW_MAX - FF_ROW_MIN + 1} FF rows (missing e.g. {missing_ff[:5]}); "
+            f"{source_name}: card dump covers only {total_slots - len(missing_ff)} of "
+            f"{total_slots} FF rows ({FF_ROW_MIN}..{ff_last_row}, missing e.g. {missing_ff[:5]}); "
             "an unread row would look free"
         )
-    region = [ff_rows[r] for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)]
+    region = [ff_rows[r] for r in range(FF_ROW_MIN, ff_last_row + 1)]
     first_free_idx = next((i for i, v in enumerate(region) if v == FF_EMPTY_WORD), None)
     if first_free_idx is None:
-        raise BurnError(f"{source_name}: FF region is full")
+        raise BurnError(f"{source_name}: FF region ({FF_ROW_MIN}..{ff_last_row}) is full")
     if any(v != FF_EMPTY_WORD for v in region[first_free_idx:]):
         raise BurnError(
-            f"{source_name}: FF rows are non-contiguous; vfi_burn's free-slot proof would refuse"
+            f"{source_name}: FF rows in {FF_ROW_MIN}..{ff_last_row} are non-contiguous; "
+            "vfi_burn's free-slot proof would refuse"
         )
     baseline_next_row = FF_ROW_MIN + first_free_idx
     next_row = baseline_next_row
@@ -807,8 +814,8 @@ def build_vfi_plan_from_records(
         verify_noop_test_record(first_word, base_blocks)
         first_record_as_test = True
 
-    if planned_items and (next_row + len(planned_items) - 1) > FF_ROW_MAX:
-        raise BurnError("plan does not fit in the remaining FF rows")
+    if planned_items and (next_row + len(planned_items) - 1) > ff_last_row:
+        raise BurnError(f"plan does not fit in the remaining FF rows (up to {ff_last_row})")
 
     for idx, item in enumerate(planned_items):
         replay_slot = baseline_next_row + len(vfi_records)
@@ -979,7 +986,7 @@ def build_vfi_plan_from_records(
             },
             "fpf": {
                 "first_row": FF_ROW_MIN,
-                "last_row": FF_ROW_MAX,
+                "last_row": ff_last_row,
                 "empty_word": f"0x{FF_EMPTY_WORD:08x}",
                 "expected_next_row": baseline_next_row,
                 "baseline_ff_rows": {str(r): f"0x{w:08x}" for r, w in sorted(baseline_ff_prefix.items())},
