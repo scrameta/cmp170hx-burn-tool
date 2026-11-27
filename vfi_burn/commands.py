@@ -45,7 +45,7 @@ from .fuses import (
     EXPERIMENTAL_BY_NAME,
     decode_experimental_register,
 )
-from .ga100 import GA100LiveAdapter
+from .ga100 import GA100LiveAdapter, prompt_select_gpu_bdf
 from .journal import Journal
 from .menu import BurnMenu, MenuSession
 from .menuconfig import run_menuconfig
@@ -248,10 +248,23 @@ def execute_configure(
     nvlink: bool | None = None,
     use_curses: bool | None = None,
     io: CommandIO | None = None,
+    sysfs_root: str = "/sys/bus/pci/devices",
 ) -> int:
     """Capture live/simulated card state read-only and build a mode-0600 vfi_burn plan
     interactively (kernel menuconfig) or non-interactively via explicit unlock flags."""
     io = io or CommandIO()
+    if not target.has_target:
+        picked = prompt_select_gpu_bdf(
+            current_bdf=None,
+            input_fn=io.input_fn,
+            show=io.show,
+            sysfs_root=sysfs_root,
+        )
+        if not picked:
+            io.show("No GPU selected; cancelled.")
+            return 1
+        target = replace(target, bdf=picked)
+
     with open_target(target, writable=False) as backend:
         check_host_readonly_safe(backend.host())
         label = target.bdf or target.adapter or target.sim_pcie or target.fake or "GPU"

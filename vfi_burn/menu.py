@@ -40,7 +40,7 @@ from .engine import (
     verify_cold_snapshot,
 )
 from .ffrecord import decode_ff, fields_in_block
-from .ga100 import GA100LiveAdapter
+from .ga100 import GA100LiveAdapter, prompt_select_gpu_bdf
 from .menuconfig import run_menuconfig
 from .model import BurnError, Plan, require_private_file, u32
 from .planner import build_plan_from_config, capture_card_snapshot
@@ -68,12 +68,14 @@ class BurnMenu:
         input_fn=None,
         show=None,
         check_tty: bool = True,
+        sysfs_root: str | Path = "/sys/bus/pci/devices",
     ) -> None:
         self.s = session or MenuSession()
         self._custom_io = (input_fn is not None) or (show is not None)
         self.input_fn = input_fn if input_fn is not None else (lambda prompt="": input(prompt))
         self.show = show if show is not None else (lambda *args, **kwargs: print(*args, **kwargs))
         self.check_tty = check_tty
+        self._sysfs_root = sysfs_root
         self._cached_fake = None  # keeps fake state across menu actions in simulation mode
 
     def _ask(self, prompt: str, default: str | None = None) -> str:
@@ -254,9 +256,15 @@ class BurnMenu:
 
     def _configure_unlocks_interactive(self) -> None:
         if not (self.s.bdf or self.s.fake_path or self.s.adapter_spec):
-            bdf = self._ask("CMP 170HX PCI BDF to read card state (e.g. 0000:05:00.0)")
+            bdf = prompt_select_gpu_bdf(
+                current_bdf=None,
+                input_fn=self.input_fn,
+                show=self.show,
+                sysfs_root=self._sysfs_root,
+            )
             if not bdf:
-                raise BurnError("select a live GPU (--bdf) or fake snapshot first")
+                self.show("No GPU selected; cancelled.")
+                return
             self.s.bdf = bdf
             self.s.execute_live = False
 
@@ -316,13 +324,21 @@ class BurnMenu:
                     self.s.plan_path = path
                     self.show(f"Loaded valid plan ({len(p.records)} records, sha={p.content_hash[:12]}).")
             elif sub == "c":
-                bdf = self._ask("CMP 170HX PCI BDF (e.g. 0000:05:00.0)", self.s.bdf)
-                self.s.bdf = bdf or None
-                self.s.fake_path = None
-                self.s.adapter_spec = None
-                self._cached_fake = None
-                self.s.execute_live = False  # always reset to safe read-only on target change
-                self.show("Target set to live hardware (Live Execute reset to OFF).")
+                bdf = prompt_select_gpu_bdf(
+                    current_bdf=self.s.bdf,
+                    input_fn=self.input_fn,
+                    show=self.show,
+                    sysfs_root=self._sysfs_root,
+                )
+                if bdf is None:
+                    self.show("Live GPU selection unchanged.")
+                else:
+                    self.s.bdf = bdf
+                    self.s.fake_path = None
+                    self.s.adapter_spec = None
+                    self._cached_fake = None
+                    self.s.execute_live = False  # always reset to safe read-only on target change
+                    self.show(f"Target set to live hardware {bdf} (Live Execute reset to OFF).")
             elif sub == "d":
                 fp = self._ask("Path to mode-0600 fake JSON snapshot", self.s.fake_path or "private/fake.json")
                 if fp:

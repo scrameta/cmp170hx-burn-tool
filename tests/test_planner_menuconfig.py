@@ -585,5 +585,233 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         self.assertIn("NOOP_TEST", output)
 
 
+class TestPCIGPUDiscoveryAndPicker(unittest.TestCase):
+    def setUp(self):
+        import struct
+        from vfi_burn.fuses import OPTION_REGS
+        from vfi_burn.ga100 import BAR0_MAP_SIZE
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.sysfs = self.root / "pci_devices"
+        self.sysfs.mkdir()
+        self.drivers = self.root / "drivers"
+        self.drivers.mkdir()
+        self.proc_modules = self.root / "proc_modules"
+        self.proc_modules.write_text("pci_stub 16384 1 - Live 0x0\n")
+        self.pci_ids = self.root / "pci.ids"
+        self.pci_ids.write_text(
+            "1a03  ASPEED Technology, Inc.\n"
+            "\t2000  ASPEED Graphics Family\n"
+        )
+
+        def _make_dev(
+            bdf: str,
+            vendor: str,
+            device: str,
+            *,
+            cls: str = "0x030200",
+            sub_v: str = "0x10de",
+            sub_d: str = "0x1532",
+            driver: str | None = "pci-stub",
+            bar0_size: int = 16 * 1024 * 1024,
+            bar1_size: int = 16 * 1024 * 1024 * 1024,
+            cur_spd: str = "2.5 GT/s PCIe",
+            cur_wid: str = "4",
+            max_spd: str = "5.0 GT/s PCIe",
+            max_wid: str = "4",
+            bar0_regs: dict[int, int] | None = None,
+            mem_decode: bool = True,
+        ) -> Path:
+            d = self.sysfs / bdf
+            d.mkdir()
+            (d / "vendor").write_text(vendor + "\n")
+            (d / "device").write_text(device + "\n")
+            (d / "class").write_text(cls + "\n")
+            (d / "subsystem_vendor").write_text(sub_v + "\n")
+            (d / "subsystem_device").write_text(sub_d + "\n")
+            b0_start = 0xF6000000
+            b0_end = b0_start + bar0_size - 1
+            b1_start = 0x1000000000
+            b1_end = b1_start + bar1_size - 1 if bar1_size > 0 else 0
+            (d / "resource").write_text(
+                f"0x{b0_start:016x} 0x{b0_end:016x} 0x0000000000040200\n"
+                f"0x{b1_start if bar1_size else 0:016x} 0x{b1_end:016x} 0x000000000014220c\n"
+            )
+            (d / "current_link_speed").write_text(cur_spd + "\n")
+            (d / "current_link_width").write_text(cur_wid + "\n")
+            (d / "max_link_speed").write_text(max_spd + "\n")
+            (d / "max_link_width").write_text(max_wid + "\n")
+            if driver:
+                drv_dir = self.drivers / driver
+                drv_dir.mkdir(exist_ok=True)
+                (d / "driver").symlink_to(drv_dir)
+            cfg = bytearray(256)
+            struct.pack_into("<HHH", cfg, 0, int(vendor, 16), int(device, 16), 0x0002 if mem_decode else 0x0000)
+            (d / "config").write_bytes(bytes(cfg))
+            if bar0_regs is not None:
+                res0 = d / "resource0"
+                with res0.open("wb") as f:
+                    f.truncate(BAR0_MAP_SIZE)
+                    for off, val in bar0_regs.items():
+                        f.seek(off)
+                        f.write(struct.pack("<I", val & 0xFFFFFFFF))
+            return d
+
+        # 1) Cold CMP 170HX at 0000:05:00.0 (76/108 SMs, 8/10 FBPs, 16 GiB BAR1)
+        cold_regs = {
+            REG_FUSECTRL: 0xE0040000,
+            REG_DSOV_STATUS: 1,
+            REG_EFP_STATUS: 1,
+            REG_CRC_STATUS: 0x55,
+            OPTION_REGS["GPC_DISABLE"]: 0xE0,
+            OPTION_REGS["FBP_DISABLE"]: 0xF00,
+            FUSES_BY_KEY["gpc_disable"].defect_addr: 0x80,
+            FUSES_BY_KEY["fbp_disable"].defect_addr: 0xC00,
+        }
+        for g in range(8):
+            cold_regs[OPTION_REGS[f"TPC_GPC{g}_DISABLE"]] = 0xFF if g >= 5 else (0x03 if g == 1 else 0x00)
+            cold_regs[FUSES_BY_KEY[f"tpc_gpc{g}_disable"].defect_addr] = 0xFF if g == 7 else (0x03 if g == 1 else 0x00)
+        _make_dev("0000:05:00.0", "0x10de", "0x20c2", bar0_regs=cold_regs)
+
+        # 2) Unsensed Goldilocks CMP 170HX at 0000:06:00.0 (DSOV=0, EFP=0 -> must NOT report bogus SMs)
+        gold_regs = {
+            REG_FUSECTRL: 0xE0040000,
+            REG_DSOV_STATUS: 0,
+            REG_EFP_STATUS: 0,
+            REG_CRC_STATUS: 0x55,
+        }
+        _make_dev("0000:06:00.0", "0x10de", "0x20c2", bar0_regs=gold_regs, cur_spd="8.0 GT/s PCIe", max_spd="8.0 GT/s PCIe")
+
+        # 3) Non-CMP170HX RTX 3090 at 0000:01:00.0 (32 GiB BAR1, nvidia driver)
+        _make_dev(
+            "0000:01:00.0",
+            "0x10de",
+            "0x2204",
+            cls="0x030000",
+            sub_d="0x1467",
+            driver="nvidia",
+            bar1_size=32 * 1024 * 1024 * 1024,
+            cur_spd="16.0 GT/s PCIe",
+            cur_wid="16",
+            max_spd="16.0 GT/s PCIe",
+            max_wid="16",
+        )
+
+        # 4) BMC VGA resolved via pci.ids
+        _make_dev(
+            "0000:03:00.0",
+            "0x1a03",
+            "0x2000",
+            cls="0x030000",
+            sub_v="0x1a03",
+            sub_d="0x2000",
+            driver="ast",
+            bar1_size=16 * 1024 * 1024,
+            cur_spd="2.5 GT/s PCIe",
+            cur_wid="1",
+            max_spd="2.5 GT/s PCIe",
+            max_wid="1",
+        )
+
+        # 5) Non-GPU Ethernet controller (must be ignored)
+        _make_dev("0000:04:00.0", "0x8086", "0x1533", cls="0x020000", driver="igb")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_discover_pci_gpus_sorting_bar1_and_readonly_bar0_probe(self):
+        from vfi_burn.ga100 import discover_pci_gpus, format_gpu_entry
+
+        gpus = discover_pci_gpus(
+            sysfs_root=self.sysfs,
+            probe_bar0=True,
+            pci_ids_paths=[self.pci_ids],
+            proc_modules_path=self.proc_modules,
+        )
+        # 4 GPUs (Ethernet ignored), sorted: CMP 170HX first, then other NVIDIA, then ASPEED
+        self.assertEqual([g.bdf for g in gpus], ["0000:05:00.0", "0000:06:00.0", "0000:01:00.0", "0000:03:00.0"])
+
+        g_cold = gpus[0]
+        self.assertTrue(g_cold.is_cmp170hx)
+        self.assertEqual(g_cold.bar1_bytes, 16 * 1024**3)
+        self.assertEqual((g_cold.cur_sm, g_cold.max_sm), (76, 108))
+        self.assertEqual((g_cold.cur_fbp, g_cold.max_fbp), (8, 10))
+        self.assertIn("COLD", g_cold.fuse_state or "")
+        lines = "\n".join(format_gpu_entry(g_cold, index=1))
+        self.assertIn("10de:20c2", lines)
+        self.assertIn("BAR1=16 GiB", lines)
+        self.assertIn("HBM/FBPs=8/10", lines)
+        self.assertIn("SMs=76/108", lines)
+        self.assertIn("drv=pci-stub", lines)
+
+        # Unsensed Goldilocks card must NOT report SMs/FBPs from zeroed shadows
+        g_gold = gpus[1]
+        self.assertIn("GOLDILOCKS (unsensed, EFP=0)", g_gold.fuse_state or "")
+        self.assertIsNone(g_gold.cur_sm)
+        self.assertIsNone(g_gold.cur_fbp)
+
+        # RTX 3090 and ASPEED BMC
+        self.assertFalse(gpus[2].is_cmp170hx)
+        self.assertEqual(gpus[2].bar1_bytes, 32 * 1024**3)
+        self.assertIn("ASPEED Graphics Family", gpus[3].name)
+
+    def test_prompt_select_gpu_bdf_rejects_non_cmp170hx_and_accepts_pick_or_manual(self):
+        from vfi_burn.ga100 import prompt_select_gpu_bdf
+
+        # Try picking #3 (RTX 3090 -> refused!), then pick #1 (CMP 170HX -> accepted!)
+        answers = iter(["3", "1"])
+        shown: list[str] = []
+        picked = prompt_select_gpu_bdf(
+            input_fn=lambda _p: next(answers),
+            show=shown.append,
+            sysfs_root=self.sysfs,
+            probe_bar0=False,
+        )
+        self.assertEqual(picked, "0000:05:00.0")
+        out = "\n".join(shown)
+        self.assertIn("REFUSED", out)
+        self.assertIn("BAR1=16 GiB", out)
+        self.assertIn("BAR1=32 GiB", out)
+
+        # Manual short BDF entry normalizes cleanly
+        picked2 = prompt_select_gpu_bdf(
+            input_fn=lambda _p: "06:00.0",
+            show=lambda _s: None,
+            sysfs_root=self.sysfs,
+            probe_bar0=False,
+        )
+        self.assertEqual(picked2, "0000:06:00.0")
+
+    def test_menu_setup_c_and_cli_configure_use_gpu_picker(self):
+        # Menu [1] Setup -> [c] Select LIVE GPU -> pick "1" -> Back -> Quit
+        answers = iter(["1", "c", "1", "0", "q"])
+        shown: list[str] = []
+        menu = BurnMenu(
+            MenuSession(),
+            input_fn=lambda _p="": next(answers),
+            show=shown.append,
+            sysfs_root=self.sysfs,
+        )
+        rc = menu.run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(menu.s.bdf, "0000:05:00.0")
+        out = "\n".join(shown)
+        self.assertIn("Detected PCI GPUs:", out)
+        self.assertIn("10de:20c2", out)
+        self.assertIn("BAR1=16 GiB", out)
+
+        # CLI execute_configure with empty TargetSpec opens picker; blank cancels cleanly
+        shown2: list[str] = []
+        rc2 = execute_configure(
+            target=TargetSpec(),
+            out=str(self.root / "unused.json"),
+            io=CommandIO(show=shown2.append, input_fn=lambda _p: ""),
+            sysfs_root=str(self.sysfs),
+        )
+        self.assertEqual(rc2, 1)
+        self.assertIn("Detected PCI GPUs:", "\n".join(shown2))
+
+
 if __name__ == "__main__":
     unittest.main()

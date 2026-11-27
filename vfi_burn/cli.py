@@ -150,8 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         "configure",
         help="read card state read-only and build a mode-0600 vfi_burn plan via kernel menuconfig (or direct flags)",
     )
-    cg = cfg_p.add_mutually_exclusive_group(required=True)
-    cg.add_argument("--bdf", help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
+    cg = cfg_p.add_mutually_exclusive_group(required=False)
+    cg.add_argument("--bdf", help="live CMP 170HX PCI BDF (omit to pick from detected PCI GPUs)")
     cg.add_argument("--adapter", help="custom owner-supplied live module:factory")
     cg.add_argument("--sim-pcie", help="mode-0600 JSON snapshot run through simulated PCIe BAR0 + GA100 HAL")
     cg.add_argument("--fake", help="synthetic mode-0600 JSON controller snapshot")
