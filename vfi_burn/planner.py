@@ -36,7 +36,7 @@ from .fuses import (
     TPC_PER_GPC,
 )
 from .ga100 import read_ga100_card_state
-from .model import BurnError, SKU_CMP170HX_8GB
+from .model import BurnError, SUPPORTED_CMP170HX_SKUS
 
 PCIE_MODES = ("keep", "gen3", "gen4", "lock_gen12")
 
@@ -141,8 +141,10 @@ def snapshot_from_raw_state(
 ) -> CardSnapshot:
     """Validate raw card readout dicts and construct a ``CardSnapshot``."""
     pci = str(pci_id).strip().lower()
-    if pci != SKU_CMP170HX_8GB:
-        raise BurnError(f"unexpected PCI ID {pci} (expected {SKU_CMP170HX_8GB})")
+    if pci not in SUPPORTED_CMP170HX_SKUS:
+        raise BurnError(
+            f"unexpected PCI ID {pci} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+        )
     missing_die = [r for r in DIE_ID_ROWS if r not in die_rows]
     if missing_die:
         raise BurnError(f"missing Die ID rows {missing_die}")
@@ -638,6 +640,7 @@ def build_plan_from_config(
         expected_masks=card.current_masks,
         defect_masks=card.defect_masks,
         planned_items=items,
+        pci_id=card.pci_id,
         base_sm_ceiling=max(card.max_healthy_sm_count(), 1),
         prepend_noop_test=True,
         link_cap2_before=card.lnkcap2,

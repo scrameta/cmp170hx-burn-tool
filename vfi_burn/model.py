@@ -7,6 +7,8 @@ import hashlib
 import json
 
 SKU_CMP170HX_8GB = "10de:20c2"
+SKU_CMP170HX_10GB = "10de:2082"
+SUPPORTED_CMP170HX_SKUS = (SKU_CMP170HX_8GB, SKU_CMP170HX_10GB)
 DEBUGCTRL_ADDR = 0x00820060
 POISON_PREFIXES = (0xBADF0000, 0xBAD00000)  # most common; is_poison() matches all 0xBADxxxxx
 
@@ -231,8 +233,11 @@ class Plan:
             raise BurnError("must provide all eight cold die ID rows (8..15)")
 
         pci_id = str(_req(card, "pci_id", "card")).strip().lower()
-        if pci_id != SKU_CMP170HX_8GB:
-            raise BurnError(f"this implementation is exclusively for CMP 170HX 8 GB ({SKU_CMP170HX_8GB})")
+        if pci_id not in SUPPORTED_CMP170HX_SKUS:
+            raise BurnError(
+                f"unsupported PCI ID {pci_id!r}; expected CMP 170HX 8 GB ({SKU_CMP170HX_8GB}) "
+                f"or 10 GB ({SKU_CMP170HX_10GB})"
+            )
 
         first = u32(_req(fpf, "first_row", "fpf"), "fpf.first_row")
         last = u32(_req(fpf, "last_row", "fpf"), "fpf.last_row")

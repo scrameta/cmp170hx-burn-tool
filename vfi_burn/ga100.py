@@ -68,7 +68,13 @@ from .fuses import (
 )
 from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, Health, Host, MMIOBus
 from .mmio import AlignedMMIO, ReadOnlyMMIO
-from .model import BurnError, PreTriggerRefusal, SKU_CMP170HX_8GB, is_poison
+from .model import (
+    BurnError,
+    PreTriggerRefusal,
+    SKU_CMP170HX_8GB,
+    SUPPORTED_CMP170HX_SKUS,
+    is_poison,
+)
 
 BAR0_MAP_SIZE = 0x01000000  # 16 MiB BAR0 window
 
@@ -780,8 +786,10 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         """Capture a cold-boot snapshot dict compatible with `vfi_burn verify-cold`."""
         host = self.host()
         pci = self.pci_id()
-        if pci != SKU_CMP170HX_8GB:
-            raise BurnError(f"unexpected PCI ID {pci} (expected {SKU_CMP170HX_8GB})")
+        if pci not in SUPPORTED_CMP170HX_SKUS:
+            raise BurnError(
+                f"unexpected PCI ID {pci} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+            )
         die_rows = {str(r): f"0x{self.die_row(r):08x}" for r in DIE_ID_ROWS}
         fpf_rows: dict[str, str] = {}
         if read_rows:
@@ -846,8 +854,10 @@ def read_ga100_card_state(
     Caller must already have verified ``check_host_readonly_safe(backend.host())``.
     """
     pci = backend.pci_id()
-    if pci != SKU_CMP170HX_8GB:
-        raise BurnError(f"unexpected PCI ID {pci} at {label} (expected {SKU_CMP170HX_8GB})")
+    if pci not in SUPPORTED_CMP170HX_SKUS:
+        raise BurnError(
+            f"unexpected PCI ID {pci} at {label} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+        )
 
     health = backend.health()
     if health.fusectrl == 0xFFFFFFFF or is_poison(health.fusectrl):
@@ -1237,7 +1247,7 @@ def discover_pci_gpus(
         cur_wid = _read_sysfs_text(dev_dir / "current_link_width")
         max_spd = _read_sysfs_text(dev_dir / "max_link_speed")
         max_wid = _read_sysfs_text(dev_dir / "max_link_width")
-        is_cmp = pci_id == SKU_CMP170HX_8GB
+        is_cmp = pci_id in SUPPORTED_CMP170HX_SKUS
         name = _KNOWN_PCI_GPU_NAMES.get(pci_id) or resolved_names.get(pci_id) or f"PCI GPU ({pci_id})"
 
         fuse_state: str | None = None
@@ -1289,12 +1299,7 @@ def format_gpu_entry(gpu: DiscoveredGPU, *, index: int | None = None, current: b
     prefix = f"  [{index:2d}]" if index is not None else "  "
     cur_mark = "*" if current else " "
     sub_str = f"  sub={gpu.subsystem_id}" if gpu.subsystem_id else ""
-    if gpu.is_cmp170hx:
-        tag = ""
-    elif gpu.pci_id == "10de:2082":
-        tag = "  [10GB SKU — tool targets 8GB 10de:20c2]"
-    else:
-        tag = "  [not CMP 170HX 8GB]"
+    tag = "" if gpu.is_cmp170hx else "  [not CMP 170HX]"
     line1 = f"{prefix}{cur_mark}{gpu.bdf}  {gpu.pci_id}  {gpu.name}{sub_str}{tag}"
 
     details: list[str] = []
@@ -1365,7 +1370,7 @@ def prompt_select_gpu_bdf(
                 if not picked.is_cmp170hx:
                     show(
                         f"REFUSED: [{idx}] {picked.bdf} is {picked.pci_id} ({picked.name}), "
-                        f"not CMP 170HX 8GB ({SKU_CMP170HX_8GB}). Pick a {SKU_CMP170HX_8GB} card."
+                        f"not a supported CMP 170HX ({' / '.join(SUPPORTED_CMP170HX_SKUS)})."
                     )
                     continue
                 return picked.bdf

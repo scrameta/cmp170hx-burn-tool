@@ -36,6 +36,7 @@ from .model import (
     FF_ROW_MIN,
     BurnError,
     SKU_CMP170HX_8GB,
+    SUPPORTED_CMP170HX_SKUS,
     canonical_ff_prefix_sha256,
     u32,
 )
@@ -716,6 +717,7 @@ def build_vfi_plan_from_records(
     expected_masks: dict[str, int],
     defect_masks: dict[str, int],
     planned_items: Sequence[dict],
+    pci_id: str = SKU_CMP170HX_8GB,
     base_sm_ceiling: int | None = None,
     override_sm_ceiling: int | None = None,
     prepend_noop_test: bool = True,
@@ -730,6 +732,11 @@ def build_vfi_plan_from_records(
     If ``base_sm_ceiling`` is omitted, automatically computes the exact non-defective SM count of
     this die from ``defect_masks`` (``GPC_DISABLE`` + ``TPC_GPC0..7_DISABLE``, max 128).
     """
+    pci = str(pci_id).strip().lower()
+    if pci not in SUPPORTED_CMP170HX_SKUS:
+        raise BurnError(
+            f"{source_name}: unsupported PCI ID {pci!r} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+        )
     if base_sm_ceiling is None:
         gpc_def = defect_masks.get("GPC_DISABLE", 0)
         tpc_defs = [defect_masks.get(f"TPC_GPC{i}_DISABLE", 0) for i in range(TOTAL_GPC)]
@@ -965,7 +972,7 @@ def build_vfi_plan_from_records(
     out.update(
         {
             "card": {
-                "pci_id": SKU_CMP170HX_8GB,
+                "pci_id": pci,
                 "die_rows": die_rows,
                 "expected_masks": {k: f"0x{v:x}" for k, v in sorted(expected_masks.items())},
                 "defect_masks": {k: f"0x{v:x}" for k, v in sorted(defect_masks.items())},

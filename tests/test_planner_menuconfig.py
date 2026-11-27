@@ -811,28 +811,79 @@ class TestPCIGPUDiscoveryAndPicker(unittest.TestCase):
         self.assertEqual(rc2, 1)
         self.assertIn("Detected PCI GPUs:", "\n".join(shown2))
 
-    def test_10gb_2082_label_and_lnkcap_wording(self):
+    def test_10gb_2082_supported_end_to_end_and_cross_sku_refused(self):
         from vfi_burn.ga100 import DiscoveredGPU, format_gpu_entry
+        from vfi_burn.model import SKU_CMP170HX_10GB
 
+        # 1) Formatted GPU entry shows 10GB CMP 170HX as supported (no [not CMP 170HX] tag) + LnkCap wording
         g10 = DiscoveredGPU(
             bdf="0000:03:00.0",
-            pci_id="10de:2082",
+            pci_id=SKU_CMP170HX_10GB,
             subsystem_id="10de:1557",
             pci_class="0x030200",
             name="NVIDIA CMP 170HX 10GB (GA100)",
-            driver="nvidia",
+            driver="pci-stub",
             bar0_bytes=16 * 1024**2,
             bar1_bytes=32 * 1024**3,
             current_link_speed="16.0 GT/s PCIe",
             current_link_width="4",
             max_link_speed="2.5 GT/s PCIe",
             max_link_width="4",
-            is_cmp170hx=False,
+            is_cmp170hx=True,
         )
         text = "\n".join(format_gpu_entry(g10, index=2))
         self.assertIn("CMP 170HX 10GB (GA100)", text)
-        self.assertIn("[10GB SKU — tool targets 8GB 10de:20c2]", text)
+        self.assertNotIn("[not CMP 170HX]", text)
         self.assertIn("PCIe x4 @ 16.0 GT/s (LnkCap 2.5 GT/s)", text)
+
+        # 2) Build a 10GB (10de:2082) plan from card snapshot, load, verify, and simulate burn
+        state_10gb = _synthetic_card_state(tpc_defs={1: 0x03})
+        state_10gb["pci_id"] = SKU_CMP170HX_10GB
+        cold_10gb = _build_sim_adapter(state_10gb, goldilocks=False)
+        card_10gb = capture_card_snapshot(cold_10gb, label="10gb-cold")
+        self.assertEqual(card_10gb.pci_id, SKU_CMP170HX_10GB)
+
+        cfg = UnlockConfig.from_card(card_10gb)
+        cfg.unlock_all_healthy_sm_hbm()
+        cfg.set_pcie_mode("gen4")
+        plan_dict = build_plan_from_config(card_10gb, cfg)
+        self.assertEqual(plan_dict["card"]["pci_id"], SKU_CMP170HX_10GB)
+
+        plan_path = self.root / "plan_10gb.json"
+        self.root.chmod(0o700)
+        write_private_json(plan_path, plan_dict)
+        loaded = Plan.load(plan_path)
+        self.assertEqual(loaded.pci_id, SKU_CMP170HX_10GB)
+        check_plan(loaded, allow_unmapped_ff=False)
+
+        # Burns cleanly on matching 10de:2082 card
+        gold_10gb = _build_sim_adapter(state_10gb, goldilocks=True)
+        with Journal(self.root / "j10.jsonl") as j10:
+            next_row = process_records(
+                loaded,
+                gold_10gb,
+                gold_10gb,
+                j10,
+                stage="all",
+                confirm=lambda _p, _tok: True,
+                show=lambda _s: None,
+            )
+        self.assertEqual(next_row, loaded.expected_next_row + len(loaded.records))
+
+        # Cross-SKU safety: 10de:2082 plan MUST be refused on a 10de:20c2 card!
+        state_8gb = _synthetic_card_state(tpc_defs={1: 0x03})
+        gold_8gb = _build_sim_adapter(state_8gb, goldilocks=True)
+        with Journal(self.root / "j_cross.jsonl") as jc:
+            with self.assertRaisesRegex(BurnError, "PCI identity mismatch"):
+                process_records(
+                    loaded,
+                    gold_8gb,
+                    gold_8gb,
+                    jc,
+                    stage="all",
+                    confirm=lambda _p, _tok: True,
+                    show=lambda _s: None,
+                )
 
     def test_unload_gpu_drivers_order_pcistub_bind_enable_and_busy_hint(self):
         import struct
