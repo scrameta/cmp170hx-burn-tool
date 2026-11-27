@@ -155,8 +155,8 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             _MenuEntry(
                 label=f"    PCIe Link Speed: {config.target_pcie_label()}  --->",
                 help_text=(
-                    "Choose PCIe speed unlock: Keep current, Gen3 (safe, 2 FF rows), "
-                    "Gen4 (experimental MAGIC_BITS_D, 4 FF rows; requires burn-time override), "
+                    "Choose PCIe speed unlock: Keep current, Gen3 (2 FF rows), "
+                    "Gen4 (Gen3 + PCIE_MAGIC_BITS_D -> 0x00200000, 4 FF rows), "
                     "or Lock back to Gen1/Gen2."
                 ),
                 submenu="pcie",
@@ -339,9 +339,9 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             ),
             (
                 "gen4",
-                "PCIe Gen4  [experimental: Gen3 + PCIE_MAGIC_BITS_D c2/b47, c2/b46 -> 0x00200000]",
-                "Unlocks PCIe Gen4 (4 FF rows). Because c2/b46-47 modify experimental PCIE_MAGIC_BITS_D, "
-                "burning requires --override-unmapped-ff (menu [7] -> [8]).",
+                "PCIe Gen4  (Gen3 + PCIE_MAGIC_BITS_D c2/b47, c2/b46 -> 0x00200000, 4 FF rows)",
+                "Unlocks full PCIe Gen4 (clears DISABLE_GEN3_SPEED, BOOT_GEN23/GEN3, and the 5 Gen4 "
+                "MAGIC_BITS_D bits 19/22/25/26/28 to match A100 0x00200000; 4 FF rows).",
             ),
             (
                 "lock_gen12",

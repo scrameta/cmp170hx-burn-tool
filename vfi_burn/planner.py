@@ -367,7 +367,7 @@ class UnlockConfig:
         if self.pcie_mode == "gen3":
             return "Gen3 (safe)"
         if self.pcie_mode == "gen4":
-            return "Gen4 [experimental]"
+            return "Gen4"
         return "Lock Gen1/Gen2"
 
     def desired_floorsweep_masks(self) -> dict[str, int]:

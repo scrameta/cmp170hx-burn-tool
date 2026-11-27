@@ -184,12 +184,19 @@ def analyze_ff_block(
         known_mask |= _field_local_mask(f, block)
     unmapped_bits = [base + i for i in range(16) if not ((known_mask >> i) & 1)]
 
-    # Well-understood sub-bit inside opt-in magic_d (Gen4 disable flag, chain 2 bit 755).
-    gen4_bit_mask = (
-        _field_local_mask(FIELDS_BY_KEY["pcie_magic_gen4_dis"], block)
-        if chain == 2 and "pcie_magic_gen4_dis" in FIELDS_BY_KEY
-        else 0
-    )
+    # Promoted PCIe Gen4 unlock sub-bits inside opt-in magic_d (bits 19, 22, 25, 26, 28
+    # -> c2/b46 bit 13 and c2/b47 bits 0, 3, 4, 6; clears MAGIC_BITS_D to A100 0x00200000).
+    gen4_bit_mask = 0
+    if chain == 2:
+        for g4_key in (
+            "pcie_magic_gen4_bit19",
+            "pcie_magic_gen4_bit22",
+            "pcie_magic_gen4_dis",
+            "pcie_magic_gen4_bit26",
+            "pcie_magic_gen4_bit28",
+        ):
+            if g4_key in FIELDS_BY_KEY:
+                gen4_bit_mask |= _field_local_mask(FIELDS_BY_KEY[g4_key], block)
 
     warnings: list[str] = []
     changed_fields: list[OptionField] = []

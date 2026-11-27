@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--pcie",
         choices=("keep", "gen3", "gen4", "lock_gen12"),
         default=None,
-        help="non-interactive: set PCIe speed target (gen3=safe, gen4=experimental MAGIC_BITS_D, lock_gen12=re-lock)",
+        help="non-interactive: set PCIe speed target (gen3=2 rows, gen4=Gen3+MAGIC_BITS_D 4 rows, lock_gen12=re-lock)",
     )
     cfg_p.add_argument(
         "--nvlink",

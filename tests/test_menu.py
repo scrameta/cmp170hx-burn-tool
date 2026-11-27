@@ -250,11 +250,14 @@ class TestBurnMenu(unittest.TestCase):
     def test_plan_review_outcome_unknown_fuses_and_ff_row_capacity(self):
         from vfi_burn.ffrecord import analyze_ff_block, encode_ff
 
-        # 1. Verify analyze_ff_block distinguishes well-known Gen4 bit vs experimental magic_d bits
-        # Chain 2 block 47 bit 3 is pcie_magic_gen4_dis (well understood); bit 4 is experimental magic_d.
-        clean_gen4 = analyze_ff_block(2, 47, 0x0000, old_data=0x0008)
+        # 1. Verify analyze_ff_block distinguishes the 5 promoted Gen4 bits vs unpromoted magic_d bits
+        # Chain 2 block 47 mask 0x0059 (bits 0,3,4,6) and block 46 bit 13 (0x2000) are promoted Gen4 bits;
+        # block 47 bit 1 (0x0002 = MAGIC_BITS_D[23]) remains experimental magic_d.
+        clean_gen4 = analyze_ff_block(2, 47, 0x0000, old_data=0x0059)
         self.assertEqual(clean_gen4["warnings"], [])
-        exp_magic = analyze_ff_block(2, 47, 0x0010, old_data=0x0000)
+        clean_gen4_b46 = analyze_ff_block(2, 46, 0x8000, old_data=0xA000)
+        self.assertEqual(clean_gen4_b46["warnings"], [])
+        exp_magic = analyze_ff_block(2, 47, 0x0002, old_data=0x0000)
         self.assertTrue(any("EXPERIMENTAL" in w for w in exp_magic["warnings"]))
 
         # Unmapped bit 371 in chain 1 block 23 (bit 3 within block 23: between nvlink 368..370 and sys_pipe 372..379)

@@ -540,7 +540,11 @@ def format_plan_review(
         pcie_keys = (
             "disable_gen3_speed_bit1",
             "disable_gen3_speed_bit9",
+            "pcie_magic_gen4_bit19",
+            "pcie_magic_gen4_bit22",
             "pcie_magic_gen4_dis",
+            "pcie_magic_gen4_bit26",
+            "pcie_magic_gen4_bit28",
             "pcie_boot_gen23_dis",
             "pcie_boot_gen3_dis",
         )
@@ -552,6 +556,7 @@ def format_plan_review(
             outcome_lines.append(f"  [-] PCIe Speed Flags : RESTRICTED (set {', '.join(pcie_dis)})")
 
         pcie_set = set(pcie_keys)
+        promoted_magic_d_mask = (1 << 19) | (1 << 22) | (1 << 25) | (1 << 26) | (1 << 28)
         for key in sorted(before_ff_fields):
             if key in pcie_set:
                 continue
@@ -559,8 +564,11 @@ def format_plan_review(
             if bv == av or key.upper() in reported_fields_upper:
                 continue
             if key == "magic_d":
-                # Only report if bits outside bit 25 (Gen4 flag) changed
-                if ((bv ^ av) & ~(1 << 25)) == 0:
+                # Only warn as EXPERIMENTAL if bits outside the 5 promoted Gen4 bits changed
+                if ((bv ^ av) & ~promoted_magic_d_mask) == 0:
+                    outcome_lines.append(
+                        f"  [+] PCIE_MAGIC_BITS_D: {hex32(bv)} -> {hex32(av)} (PCIe Gen4 unlock)"
+                    )
                     continue
                 outcome_lines.append(
                     f"  [!] PCIE_MAGIC_BITS_D: {hex32(bv)} -> {hex32(av)} (EXPERIMENTAL bits changed!)"

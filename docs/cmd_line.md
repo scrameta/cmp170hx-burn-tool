@@ -75,8 +75,7 @@ sudo python3 -m vfi_burn configure \
   --bdf 0000:05:00.0 \
   --sm-hbm --pcie gen3 --nvlink \
   --out private/plan.json
-#   Use --pcie gen4 for experimental PCIE_MAGIC_BITS_D Gen4 unlock (burning Gen4 records
-#   requires --override-unmapped-ff / menu [7] -> [8]).
+#   Use --pcie gen4 for full PCIe Gen4 unlock (Gen3 + PCIE_MAGIC_BITS_D -> 0x00200000, 4 FF rows).
 
 # 2. Review every decoded record, die ID row (8..15), and defect mask offline:
 python3 -m vfi_burn plan --plan private/plan.json

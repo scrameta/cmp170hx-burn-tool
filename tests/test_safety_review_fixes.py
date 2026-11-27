@@ -1143,7 +1143,43 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                 )
         self.assertEqual(mmio0.program_calls, 0)
 
-        # 2) With LnkCap2 declared, WITHOUT --override-unmapped-ff it is still refused (magic_d opt_in).
+        # 2) An UNPROMOTED magic_d bit on block 46 (0xA000 -> 0xA001, bit 0) WITHOUT
+        #    --override-unmapped-ff is still refused (magic_d opt_in).
+        b46_unpromoted = encode_ff(2, 46, 0xA001)
+        unpromoted_plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "MAGIC_D_UNPROMOTED",
+                    "kind": "regular",
+                    "target": "MAGIC_D",
+                    "word": f"0x{b46_unpromoted:08x}",
+                    "decode": "chain 2 block 46 0xA000 -> 0xA001 (unpromoted bit)",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x1e",
+                },
+            ],
+            baseline_rows=base_rows,
+            name="b46_unpromoted.json",
+        )
+        mmio_no_ov = self._live_mmio(base_rows)
+        ad_no_ov = LiveMMIOAdapter(mmio_no_ov)
+        with Journal(self.work / "j_b46_no_ov.jsonl") as j_no_ov:
+            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
+                process_records(
+                    unpromoted_plan,
+                    ad_no_ov,
+                    ad_no_ov,
+                    j_no_ov,
+                    stage="all",
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio_no_ov.program_calls, 0)
+
+        # 3) Promoted Gen4 block 46 bit 19 (0xA000 -> 0x8000) needs NO override,
+        #    and wrong live LnkCap2 still refuses before burning block 46.
         with_lnk_plan = self._make_plan(
             [
                 self._noop_rec(),
@@ -1161,22 +1197,6 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
             baseline_rows=base_rows,
             name="b46_with_lnk.json",
         )
-        mmio_no_ov = self._live_mmio(base_rows)
-        ad_no_ov = LiveMMIOAdapter(mmio_no_ov)
-        with Journal(self.work / "j_b46_no_ov.jsonl") as j_no_ov:
-            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
-                process_records(
-                    with_lnk_plan,
-                    ad_no_ov,
-                    ad_no_ov,
-                    j_no_ov,
-                    stage="all",
-                    confirm=lambda *_: True,
-                    show=lambda *_: None,
-                )
-        self.assertEqual(mmio_no_ov.program_calls, 0)
-
-        # 3) With Overrides(unmapped_ff=True), wrong live LnkCap2 refuses before burning block 46.
         mmio1 = self._live_mmio(base_rows)
         ad1 = LiveMMIOAdapter(mmio1, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x02})
         with Journal(self.work / "j_b46_1.jsonl") as j1:
@@ -1187,13 +1207,12 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                     ad1,
                     j1,
                     stage="all",
-                    overrides=Overrides(unmapped_ff=True),
                     confirm=lambda *_: True,
                     show=lambda *_: None,
                 )
         self.assertEqual(mmio1.program_calls, 1)  # NOOP_TEST only; block 46 refused
 
-        # 4) Matching live LnkCap2 demands REVIEW PCIE confirmation token!
+        # 4) Matching live LnkCap2 still demands REVIEW PCIE confirmation token (no override needed)!
         mmio2 = self._live_mmio(base_rows)
         ad2 = LiveMMIOAdapter(mmio2, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x06})
         tokens: list[str] = []
@@ -1210,7 +1229,6 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                     ad2,
                     j2,
                     stage="all",
-                    overrides=Overrides(unmapped_ff=True),
                     confirm=decline_review_pcie,
                     show=lambda *_: None,
                 )

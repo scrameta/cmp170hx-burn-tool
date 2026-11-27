@@ -307,7 +307,7 @@ class TestUnlockAndLockPlanner(unittest.TestCase):
             self.assertEqual(final_masks["FBP_DISABLE"], 0xC00)
             self.assertEqual(final_masks["NVLINK_DISABLE"], 0x0)
 
-    def test_pcie_gen4_clears_magic_d_blocks_and_requires_optin_override(self):
+    def test_pcie_gen4_clears_magic_d_blocks_without_override(self):
         cfg = UnlockConfig.from_card(self.card)
         cfg.set_pcie_mode("gen4")
         items, _ = derive_ff_records(self.card, cfg)
@@ -324,9 +324,8 @@ class TestUnlockAndLockPlanner(unittest.TestCase):
             Path(tmp).chmod(0o700)
             write_private_json(p, plan_dict)
             loaded = Plan.load(p)
-            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
-                check_plan(loaded, allow_unmapped_ff=False)
-            check_plan(loaded, allow_unmapped_ff=True)
+            # Promoted Gen4 MAGIC_BITS_D bits (19/22/25/26/28) pass strict check_plan with NO override!
+            check_plan(loaded, allow_unmapped_ff=False)
 
     def test_lock_active_gpc_tpc_fbp_pcie_and_nvlink(self):
         # Start from an already-unlocked Gen3 + NVLink card and lock individual items!
