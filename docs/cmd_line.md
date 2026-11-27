@@ -14,8 +14,7 @@ This page documents the scriptable `python3 -m vfi_burn <command>` interface. Fo
 | `menu` | High-level interactive menu (also launched with no arguments) — see [`menu_driven.md`](menu_driven.md) | Read-only unless Live Execute is enabled |
 | `plan` | Pure offline plan validation and review | Never |
 | `decode <word>` | Decode a 32-bit GA100 FF record word into chain/block/data/fields | Never |
-| `import-ffcalc` | Convert a `cmp170hx-ffcalc` `burn.json` + 512-row card `dump.json` into a mode-0600 `vfi_burn` plan | Never |
-| `import-ga100-ff-tools` | Convert one or more `ga100-ff-tools` plan JSONs + `ff_dump.py` + `read_defects.py` into a mode-0600 `vfi_burn` plan | Only read-only if `--bdf` is used for Die ID rows `8..15` |
+| `configure` | Read card state (live `--bdf` or simulated `--sim-pcie`/`--fake`) and build a mode-0600 plan via interactive kernel `menuconfig` TUI or non-interactive flags (`--sm-hbm`, `--pcie`, `--nvlink`) | Read-only (when using `--bdf`) |
 | `snapshot` | Capture a mode-0600 cold-boot snapshot from a live CMP 170HX for `verify-cold` | Read-only |
 | `inspect` | Read-only preflight, health report, and free-slot proof (`--sense` explicitly invokes `SENSE_CTRL`) | Read-only (unless `--sense`) |
 | `burn` | Live hardware burn workflow — passive **dry-run by default**; requires `--execute` + TTY to program fuses | Only with `--execute` |
@@ -32,7 +31,7 @@ Run `python3 -m vfi_burn <command> --help` for the full list of flags.
 ## Offline Verification & Simulation (Safe — No GPU Touched)
 
 ```bash
-# Run the full offline test suite (186 tests):
+# Run the full offline test suite:
 python3 -m unittest discover -s tests -v
 
 # Set up a private mode-0700 working directory:
@@ -60,30 +59,23 @@ python3 -m vfi_burn simulate --plan private/plan.json --fake private/after-test.
 ## Bench Workflow (Live Hardware — Untested, Proceed With Extreme Caution)
 
 ```bash
-# 1A. Import a cmp170hx-ffcalc plan + 512-row card dump (prepends a safe no-op test row):
-python3 -m vfi_burn import-ffcalc \
-  --burn-plan private/card.burn.json \
-  --dump private/card.dump.json \
-  --base-sm <YOUR_REVIEWED_SM_CEILING> \
-  --prepend-noop-test \
-  --out private/plan.json
-#   --base-sm is REQUIRED (operator/community knowledge, e.g. 122; the card cannot supply it).
-#   Optionally pass --link-cap2-before/--link-cap2-after with values you read from your card.
-#   The importer refuses stale/partial dumps, non-contiguous or colliding rows, wrong `old`
-#   values, and dumps whose fused masks disagree with the FF replay.
-
-# 1B. Or import one or more ga100-ff-tools plans + ff_dump.py + read_defects.py:
-#     (Stock ff_dump.py starts at row 222 and omits Die ID rows 8..15; pass --bdf <BDF> for a
-#      read-only live read of rows 8..15, --die-rows-from <file>, or ff_dump.py --start 8.)
-sudo python3 -m vfi_burn import-ga100-ff-tools \
-  --plans private/card_plan_0_noop.json private/card_plan_sm_hbm.json \
-  --dump private/card-dump.json \
-  --defects private/card-defects.json \
+# 1A. Configure unlocks/locks interactively with the kernel menuconfig-style TUI
+#     (run on a cold card before glitching, or after SENSE_CTRL when EFP=1):
+sudo python3 -m vfi_burn configure \
   --bdf 0000:05:00.0 \
-  --base-sm <YOUR_REVIEWED_SM_CEILING> \
   --out private/plan.json
-#   Include card_plan_pcie.json / card_plan_nvlink.json in --plans if desired (burning
-#   experimental PCIe Gen4 MAGIC_BITS_D records or NVLink without OPT_SYS_PIPE_DEFECTIVE
+#   Reads Die ID rows 8..15, FF rows 222..486, fused option shadows, and all 16 genuine
+#   OPT_*_DEFECTIVE registers read-only. Lets you unlock or lock all healthy SM+HBM,
+#   individual GPCs/TPCs/FBPs (keeping PES and FBPA/FBIO/ROP_L2 coherent), PCIe Gen3/Gen4/lock,
+#   and NVLink, while blocking genuinely defective units and automatically prepending a
+#   0-bit-diff no-op test row for flashing-time verification. Pass --no-curses for plain text.
+
+# 1B. Or generate a plan non-interactively with explicit flags:
+sudo python3 -m vfi_burn configure \
+  --bdf 0000:05:00.0 \
+  --sm-hbm --pcie gen3 --nvlink \
+  --out private/plan.json
+#   Use --pcie gen4 for experimental PCIE_MAGIC_BITS_D Gen4 unlock (burning Gen4 records
 #   requires --override-unmapped-ff / menu [7] -> [8]).
 
 # 2. Review every decoded record, die ID row (8..15), and defect mask offline:

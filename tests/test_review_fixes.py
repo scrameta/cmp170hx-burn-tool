@@ -9,7 +9,7 @@ import unittest
 
 from vfi_burn.backend import FakeController
 from vfi_burn.engine import Journal, process_records, reconcile, verify_cold_snapshot
-from vfi_burn.ffrecord import FF_ROW_MIN, encode_ff, import_ffcalc_plan
+from vfi_burn.ffrecord import FF_ROW_MIN, build_vfi_plan_from_records, encode_ff
 from vfi_burn.ga100 import (
     REG_CTRL_WR_SECURE,
     REG_FUSEWDATA,
@@ -279,49 +279,63 @@ class TestFakeRoundTrip(Base):
         self.assertIsNone(fake_from_file(out).state.efp)
 
 
-class TestImporter(Base):
-    def write(self, name, obj):
-        p = self.work / name
-        p.write_text(json.dumps(obj))
-        p.chmod(0o600)
-        return p
+class TestPlanBuilder(Base):
+    def base_args(self, *, expected_masks=None, defect_masks=None, row=224, old=0x4290):
+        die_rows = {i: 0x1000 + i for i in range(8, 16)}
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+        ff_rows[FF_ROW_MIN] = encode_ff(1, 19, 0x4290)
+        return dict(
+            ff_rows=ff_rows,
+            die_rows_int=die_rows,
+            expected_masks=expected_masks if expected_masks is not None else {
+                "FBP_DISABLE": 0x852,
+                "ROP_L2_DISABLE": 0,
+            },
+            defect_masks=defect_masks if defect_masks is not None else {
+                "FBP_DISABLE": 0x840,
+                "ROP_L2_DISABLE": 0,
+            },
+            planned_items=[
+                {
+                    "row": row,
+                    "chain": 1,
+                    "block": 19,
+                    "old": old,
+                    "new": 0x4200,
+                    "word": encode_ff(1, 19, 0x4200),
+                    "fields": ["fbp_disable"],
+                }
+            ],
+        )
 
-    def dump(self, extra_rows=None):
-        rows = {str(i): hex(0x1000 + i) for i in range(8, 16)}
-        rows[str(FF_ROW_MIN)] = hex(encode_ff(1, 19, 0x4290))
-        for r in range(FF_ROW_MIN + 1, 487):
-            rows[str(r)] = "0x0"
-        rows.update(extra_rows or {})
-        return {"ff_rows": rows, "option_words": {
-            "fbp_disable": 0x852, "fbp_defective": 0x840,
-            "rop_l2_disable": 0, "rop_l2_defective": 0,
-        }}
-
-    def burn(self, row=223, old="0x4290"):
-        return {"burn": [{"row": row, "chain": 1, "block": 19, "old": old, "new": "0x4200",
-                          "record": hex(encode_ff(1, 19, 0x4200)), "fields": ["fbp_disable"]}]}
-
-    def test_base_sm_ceiling_is_required(self):
-        with self.assertRaises(TypeError):
-            import_ffcalc_plan(self.write("b.json", self.burn()), self.write("d.json", self.dump()))
+    def test_base_sm_ceiling_auto_computed_from_defects(self):
+        # 1 defective GPC + 3 defective TPCs on GPC 1 -> (7*8 - 3)*2 = 106 SMs
+        plan = build_vfi_plan_from_records(
+            **self.base_args(
+                defect_masks={
+                    "GPC_DISABLE": 0x01,
+                    "TPC_GPC1_DISABLE": 0x07,
+                    "FBP_DISABLE": 0x840,
+                    "ROP_L2_DISABLE": 0,
+                }
+            )
+        )
+        self.assertEqual(plan["ceiling"]["base_sm"], 106)
 
     def test_stale_rows_and_old_values_are_refused(self):
-        d = self.write("d.json", self.dump())
-        with self.assertRaisesRegex(BurnError, "not contiguous from the first free FF row 223"):
-            import_ffcalc_plan(self.write("b1.json", self.burn(row=230)), d, base_sm_ceiling=122)
+        with self.assertRaisesRegex(BurnError, "not contiguous with expected row 224"):
+            build_vfi_plan_from_records(**self.base_args(row=230))
         with self.assertRaisesRegex(BurnError, "planned old=0x4291"):
-            import_ffcalc_plan(self.write("b2.json", self.burn(old="0x4291")), d, base_sm_ceiling=122)
+            build_vfi_plan_from_records(**self.base_args(old=0x4291))
 
     def test_dump_disagreeing_with_ff_replay_fails_closed(self):
-        dump = self.dump()
-        dump["option_words"]["fbp_disable"] = 0x850  # fused register != replay 0x852
         with self.assertRaisesRegex(BurnError, "disagrees with FF replay"):
-            import_ffcalc_plan(self.write("b.json", self.burn()), self.write("d.json", dump),
-                               base_sm_ceiling=122)
+            build_vfi_plan_from_records(
+                **self.base_args(expected_masks={"FBP_DISABLE": 0x850, "ROP_L2_DISABLE": 0})
+            )
 
     def test_lnkcap2_expectation_unchanged_without_pcie_records(self):
-        plan = import_ffcalc_plan(self.write("b.json", self.burn()), self.write("d.json", self.dump()),
-                                  base_sm_ceiling=122, link_cap2_before=0x02)
+        plan = build_vfi_plan_from_records(**self.base_args(), link_cap2_before=0x02)
         self.assertEqual(plan["final_expected_cold"]["LnkCap2"], "0x2")
 
 

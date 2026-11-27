@@ -199,36 +199,18 @@ class Plan:
         if not isinstance(d, dict):
             raise BurnError("plan root must be a JSON object")
         if d.get("schema_version") != 1:
-            raw_recs = d.get("records")
-            raw_burn = d.get("burn")
-            if (
-                isinstance(raw_recs, list)
-                and raw_recs
-                and isinstance(raw_recs[0], dict)
-                and "encoded" in raw_recs[0]
-                and "row" in raw_recs[0]
-            ):
-                raise BurnError(
-                    "only schema_version=1 is understood — this looks like a ga100-ff-tools plan "
-                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ga100-ff-tools' "
-                    "or menu [1] Setup -> [h]"
-                )
-            if (
-                isinstance(raw_burn, list)
-                and raw_burn
-                and isinstance(raw_burn[0], dict)
-                and "record" in raw_burn[0]
-            ):
-                raise BurnError(
-                    "only schema_version=1 is understood — this looks like a cmp170hx-ffcalc burn plan "
-                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ffcalc' "
-                    "or menu [1] Setup -> [b]"
-                )
-            raise BurnError("only schema_version=1 is understood")
+            raise BurnError(
+                "only schema_version=1 is understood (use 'python3 -m vfi_burn configure' "
+                "or menu [1] Setup -> [a] to build a plan directly from your card)"
+            )
 
         card = _req(d, "card", "plan")
         fpf = _req(d, "fpf", "plan")
-        ceiling = _req(d, "ceiling", "plan")
+        ceiling = d.get("ceiling")
+        if ceiling is None:
+            ceiling = {"base_sm": 128}
+        elif not isinstance(ceiling, dict):
+            raise BurnError("plan.ceiling must be a JSON object")
         raw_records = _req(d, "records", "plan")
         if not isinstance(raw_records, list):
             raise BurnError("plan.records must be a JSON list")

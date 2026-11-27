@@ -9,7 +9,7 @@ This page documents the guided, numbered interactive menu. For the scriptable su
 
 ## Launching the Menu
 
-Running `vfi_burn` with **no arguments** (or with `menu` plus optional pre-filled flags) launches a plain numbered menu designed for SSH/serial/tmux sessions (no fragile `curses`, full scrollback preserved):
+Running `vfi_burn` with **no arguments** (or with `menu` plus optional pre-filled flags) launches a plain numbered main menu designed for SSH/serial/tmux sessions (full scrollback preserved; `[1] Setup -> [a]` opens a kernel `menuconfig`-style `curses` TUI on interactive TTYs with an automatic plain-text fallback):
 
 ```bash
 # Launch empty menu and configure everything interactively:
@@ -42,7 +42,7 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 
 | Option | Action |
 |---|---|
-| `[1]` | Setup / load plan / import `cmp170hx-ffcalc` (`[b]`) or `ga100-ff-tools` (`[h]`) plan |
+| `[1]` | Setup / Configure Unlocks from Card (`[a]` kernel `menuconfig` TUI — unlock/lock GPCs, TPCs, FBPs, PCIe Gen3/Gen4, NVLink) / load saved plan (`[b]`) / target & mode |
 | `[2]` | Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit) |
 | `[3]` | Live Status & Passive Inspection |
 | `[4]` | Active Sense (`SENSE_CTRL`) |

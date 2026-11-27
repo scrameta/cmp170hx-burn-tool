@@ -14,9 +14,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-import hashlib
-import json
-from pathlib import Path
 
 from .fuse_rules import evaluate_fuse_combinations, poweroff_domain_for_group
 from .fuses import (
@@ -40,7 +37,6 @@ from .model import (
     BurnError,
     SKU_CMP170HX_8GB,
     canonical_ff_prefix_sha256,
-    require_private_file,
     u32,
 )
 
@@ -706,160 +702,53 @@ def make_noop_test_record(ff_rows: dict[int, int]) -> dict:
     }
 
 
-GA100_FF_TOOLS_DEFECT_TO_FIELD: dict[str, str] = {
-    "OPT_GPC_DEFECTIVE": "GPC_DISABLE",
-    "OPT_FBP_DEFECTIVE": "FBP_DISABLE",
-    "OPT_FBPA_DEFECTIVE": "FBPA_DISABLE",
-    "OPT_FBIO_DEFECTIVE": "FBIO_DISABLE",
-    "OPT_PES_DEFECTIVE": "PES_DISABLE",
-    "OPT_ROP_L2_DEFECTIVE": "ROP_L2_DISABLE",
-    "OPT_NVLINK_DEFECTIVE": "NVLINK_DISABLE",
-    "OPT_SYS_PIPE_DEFECTIVE": "SYS_PIPE_DISABLE",
-    **{f"OPT_TPC_GPC{i}_DEFECTIVE": f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)},
-}
-
-# Standard 15 defect masks emitted by ga100-ff-tools/planner/read_defects.py.
-GA100_FF_TOOLS_REQUIRED_DEFECTS: tuple[str, ...] = (
-    "OPT_GPC_DEFECTIVE",
-    "OPT_FBP_DEFECTIVE",
-    "OPT_FBPA_DEFECTIVE",
-    "OPT_FBIO_DEFECTIVE",
-    "OPT_PES_DEFECTIVE",
-    "OPT_ROP_L2_DEFECTIVE",
-    "OPT_NVLINK_DEFECTIVE",
-    *(f"OPT_TPC_GPC{i}_DEFECTIVE" for i in range(TOTAL_GPC)),
-)
-
-GA100_FF_TOOLS_FIELD_TO_KEY: dict[str, str] = {
-    "OPT_GPC_DISABLE": "gpc_disable",
-    "OPT_FBP_DISABLE": "fbp_disable",
-    "OPT_FBPA_DISABLE": "fbpa_disable",
-    "OPT_FBIO_DISABLE": "fbio_disable",
-    "OPT_PES_DISABLE": "pes_disable",
-    "OPT_ROP_L2_DISABLE": "rop_l2_disable",
-    "OPT_NVLINK_DISABLE": "nvlink_disable",
-    "OPT_SYS_PIPE_DISABLE": "sys_pipe_disable",
-    "OPT_PCIE_DEVIDA": "pcie_devida",
-    "OPT_PCIE_DEVIDB": "pcie_devidb",
-    **{f"OPT_TPC_DISABLE_GPC{i}": f"tpc_gpc{i}_disable" for i in range(TOTAL_GPC)},
-}
-
-
-def ga100_ff_tools_fingerprint(ff_rows: dict[int, int], last_row: int) -> str:
-    """Compute the 16-hex-char baseline fingerprint used by kprinssu/ga100-ff-tools."""
-    if not (FF_ROW_MIN <= last_row <= FF_ROW_MAX):
-        raise BurnError(f"ga100-ff-tools baseline.last_row {last_row} outside {FF_ROW_MIN}..{FF_ROW_MAX}")
-    missing = [r for r in range(FF_ROW_MIN, last_row + 1) if r not in ff_rows]
-    if missing:
-        raise BurnError(f"cannot compute ga100-ff-tools fingerprint: missing rows {missing[:5]}")
-    payload = ",".join(f"0x{ff_rows[r] & 0xFFFFFFFF:08X}" for r in range(FF_ROW_MIN, last_row + 1))
-    return hashlib.sha256(payload.encode("ascii")).hexdigest()[:16]
-
-
-def _extract_die_rows_from_mapping(raw: dict, label: str) -> dict[int, int]:
-    out: dict[int, int] = {}
-    for k, v in raw.items():
-        try:
-            idx = int(k)
-        except (TypeError, ValueError):
-            continue
-        if idx in DIE_ID_ROWS:
-            out[idx] = u32(v, f"{label}.{idx}")
-    return out
-
-
-def _extract_die_rows_from_ga100_rows(rows_list: list, label: str) -> dict[int, int]:
-    out: dict[int, int] = {}
-    for entry in rows_list:
-        if not isinstance(entry, dict) or "row" not in entry:
-            continue
-        idx = int(entry["row"])
-        if idx in DIE_ID_ROWS:
-            raw_val = entry.get("raw")
-            if raw_val is None or entry.get("error"):
-                raise BurnError(f"{label}: die ID row {idx} has read error / missing raw value")
-            out[idx] = u32(raw_val, f"{label}.row_{idx}")
-    return out
-
-
-def load_die_rows_from_file(path: str | Path) -> dict[int, int]:
-    """Load Die ID rows 8..15 from a mode-0600 JSON file.
-
-    Accepts:
-      - vfi_burn snapshot / plan JSON (``die_rows`` or ``card.die_rows``)
-      - cmp170hx-ffcalc 512-row dump JSON (``ff_rows``)
-      - ga100-ff-tools ``ff_dump.py --start 8`` JSON (``rows`` list)
-      - plain mapping ``{"8": "0x...", ..., "15": "0x..."}``
-    """
-    p = require_private_file(path, "die ID rows file")
-    try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in die ID rows file {p}: {exc}") from exc
-    if not isinstance(obj, dict):
-        raise BurnError(f"die ID rows file {p} must contain a JSON object")
-
-    found: dict[int, int] = {}
-    if isinstance(obj.get("die_rows"), dict):
-        found = _extract_die_rows_from_mapping(obj["die_rows"], "die_rows")
-    elif isinstance(obj.get("card"), dict) and isinstance(obj["card"].get("die_rows"), dict):
-        found = _extract_die_rows_from_mapping(obj["card"]["die_rows"], "card.die_rows")
-    elif isinstance(obj.get("ff_rows"), dict):
-        found = _extract_die_rows_from_mapping(obj["ff_rows"], "ff_rows")
-    elif isinstance(obj.get("rows"), list):
-        found = _extract_die_rows_from_ga100_rows(obj["rows"], "rows")
-    else:
-        found = _extract_die_rows_from_mapping(obj, "die_rows")
-
-    missing = [r for r in DIE_ID_ROWS if r not in found]
-    if missing:
-        raise BurnError(
-            f"die ID rows file {p} is missing die ID rows {missing}; "
-            "all 8 rows (8..15) are required"
-        )
-    return {r: found[r] for r in DIE_ID_ROWS}
-
-
-def _build_vfi_plan_from_records(
+def build_vfi_plan_from_records(
     *,
     ff_rows: dict[int, int],
     die_rows_int: dict[int, int],
     expected_masks: dict[str, int],
     defect_masks: dict[str, int],
     planned_items: Sequence[dict],
-    base_sm_ceiling: int,
-    override_sm_ceiling: int | None,
-    prepend_noop_test: bool,
-    allow_shifted_first_row: bool = False,
+    base_sm_ceiling: int | None = None,
+    override_sm_ceiling: int | None = None,
+    prepend_noop_test: bool = True,
     link_cap2_before: int = 0x06,
     link_cap2_after: int = 0x1E,
     extra_metadata: dict | None = None,
-    source_name: str = "ffcalc",
+    source_name: str = "planner",
     on_record_replayed: Callable[[int, dict[int, int]], None] | None = None,
 ) -> dict:
-    """Shared fail-closed builder converting normalized FF burn records into a vfi_burn plan dict."""
+    """Fail-closed builder converting derived FF burn records into a vfi_burn schema_version=1 plan dict.
+
+    If ``base_sm_ceiling`` is omitted, automatically computes the exact non-defective SM count of
+    this die from ``defect_masks`` (``GPC_DISABLE`` + ``TPC_GPC0..7_DISABLE``, max 128).
+    """
+    if base_sm_ceiling is None:
+        gpc_def = defect_masks.get("GPC_DISABLE", 0)
+        tpc_defs = [defect_masks.get(f"TPC_GPC{i}_DISABLE", 0) for i in range(TOTAL_GPC)]
+        base_sm_ceiling = max(compute_sm_count(gpc_def, tpc_defs), 1)
     if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
-        raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")
+        raise BurnError("base_sm_ceiling must be a positive integer")
     missing_die = [r for r in DIE_ID_ROWS if r not in die_rows_int]
     if missing_die:
-        raise BurnError(f"{source_name} missing die ID rows {missing_die}")
+        raise BurnError(f"{source_name}: missing die ID rows {missing_die}")
     die_rows = {str(r): f"0x{die_rows_int[r]:08x}" for r in DIE_ID_ROWS}
 
     # Row occupancy must be fully known across 222..486.
     missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
     if missing_ff:
         raise BurnError(
-            f"{source_name} dump covers only {FF_ROW_MAX - FF_ROW_MIN + 1 - len(missing_ff)} of "
+            f"{source_name}: card dump covers only {FF_ROW_MAX - FF_ROW_MIN + 1 - len(missing_ff)} of "
             f"{FF_ROW_MAX - FF_ROW_MIN + 1} FF rows (missing e.g. {missing_ff[:5]}); "
             "an unread row would look free"
         )
     region = [ff_rows[r] for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)]
     first_free_idx = next((i for i, v in enumerate(region) if v == FF_EMPTY_WORD), None)
     if first_free_idx is None:
-        raise BurnError(f"{source_name} dump shows the FF region full")
+        raise BurnError(f"{source_name}: FF region is full")
     if any(v != FF_EMPTY_WORD for v in region[first_free_idx:]):
         raise BurnError(
-            f"{source_name} dump FF rows are non-contiguous; vfi_burn's free-slot proof would refuse"
+            f"{source_name}: FF rows are non-contiguous; vfi_burn's free-slot proof would refuse"
         )
     baseline_next_row = FF_ROW_MIN + first_free_idx
     next_row = baseline_next_row
@@ -867,12 +756,12 @@ def _build_vfi_plan_from_records(
     for r_idx, w in baseline_ff_prefix.items():
         if (w >> 5) & 1:
             raise BurnError(
-                f"{source_name} dump row {r_idx} word 0x{w:08x} has IFF bit 5 set"
+                f"{source_name}: row {r_idx} word 0x{w:08x} has IFF bit 5 set"
             )
     baseline_ff_sha = canonical_ff_prefix_sha256(baseline_ff_prefix)
 
-    if not planned_items:
-        raise BurnError(f"{source_name} burn plan has no records")
+    if not planned_items and not prepend_noop_test:
+        raise BurnError(f"{source_name}: plan has no records")
 
     # Replay current FF rows and verify expected_masks against FF replay.
     running_rows = dict(ff_rows)
@@ -884,7 +773,7 @@ def _build_vfi_plan_from_records(
     for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
         if vfi_name in expected_masks and replay_fields[ff_key] != expected_masks[vfi_name]:
             raise BurnError(
-                f"dump fused {vfi_name}=0x{expected_masks[vfi_name]:x} disagrees with FF replay "
+                f"fused {vfi_name}=0x{expected_masks[vfi_name]:x} disagrees with FF replay "
                 f"0x{replay_fields[ff_key]:x}; the FF-only option model does not hold for this card, "
                 "so planned before/after masks cannot be trusted"
             )
@@ -898,37 +787,28 @@ def _build_vfi_plan_from_records(
             noop["expected_cold"] = {first_key: f"0x{expected_masks[first_key]:x}"}
         vfi_records.append(noop)
         first_record_as_test = False
-        next_row += 1  # the no-op occupies the first free row; planned rows shift by one if unshifted
+        next_row += 1
     else:
-        # Without prepending a no-op test row, record[0] MUST itself be a demonstrable no-op.
         first_word = planned_items[0]["word"]
         verify_noop_test_record(first_word, base_blocks)
         first_record_as_test = True
 
-    planned_rows = [int(item["row"]) for item in planned_items]
-    if len(set(planned_rows)) != len(planned_rows):
-        raise BurnError(f"{source_name} burn plan uses the same row twice")
-    expected_first = next_row - (1 if prepend_noop_test else 0)
-    valid_starts = [expected_first]
-    if allow_shifted_first_row and prepend_noop_test:
-        valid_starts.append(expected_first + 1)
-    if planned_rows[0] not in valid_starts or planned_rows != list(
-        range(planned_rows[0], planned_rows[0] + len(planned_rows))
-    ):
-        raise BurnError(
-            f"{source_name} planned rows {planned_rows[:3]}... are not contiguous from the first free "
-            f"FF row {expected_first} of this dump (stale dump or plan?)"
-        )
-    if (next_row + len(planned_rows) - 1) > FF_ROW_MAX:
+    if planned_items and (next_row + len(planned_items) - 1) > FF_ROW_MAX:
         raise BurnError("plan does not fit in the remaining FF rows")
 
     for idx, item in enumerate(planned_items):
-        row = int(item["row"])
+        replay_slot = baseline_next_row + len(vfi_records)
+        if item.get("row") is not None and int(item["row"]) != replay_slot:
+            raise BurnError(
+                f"{source_name}: planned record[{idx}] targets row {int(item['row'])}, "
+                f"not contiguous with expected row {replay_slot} (first free FF row is {baseline_next_row})"
+            )
+        row = replay_slot
         word = int(item["word"])
         chain = int(item["chain"])
         block = int(item["block"])
         new_data = int(item["new"])
-        src_label = str(item.get("source_label", f"burn[{idx}]"))
+        src_label = str(item.get("source_label", f"record[{idx}]"))
         if encode_ff(chain, block, new_data) != word:
             raise BurnError(
                 f"{src_label} row {row}: record 0x{word:08x} disagrees with "
@@ -952,13 +832,10 @@ def _build_vfi_plan_from_records(
         hard_denials, overridable_issues = ff_word_safety_audit(word, replay_old)
         if hard_denials:
             raise BurnError(f"{src_label} row {row}: REFUSED; " + "; ".join(hard_denials))
-        # Reject unknown blocks and changed unmapped bits at import time too.
         non_optin_issues = [msg for msg in overridable_issues if "opt-in field" not in msg]
         if non_optin_issues:
             raise BurnError(f"{src_label} row {row}: REFUSED; " + "; ".join(non_optin_issues))
 
-        # Place replayed word at next sequential slot (identical replay order; row may be +1 when prepending no-op).
-        replay_slot = baseline_next_row + len(vfi_records)
         sim = simulate_ff_write(running_rows, replay_slot, word)
         running_rows[replay_slot] = word
 
@@ -971,7 +848,6 @@ def _build_vfi_plan_from_records(
             if k in FIELDS_BY_KEY
         )
 
-        # Find primary floorsweep mask changed by this record (if any).
         changed_masks = [
             (k, sim["changes"][k])
             for k in sim["changes"]
@@ -1017,7 +893,6 @@ def _build_vfi_plan_from_records(
         for ff_key, (before_v, after_v) in changed_masks:
             vfi_name = FFCALC_KEY_TO_FIELD[ff_key]
             if running_masks[vfi_name] != before_v:
-                # Never silently drop reconciliation metadata: fail closed.
                 raise BurnError(
                     f"{src_label} row {row}: tracked {vfi_name}=0x{running_masks[vfi_name]:x} "
                     f"!= replayed before-value 0x{before_v:x}"
@@ -1032,8 +907,6 @@ def _build_vfi_plan_from_records(
                 "from": f"0x{before_v:x}",
                 "to": f"0x{after_v:x}",
             }
-        # Multi-field shared blocks cannot carry one mask_update; the engine re-derives and
-        # defect-checks every field from the word itself. Always attach the SM count.
         if any(
             any(tok in FFCALC_KEY_TO_FIELD[k] for tok in ("GPC", "TPC")) for k, _ in changed_masks
         ):
@@ -1075,7 +948,6 @@ def _build_vfi_plan_from_records(
         "MAGIC_D": f"0x{final_decoded['magic_d']:x}",
         "BOOT_GEN3_DIS": f"0x{final_decoded['pcie_boot_gen3_dis']:x}",
         "DISABLE_GEN3_SPEED": f"0x{final_decoded['disable_gen3_speed_bit1'] | final_decoded['disable_gen3_speed_bit9']:x}",
-        # Only expect the new link capability if the plan actually burns a PCIe record.
         "LnkCap2": f"0x{(link_cap2_after if any(r.get('kind') == 'pcie' for r in vfi_records) else link_cap2_before):x}",
         "SM_COUNT": final_sm,
     }
@@ -1109,459 +981,3 @@ def _build_vfi_plan_from_records(
         }
     )
     return out
-
-
-def import_ffcalc_plan(
-    burn_plan_path: str | Path,
-    dump_path: str | Path,
-    *,
-    base_sm_ceiling: int,
-    override_sm_ceiling: int | None = None,
-    first_record_as_test: bool = False,
-    prepend_noop_test: bool = True,
-    link_cap2_before: int = 0x06,
-    link_cap2_after: int = 0x1E,
-) -> dict:
-    """Convert a cmp170hx-ffcalc burn plan + 512-row card dump into a vfi_burn plan dict.
-
-    Validates:
-      - All 8 Die ID rows (8..15) are present in the card dump (refuses incomplete dumps).
-      - Every planned FF record decodes cleanly (IFF bit 5 == 0) and matches chain/block/new.
-      - The dump covers every FF row 222..486, and its used rows are one contiguous prefix.
-      - Preserves the canonical occupied FF prefix (``baseline_ff_rows`` + SHA-256 digest +
-        ``expected_next_row``) so live preflight proves the on-card history matches this dump.
-      - Planned rows are contiguous, start at the first free FF row and never collide.
-      - Each planned ``old`` value equals the replayed current block.
-      - The dump's fused mask registers agree with the FF replay (model check).
-      - No planned record touches read-only device-ID blocks, unknown blocks, or unmapped bits.
-      - No planned record leaves any *_defective unit enabled (word-derived check).
-      - Ensures the first record (``kind="test"``) is a demonstrable 0-bit-diff no-op.
-      - Computes exact before/after disable masks and SM counts from full FF replay.
-
-    ``base_sm_ceiling`` is required: it is community/operator knowledge the card cannot
-    supply, and defaulting it to the full-die 128 made the check vacuous.
-    """
-    if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
-        raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")
-    bp = require_private_file(burn_plan_path, "ffcalc burn plan")
-    dp = require_private_file(dump_path, "ffcalc card dump")
-    try:
-        burn_obj = json.loads(bp.read_text(encoding="utf-8"))
-        dump_obj = json.loads(dp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in ffcalc input: {exc}") from exc
-
-    if burn_obj.get("uuid") and dump_obj.get("uuid") and burn_obj["uuid"] != dump_obj["uuid"]:
-        raise BurnError(
-            f"UUID mismatch between burn plan ({burn_obj['uuid']}) and dump ({dump_obj['uuid']})"
-        )
-
-    raw_ff_rows = dump_obj.get("ff_rows")
-    if not isinstance(raw_ff_rows, dict):
-        raise BurnError("ffcalc dump is missing 'ff_rows' (must run full 512-row capture)")
-
-    ff_rows = {int(k): u32(v, f"dump.ff_rows.{k}") for k, v in raw_ff_rows.items()}
-    missing_die = [r for r in DIE_ID_ROWS if r not in ff_rows]
-    if missing_die:
-        raise BurnError(
-            f"ffcalc dump missing die ID rows {missing_die}; re-capture all 512 rows with --read-ff-rows"
-        )
-    die_rows_int = {r: ff_rows[r] for r in DIE_ID_ROWS}
-
-    opt_words = dump_obj.get("option_words", {})
-    if not isinstance(opt_words, dict):
-        raise BurnError("ffcalc dump missing 'option_words'")
-
-    # Extract cold fused masks and genuine defective masks for every floorsweep field.
-    expected_masks: dict[str, int] = {}
-    defect_masks: dict[str, int] = {}
-    for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
-        field = FIELDS_BY_KEY[ff_key]
-        # Prefer __fused when present because OEM firmware can mask status registers (e.g. tpc3/6).
-        raw_cur = opt_words.get(ff_key + "__fused", opt_words.get(ff_key))
-        raw_def = opt_words.get(field.defect_key) if field.defect_key else None
-        if raw_cur is not None and raw_def is not None:
-            expected_masks[vfi_name] = u32(raw_cur, f"option_words.{ff_key}")
-            defect_masks[vfi_name] = u32(raw_def, f"option_words.{field.defect_key}")
-
-    burn_list = burn_obj.get("burn")
-    if not isinstance(burn_list, list) or not burn_list:
-        raise BurnError("ffcalc burn plan has no records in 'burn'")
-
-    planned_items = []
-    for idx, item in enumerate(burn_list):
-        if not isinstance(item, dict):
-            raise BurnError(f"burn[{idx}] must be a JSON object")
-        planned_items.append(
-            {
-                "row": int(item["row"]),
-                "chain": int(item["chain"]),
-                "block": int(item["block"]),
-                "old": u32(item["old"], f"burn[{idx}].old") if "old" in item else None,
-                "new": u32(item["new"], f"burn[{idx}].new"),
-                "word": u32(item["record"], f"burn[{idx}].record"),
-                "fields": list(item.get("fields", [])),
-                "source_label": f"burn[{idx}]",
-            }
-        )
-
-    return _build_vfi_plan_from_records(
-        ff_rows=ff_rows,
-        die_rows_int=die_rows_int,
-        expected_masks=expected_masks,
-        defect_masks=defect_masks,
-        planned_items=planned_items,
-        base_sm_ceiling=base_sm_ceiling,
-        override_sm_ceiling=override_sm_ceiling,
-        prepend_noop_test=prepend_noop_test,
-        allow_shifted_first_row=False,
-        link_cap2_before=link_cap2_before,
-        link_cap2_after=link_cap2_after,
-        extra_metadata={
-            "source_ffcalc_uuid": burn_obj.get("uuid") or dump_obj.get("uuid"),
-            "source_ffcalc_fingerprint": burn_obj.get("fingerprint") or dump_obj.get("fingerprint"),
-        },
-        source_name="ffcalc",
-    )
-
-
-def _verify_ga100_expect_registers(
-    expect_registers: dict,
-    decoded: dict[str, int],
-    plan_label: str,
-) -> None:
-    """Cross-check ga100-ff-tools expect_registers against independent FF replay."""
-    for raw_key, raw_want in expect_registers.items():
-        want = u32(raw_want, f"{plan_label}.expect_registers[{raw_key}]")
-        key_upper = str(raw_key).strip().upper()
-        if key_upper.startswith("DISABLE_GEN3_SPEED"):
-            got = decoded["disable_gen3_speed_bit1"] | decoded["disable_gen3_speed_bit9"]
-        elif key_upper.startswith("BOOT_GEN23_DISABLE"):
-            got = decoded["pcie_boot_gen23_dis"]
-        elif key_upper.startswith("BOOT_GEN3_DISABLE"):
-            got = decoded["pcie_boot_gen3_dis"]
-        elif key_upper.startswith("PCIE_MAGIC_BITS_D"):
-            got = decoded["magic_d"]
-        else:
-            continue
-        if got != want:
-            raise BurnError(
-                f"{plan_label}: expect_registers[{raw_key!r}] wants 0x{want:x} "
-                f"but FF replay produces 0x{got:x}"
-            )
-
-
-def import_ga100_ff_tools_plan(
-    plan_paths: Sequence[str | Path],
-    dump_path: str | Path,
-    defects_path: str | Path,
-    *,
-    base_sm_ceiling: int,
-    override_sm_ceiling: int | None = None,
-    die_rows: dict[int, int] | None = None,
-    die_rows_path: str | Path | None = None,
-    prepend_noop_test: bool | None = None,
-    link_cap2_before: int = 0x06,
-    link_cap2_after: int = 0x1E,
-) -> dict:
-    """Convert one or more kprinssu/ga100-ff-tools plan JSONs + ff_dump.py + read_defects.py
-    into a single strict mode-0600 vfi_burn plan dict (schema_version=1).
-
-    Multiple plans from the same ``ffcard.py derive`` run (e.g. ``0_noop``, ``sm_hbm``,
-    ``pcie``, ``nvlink``) can be passed together; they are validated to share the same
-    baseline (``last_row`` + 16-hex ``fingerprint``) and sorted by starting row.
-
-    Die ID rows 8..15 are required by vfi_burn and NEVER fabricated. Because stock
-    ``ff_dump.py`` defaults to ``--start 222``, supply them via one of:
-      - rows 8..15 inside ``dump_path`` (``ff_dump.py --start 8``), OR
-      - ``die_rows_path`` (a vfi_burn snapshot, ffcalc dump, ``ff_dump.py --start 8`` dump,
-        or plain ``{"8": ..., "15": ...}`` JSON), OR
-      - ``die_rows`` dict read read-only from the live card (CLI ``--bdf``).
-    """
-    if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
-        raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")
-    if isinstance(plan_paths, (str, Path)):
-        plan_paths = [plan_paths]
-    if not plan_paths:
-        raise BurnError("at least one ga100-ff-tools plan JSON path is required")
-
-    # 1. Load & validate all ga100-ff-tools plan files.
-    loaded_plans: list[tuple[Path, dict]] = []
-    for raw_p in plan_paths:
-        pp = require_private_file(raw_p, "ga100-ff-tools plan")
-        try:
-            obj = json.loads(pp.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise BurnError(f"invalid JSON in ga100-ff-tools plan {pp}: {exc}") from exc
-        if not isinstance(obj, dict):
-            raise BurnError(f"ga100-ff-tools plan {pp} root must be a JSON object")
-        recs = obj.get("records")
-        if not isinstance(recs, list) or not recs:
-            raise BurnError(f"ga100-ff-tools plan {pp} has no records in 'records'")
-        base = obj.get("baseline")
-        if not isinstance(base, dict) or "last_row" not in base or "fingerprint" not in base:
-            raise BurnError(
-                f"ga100-ff-tools plan {pp} is missing 'baseline.last_row' / 'baseline.fingerprint'"
-            )
-        loaded_plans.append((pp, obj))
-
-    first_base = loaded_plans[0][1]["baseline"]
-    base_last_row = u32(first_base["last_row"], "baseline.last_row")
-    base_fp = str(first_base["fingerprint"]).strip().lower()
-    if not base_fp:
-        raise BurnError("ga100-ff-tools plan has empty baseline.fingerprint")
-    card_names = {str(pl.get("card")) for _, pl in loaded_plans if pl.get("card") is not None}
-    if len(card_names) > 1:
-        raise BurnError(f"ga100-ff-tools plans disagree on card name: {sorted(card_names)}")
-    for pp, pl in loaded_plans[1:]:
-        b = pl["baseline"]
-        if u32(b["last_row"], f"{pp.name}.baseline.last_row") != base_last_row or (
-            str(b["fingerprint"]).strip().lower() != base_fp
-        ):
-            raise BurnError(
-                f"ga100-ff-tools plan {pp.name} has a different baseline than {loaded_plans[0][0].name}; "
-                "all plans must come from the same ffcard.py derive run"
-            )
-    loaded_plans.sort(key=lambda pair: int(pair[1]["records"][0]["row"]))
-
-    # 2. Load & validate ff_dump.py dump JSON.
-    dp = require_private_file(dump_path, "ga100-ff-tools dump")
-    try:
-        dump_obj = json.loads(dp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in ga100-ff-tools dump {dp}: {exc}") from exc
-    if not isinstance(dump_obj, dict):
-        raise BurnError("ga100-ff-tools dump root must be a JSON object")
-    if dump_obj.get("shadow_only") is True:
-        raise BurnError("ga100-ff-tools dump was captured with --shadow-only (no FF rows)")
-    if dump_obj.get("read_errors"):
-        raise BurnError(f"ga100-ff-tools dump has read_errors on rows {dump_obj['read_errors']}")
-    if dump_obj.get("controller_idle") is False:
-        raise BurnError("ga100-ff-tools dump reports controller_idle=false")
-    if dump_obj.get("crc_status") is not None:
-        crc_val = u32(dump_obj["crc_status"], "dump.crc_status")
-        if crc_val != 0x55:
-            raise BurnError(f"ga100-ff-tools dump crc_status=0x{crc_val:02x} (expected 0x55)")
-
-    raw_rows = dump_obj.get("rows")
-    if not isinstance(raw_rows, list) or not raw_rows:
-        raise BurnError("ga100-ff-tools dump is missing 'rows' list (from ff_dump.py)")
-    ff_rows: dict[int, int] = {}
-    for entry in raw_rows:
-        if not isinstance(entry, dict) or "row" not in entry:
-            raise BurnError("ga100-ff-tools dump 'rows' entries must be JSON objects with 'row'")
-        r_idx = int(entry["row"])
-        if entry.get("error") or entry.get("raw") is None:
-            raise BurnError(f"ga100-ff-tools dump row {r_idx} was not read cleanly")
-        ff_rows[r_idx] = u32(entry["raw"], f"dump.rows[{r_idx}]")
-    for b_row in dump_obj.get("blank_rows", []):
-        ff_rows.setdefault(int(b_row), FF_EMPTY_WORD)
-
-    missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
-    if missing_ff:
-        raise BurnError(
-            f"ga100-ff-tools dump covers only {FF_ROW_MAX - FF_ROW_MIN + 1 - len(missing_ff)} of "
-            f"{FF_ROW_MAX - FF_ROW_MIN + 1} FF rows (missing e.g. {missing_ff[:5]}); "
-            "an unread row would look free"
-        )
-    # Verify baseline last_row & 16-hex fingerprint against dump rows.
-    used_rows = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if ff_rows[r] != FF_EMPTY_WORD]
-    if not used_rows:
-        raise BurnError("ga100-ff-tools dump has no occupied FF rows")
-    if used_rows != list(range(FF_ROW_MIN, used_rows[-1] + 1)):
-        raise BurnError("ga100-ff-tools dump FF rows are non-contiguous; vfi_burn's free-slot proof would refuse")
-    if used_rows[-1] != base_last_row:
-        raise BurnError(
-            f"ga100-ff-tools dump last occupied row is {used_rows[-1]}, "
-            f"but plan baseline.last_row is {base_last_row} (stale dump or plan?)"
-        )
-    computed_fp = ga100_ff_tools_fingerprint(ff_rows, base_last_row)
-    if computed_fp != base_fp:
-        raise BurnError(
-            f"ga100-ff-tools dump rows {FF_ROW_MIN}..{base_last_row} fingerprint {computed_fp} "
-            f"!= plan baseline.fingerprint {base_fp}: dump does not match this plan's card/state"
-        )
-
-    # 3. Resolve Die ID rows 8..15 (never fabricated).
-    resolved_die: dict[int, int] = {}
-    if all(r in ff_rows for r in DIE_ID_ROWS):
-        resolved_die = {r: ff_rows[r] for r in DIE_ID_ROWS}
-    if die_rows_path is not None:
-        file_die = load_die_rows_from_file(die_rows_path)
-        if resolved_die and resolved_die != file_die:
-            raise BurnError("die ID rows in dump disagree with --die-rows-from file")
-        resolved_die = file_die
-    if die_rows is not None:
-        supplied_die = {int(k): u32(v, f"die_rows.{k}") for k, v in die_rows.items() if int(k) in DIE_ID_ROWS}
-        missing_supplied = [r for r in DIE_ID_ROWS if r not in supplied_die]
-        if missing_supplied:
-            raise BurnError(f"supplied die_rows missing rows {missing_supplied}")
-        if resolved_die and resolved_die != supplied_die:
-            raise BurnError("live/supplied die ID rows disagree with dump/--die-rows-from die ID rows")
-        resolved_die = supplied_die
-    if not resolved_die:
-        raise BurnError(
-            "ga100-ff-tools ff_dump.py defaults to rows 222..487 and does not include Die ID rows 8..15; "
-            "vfi_burn requires all 8 Die ID rows for card identity verification. Supply them via "
-            "--bdf <BDF> (read-only live read), --die-rows-from <snapshot-or-die-dump.json>, "
-            "or re-run ff_dump.py with --start 8 --end 487"
-        )
-
-    # 4. Load & validate read_defects.py JSON.
-    dfp = require_private_file(defects_path, "ga100-ff-tools defects")
-    try:
-        defects_obj = json.loads(dfp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in ga100-ff-tools defects {dfp}: {exc}") from exc
-    if not isinstance(defects_obj, dict) or not isinstance(defects_obj.get("registers"), list):
-        raise BurnError("ga100-ff-tools defects file must contain a 'registers' list (from read_defects.py)")
-    defect_regs: dict[str, int] = {}
-    for entry in defects_obj["registers"]:
-        if not isinstance(entry, dict) or "name" not in entry or "value" not in entry:
-            raise BurnError("ga100-ff-tools defects 'registers' entries must have 'name' and 'value'")
-        rname = str(entry["name"]).strip().upper()
-        defect_regs[rname] = u32(entry["value"], f"defects.{rname}")
-
-    missing_def = [name for name in GA100_FF_TOOLS_REQUIRED_DEFECTS if name not in defect_regs]
-    if missing_def:
-        raise BurnError(
-            f"ga100-ff-tools defects file is missing required defect register(s): {', '.join(missing_def)}"
-        )
-    defect_masks: dict[str, int] = {
-        vfi_field: defect_regs[reg_name]
-        for reg_name, vfi_field in GA100_FF_TOOLS_DEFECT_TO_FIELD.items()
-        if reg_name in defect_regs
-    }
-
-    # 5. Replay baseline FF rows and cross-check dump shadow + defects OPT_* registers.
-    base_blocks = replay_ff_rows(ff_rows)
-    replay_fields = decode_all_fields(base_blocks)
-
-    shadow = dump_obj.get("shadow")
-    if isinstance(shadow, dict):
-        for opt_name, ff_key in GA100_FF_TOOLS_FIELD_TO_KEY.items():
-            if opt_name in shadow and shadow[opt_name] is not None:
-                sh_val = u32(shadow[opt_name], f"dump.shadow.{opt_name}")
-                if sh_val != replay_fields[ff_key]:
-                    raise BurnError(
-                        f"ga100-ff-tools dump shadow {opt_name}=0x{sh_val:x} disagrees with FF replay "
-                        f"0x{replay_fields[ff_key]:x} (was ff_dump.py captured before SENSE_CTRL or on another card?)"
-                    )
-    for opt_name in ("OPT_PES_DISABLE", "OPT_ROP_L2_DISABLE"):
-        if opt_name in defect_regs:
-            ff_key = GA100_FF_TOOLS_FIELD_TO_KEY[opt_name]
-            if defect_regs[opt_name] != replay_fields[ff_key]:
-                raise BurnError(
-                    f"ga100-ff-tools defects {opt_name}=0x{defect_regs[opt_name]:x} disagrees with FF replay "
-                    f"0x{replay_fields[ff_key]:x} (defects file from a different card/state?)"
-                )
-
-    expected_masks: dict[str, int] = {
-        vfi_name: replay_fields[ff_key]
-        for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items()
-        if vfi_name in defect_masks
-    }
-
-    # 6. Flatten records across the sorted plans and track per-subplan end indices for expectation checks.
-    planned_items: list[dict] = []
-    subplan_end_checks: dict[int, tuple[str, dict]] = {}
-    modes: list[str] = []
-    for pp, pl in loaded_plans:
-        mode = str(pl.get("mode", pp.stem))
-        modes.append(mode)
-        for j, rec in enumerate(pl["records"]):
-            if not isinstance(rec, dict):
-                raise BurnError(f"{pp.name}.records[{j}] must be a JSON object")
-            for req_k in ("chain", "block", "new_data", "encoded", "row"):
-                if req_k not in rec:
-                    raise BurnError(f"{pp.name}.records[{j}] missing required key {req_k!r}")
-            planned_items.append(
-                {
-                    "row": int(rec["row"]),
-                    "chain": int(rec["chain"]),
-                    "block": int(rec["block"]),
-                    "old": u32(rec["old_data"], f"{pp.name}.records[{j}].old_data")
-                    if "old_data" in rec
-                    else None,
-                    "new": u32(rec["new_data"], f"{pp.name}.records[{j}].new_data"),
-                    "word": u32(rec["encoded"], f"{pp.name}.records[{j}].encoded"),
-                    "fields": [],
-                    "note": str(rec["note"]).strip() if rec.get("note") else None,
-                    "source_label": f"{pp.name}[{j}]",
-                }
-            )
-        subplan_end_checks[len(planned_items) - 1] = (pp.name, pl)
-
-    # 7. Auto-detect whether record 0 is already a verified 0-bit-diff no-op (e.g. *_plan_0_noop.json).
-    first_is_noop = False
-    try:
-        verify_noop_test_record(planned_items[0]["word"], base_blocks)
-        first_is_noop = True
-    except BurnError:
-        first_is_noop = False
-
-    if prepend_noop_test is None:
-        do_prepend = not first_is_noop
-    elif prepend_noop_test is True:
-        do_prepend = not first_is_noop
-    else:
-        do_prepend = False
-
-    def _check_subplan_expectations(idx: int, cur_rows: dict[int, int]) -> None:
-        if idx not in subplan_end_checks:
-            return
-        pname, pl = subplan_end_checks[idx]
-        cur_decoded = decode_all_fields(replay_ff_rows(cur_rows))
-        exp_fields = pl.get("expect_fields")
-        if isinstance(exp_fields, dict):
-            for opt_name, raw_want in exp_fields.items():
-                ff_key = GA100_FF_TOOLS_FIELD_TO_KEY.get(str(opt_name).strip().upper())
-                if ff_key is None:
-                    continue
-                want = u32(raw_want, f"{pname}.expect_fields.{opt_name}")
-                got = cur_decoded[ff_key]
-                if got != want:
-                    raise BurnError(
-                        f"{pname}: expect_fields.{opt_name}=0x{want:x} disagrees with "
-                        f"independent FF replay 0x{got:x}"
-                    )
-        unch = pl.get("unchanged_fields")
-        if isinstance(unch, dict):
-            for opt_name, raw_want in unch.items():
-                ff_key = GA100_FF_TOOLS_FIELD_TO_KEY.get(str(opt_name).strip().upper())
-                if ff_key is None:
-                    continue
-                want = u32(raw_want, f"{pname}.unchanged_fields.{opt_name}")
-                got = cur_decoded[ff_key]
-                if got != want:
-                    raise BurnError(
-                        f"{pname}: unchanged_fields.{opt_name}=0x{want:x} changed to 0x{got:x} during FF replay"
-                    )
-        exp_regs = pl.get("expect_registers")
-        if isinstance(exp_regs, dict):
-            _verify_ga100_expect_registers(exp_regs, cur_decoded, pname)
-
-    return _build_vfi_plan_from_records(
-        ff_rows=ff_rows,
-        die_rows_int=resolved_die,
-        expected_masks=expected_masks,
-        defect_masks=defect_masks,
-        planned_items=planned_items,
-        base_sm_ceiling=base_sm_ceiling,
-        override_sm_ceiling=override_sm_ceiling,
-        prepend_noop_test=do_prepend,
-        allow_shifted_first_row=True,
-        link_cap2_before=link_cap2_before,
-        link_cap2_after=link_cap2_after,
-        extra_metadata={
-            "source_format": "ga100-ff-tools",
-            "source_ga100_ff_tools_card": next(iter(card_names), None),
-            "source_ga100_ff_tools_modes": modes,
-            "source_ga100_ff_tools_baseline": {
-                "last_row": base_last_row,
-                "fingerprint": base_fp,
-            },
-        },
-        source_name="ga100-ff-tools",
-        on_record_replayed=_check_subplan_expectations,
-    )

@@ -9,8 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import json
-import re
-import shlex
 import sys
 
 from .backend import (
@@ -41,12 +39,11 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
-from .fuses import DIE_ID_ROWS
+from .ffrecord import decode_ff, fields_in_block
 from .ga100 import GA100LiveAdapter
-from .model import BurnError, Plan, SKU_CMP170HX_8GB, require_private_file, u32
-
-_BDF_INPUT_RE = re.compile(r"^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+from .menuconfig import run_menuconfig
+from .model import BurnError, Plan, require_private_file, u32
+from .planner import build_plan_from_config, capture_card_snapshot
 
 
 @dataclass
@@ -73,6 +70,7 @@ class BurnMenu:
         check_tty: bool = True,
     ) -> None:
         self.s = session or MenuSession()
+        self._custom_io = (input_fn is not None) or (show is not None)
         self.input_fn = input_fn if input_fn is not None else (lambda prompt="": input(prompt))
         self.show = show if show is not None else (lambda *args, **kwargs: print(*args, **kwargs))
         self.check_tty = check_tty
@@ -202,7 +200,7 @@ class BurnMenu:
         self.show(f"  Journal   : {self.s.journal_path}" + (f" | Receipt: {self.s.receipt_path}" if self.s.receipt_path else ""))
         self.show(f"  Overrides : {ov_str}")
         self.show("-" * 72)
-        self.show("   [1] Setup / Load Plan, Import ffcalc / ga100-ff-tools, Target BDF & Mode")
+        self.show("   [1] Setup / Target BDF, Configure Unlocks (menuconfig) & Mode")
         self.show("   [2] Review Plan & Expected Outcome (enabled/disabled, unknown fuses, FF rows)")
         self.show("   [3] Live Status & Passive Inspection (safe on cold/faulted cards)")
         self.show("   [4] Run Active Sense (SENSE_CTRL: EFP 0->1, checks PLM_f8)")
@@ -254,87 +252,69 @@ class BurnMenu:
             return
         fn()
 
+    def _configure_unlocks_interactive(self) -> None:
+        if not (self.s.bdf or self.s.fake_path or self.s.adapter_spec):
+            bdf = self._ask("CMP 170HX PCI BDF to read card state (e.g. 0000:05:00.0)")
+            if not bdf:
+                raise BurnError("select a live GPU (--bdf) or fake snapshot first")
+            self.s.bdf = bdf
+            self.s.execute_live = False
+
+        backend, owned = self._open_backend(writable=False)
+        try:
+            check_host_readonly_safe(backend.host())
+            card = capture_card_snapshot(backend, label=self._target_label())
+        finally:
+            self._close_if_owned(backend, owned)
+
+        cfg = run_menuconfig(
+            card,
+            use_curses=False if self._custom_io else None,
+            input_fn=self.input_fn if self._custom_io else None,
+            show=self.show if self._custom_io else None,
+        )
+        if cfg is None:
+            self.show("Unlock configuration cancelled.")
+            return
+
+        plan_dict = build_plan_from_config(card, cfg)
+        out = self._ask("Save mode-0600 plan JSON path", self.s.plan_path or "private/plan.json")
+        if not out:
+            self.show("Plan not saved (no output path given).")
+            return
+        write_private_json(out, plan_dict)
+        loaded = Plan.load(out)
+        self._validate_plan_for_setup(loaded)
+        self.s.plan_path = out
+        self.show(
+            f"Saved & loaded {out} ({len(loaded.records)} records: 1 auto no-op test + "
+            f"{len(loaded.records) - 1} real; {cfg.summary_line()})."
+        )
+
     # ------------------------------------------------------------------ [1] Setup
     def _menu_setup(self) -> None:
         while True:
             self.show("\n--- [1] Setup ---")
-            self.show(f"  [a] Select plan JSON             (current: {self.s.plan_path or 'none'})")
-            self.show("  [b] Import cmp170hx-ffcalc plan + 512-row dump -> new 0600 plan")
+            self.show("  [a] Configure Unlocks from Card (menuconfig) -> build & load 0600 plan")
+            self.show(f"  [b] Load saved plan JSON         (current: {self.s.plan_path or 'none'})")
             self.show(f"  [c] Select LIVE GPU (--bdf)      (current: {self.s.bdf or 'none'})")
             self.show(f"  [d] Select FAKE snapshot (--fake)    (current: {self.s.fake_path or 'none'})")
             self.show(f"  [e] Select journal path          (current: {self.s.journal_path})")
             self.show(f"  [f] Select test receipt path     (current: {self.s.receipt_path or 'none'})")
             self.show(f"  [g] Toggle Live Execute mode     (current: {'ON' if self.s.execute_live else 'OFF (safe)'})")
-            self.show("  [h] Import ga100-ff-tools plan(s) + dump + defects -> new 0600 plan")
             self.show("  [0] Back to main menu")
-            sub = self.input_fn("Setup [a-h, 0]: ").strip().lower()
+            sub = self.input_fn("Setup [a-g, 0]: ").strip().lower()
             if sub in ("0", "", "b0", "back"):
                 return
             if sub == "a":
-                path = self._ask("Path to mode-0600 plan JSON", self.s.plan_path)
+                self._configure_unlocks_interactive()
+            elif sub == "b":
+                path = self._ask("Path to mode-0600 vfi_burn plan JSON", self.s.plan_path)
                 if path:
                     p = Plan.load(path)
                     self._validate_plan_for_setup(p)
                     self.s.plan_path = path
                     self.show(f"Loaded valid plan ({len(p.records)} records, sha={p.content_hash[:12]}).")
-            elif sub == "b":
-                bp = self._ask("ffcalc burn.json path")
-                dp = self._ask("ffcalc 512-row dump.json path")
-                out = self._ask("Output mode-0600 plan path", "private/plan.json")
-                noop = self._ask("Prepend safe no-op test row? (y/n)", "y").lower().startswith("y")
-                base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
-                if not base_sm_s:
-                    raise BurnError("SM ceiling is required; the card cannot supply it")
-                plan_dict = import_ffcalc_plan(
-                    bp, dp, base_sm_ceiling=int(base_sm_s, 0), prepend_noop_test=noop
-                )
-                write_private_json(out, plan_dict)
-                loaded = Plan.load(out)
-                self._validate_plan_for_setup(loaded)
-                self.s.plan_path = out
-                self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
-            elif sub == "h":
-                raw_plans = self._ask("ga100-ff-tools plan JSON path(s) (space- or comma-separated)")
-                plan_list = shlex.split(raw_plans.replace(",", " ")) if raw_plans else []
-                if not plan_list:
-                    raise BurnError("at least one ga100-ff-tools plan JSON path is required")
-                dp = self._ask("ga100-ff-tools ff_dump.py JSON path")
-                dfp = self._ask("ga100-ff-tools read_defects.py JSON path")
-                die_src = self._ask(
-                    "Die ID rows 8..15 source (blank if in dump, JSON path, or live PCI BDF)",
-                    self.s.bdf,
-                )
-                out = self._ask("Output mode-0600 plan path", "private/plan.json")
-                base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
-                if not base_sm_s:
-                    raise BurnError("SM ceiling is required; the card cannot supply it")
-                live_die: dict[int, int] | None = None
-                die_path: str | None = None
-                if die_src:
-                    if _BDF_INPUT_RE.match(die_src.strip().lower()):
-                        with GA100LiveAdapter(die_src.strip(), writable=False) as backend:
-                            check_host_readonly_safe(backend.host())
-                            pci = backend.pci_id()
-                            if pci != SKU_CMP170HX_8GB:
-                                raise BurnError(
-                                    f"unexpected PCI ID {pci} at {die_src} (expected {SKU_CMP170HX_8GB})"
-                                )
-                            live_die = {r: backend.die_row(r) for r in DIE_ID_ROWS}
-                    else:
-                        die_path = die_src
-                plan_dict = import_ga100_ff_tools_plan(
-                    plan_list,
-                    dp,
-                    dfp,
-                    base_sm_ceiling=int(base_sm_s, 0),
-                    die_rows=live_die,
-                    die_rows_path=die_path,
-                )
-                write_private_json(out, plan_dict)
-                loaded = Plan.load(out)
-                self._validate_plan_for_setup(loaded)
-                self.s.plan_path = out
-                self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
             elif sub == "c":
                 bdf = self._ask("CMP 170HX PCI BDF (e.g. 0000:05:00.0)", self.s.bdf)
                 self.s.bdf = bdf or None

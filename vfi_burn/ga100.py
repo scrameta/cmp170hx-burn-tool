@@ -32,7 +32,9 @@ from .fuses import (
     DIE_ID_ROWS,
     EXPERIMENTAL_INSPECT_REGS,
     EXPERIMENTAL_REGS_BY_NAME,
+    FFCALC_KEY_TO_FIELD,
     FF_EMPTY_WORD,
+    FUSES_BY_KEY,
     OPTION_REGS,
     REG_CRC_STATUS,
     REG_CTRL_WR_SECURE,
@@ -815,3 +817,85 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
             "controller_state": controller_state,
             "experimental_registers": experimental_registers,
         }
+
+
+def read_ga100_card_state(
+    backend,
+    *,
+    label: str = "live GPU",
+) -> dict:
+    """Read full read-only card state (Die IDs 8..15, FF rows 222..486, all 16 defect masks,
+    fused option shadows, and optional PCIe LnkCap2) for the built-in unlock configurator.
+
+    Refuses to read defect/shadow masks when ``EFP != 1`` (unsensed pre-SENSE_CTRL glitch
+    window where option/defect shadows read 0) so genuine silicon defects are never missed.
+    Caller must already have verified ``check_host_readonly_safe(backend.host())``.
+    """
+    pci = backend.pci_id()
+    if pci != SKU_CMP170HX_8GB:
+        raise BurnError(f"unexpected PCI ID {pci} at {label} (expected {SKU_CMP170HX_8GB})")
+
+    health = backend.health()
+    if health.fusectrl == 0xFFFFFFFF or is_poison(health.fusectrl):
+        raise BurnError(
+            f"{label}: FUSECTRL reads 0x{health.fusectrl:08x} (BAR0 inaccessible or poisoned)"
+        )
+    if not is_fusectrl_idle(health.fusectrl):
+        raise BurnError(
+            f"{label}: FUSECTRL is not IDLE (0x{health.fusectrl:08x}); refusing read"
+        )
+    if health.crc != 0x55:
+        raise BurnError(
+            f"{label}: CRC_STATUS=0x{health.crc:02x} (expected 0x55); cannot trust fuse reads"
+        )
+    if health.efp != 1:
+        raise BurnError(
+            f"{label} option/defect shadow registers are UNSENSED (EFP={health.efp}, DSOV={health.dsov}): "
+            "all OPT_*_DEFECTIVE registers read 0 until SENSE_CTRL runs, so genuine silicon defects "
+            "cannot be read yet. Either configure unlocks on a cold card (before glitching) or run "
+            "[4] Active Sense (SENSE_CTRL) first so EFP=1."
+        )
+
+    die_rows = {r: backend.die_row(r) for r in DIE_ID_ROWS}
+    ff_rows = {r: backend.fuse_row(r) for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)}
+
+    defect_masks: dict[str, int] = {}
+    for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
+        addr = FUSES_BY_KEY[ff_key].defect_addr
+        if addr is None:
+            continue
+        val = backend.register(addr)
+        if val == 0xFFFFFFFF or is_poison(val):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{val:08x} from defect register {vfi_name} (0x{addr:08x})"
+            )
+        defect_masks[vfi_name] = val
+
+    shadow_masks: dict[str, int] = {}
+    for ff_key in FFCALC_KEY_TO_FIELD.keys():
+        addr = FUSES_BY_KEY[ff_key].fused_addr
+        if addr is None:
+            continue
+        val = backend.register(addr)
+        if val == 0xFFFFFFFF or is_poison(val):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{val:08x} from fused shadow {ff_key} (0x{addr:08x})"
+            )
+        shadow_masks[ff_key] = val
+
+    lnkcap2 = 0x06
+    try:
+        lc = backend.field("LnkCap2")
+        if not is_poison(lc) and lc != 0xFFFFFFFF:
+            lnkcap2 = lc
+    except Exception:
+        pass
+
+    return {
+        "pci_id": pci,
+        "die_rows": die_rows,
+        "ff_rows": ff_rows,
+        "defect_masks": defect_masks,
+        "shadow_masks": shadow_masks,
+        "lnkcap2": lnkcap2,
+    }
