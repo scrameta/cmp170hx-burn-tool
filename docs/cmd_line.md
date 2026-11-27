@@ -15,7 +15,7 @@ This page documents the scriptable `python3 -m vfi_burn <command>` interface. Fo
 | `plan` | Pure offline plan validation and review | Never |
 | `decode <word>` | Decode a 32-bit GA100 FF record word into chain/block/data/fields | Never |
 | `import-ffcalc` | Convert a `cmp170hx-ffcalc` `burn.json` + 512-row card `dump.json` into a mode-0600 `vfi_burn` plan | Never |
-| `import-ga100-ff-tools` | Convert one or more `ga100-ff-tools` plan JSONs + `ff_dump.py` + `read_defects.py` into a mode-0600 `vfi_burn` plan | Only read-only if `--bdf` is used for Die ID rows `8..15` |
+| `import-ga100-ff-tools` | Convert a `ga100-ff-tools` plan directory or JSON file(s) into a mode-0600 `vfi_burn` plan (reads card state live via `--bdf` or from optional `--dump`/`--defects`) | Only read-only if `--bdf` is used |
 | `snapshot` | Capture a mode-0600 cold-boot snapshot from a live CMP 170HX for `verify-cold` | Read-only |
 | `inspect` | Read-only preflight, health report, and free-slot proof (`--sense` explicitly invokes `SENSE_CTRL`) | Read-only (unless `--sense`) |
 | `burn` | Live hardware burn workflow — passive **dry-run by default**; requires `--execute` + TTY to program fuses | Only with `--execute` |
@@ -72,19 +72,19 @@ python3 -m vfi_burn import-ffcalc \
 #   The importer refuses stale/partial dumps, non-contiguous or colliding rows, wrong `old`
 #   values, and dumps whose fused masks disagree with the FF replay.
 
-# 1B. Or import one or more ga100-ff-tools plans + ff_dump.py + read_defects.py:
-#     (Stock ff_dump.py starts at row 222 and omits Die ID rows 8..15; pass --bdf <BDF> for a
-#      read-only live read of rows 8..15, --die-rows-from <file>, or ff_dump.py --start 8.)
+# 1B. Or point directly at a ga100-ff-tools plan directory (or individual plan JSONs):
+#     When card-dump.json / card-defects.json are not present next to the plans, --bdf reads
+#     current FF rows (222..486), Die ID rows (8..15), and all 16 genuine defect masks directly
+#     (read-only) from the live cold/sensed GPU and verifies baseline.fingerprint against it.
 sudo python3 -m vfi_burn import-ga100-ff-tools \
-  --plans private/card_plan_0_noop.json private/card_plan_sm_hbm.json \
-  --dump private/card-dump.json \
-  --defects private/card-defects.json \
+  --plans /path/to/cmp170_burn \
   --bdf 0000:05:00.0 \
   --base-sm <YOUR_REVIEWED_SM_CEILING> \
   --out private/plan.json
-#   Include card_plan_pcie.json / card_plan_nvlink.json in --plans if desired (burning
-#   experimental PCIe Gen4 MAGIC_BITS_D records or NVLink without OPT_SYS_PIPE_DEFECTIVE
-#   requires --override-unmapped-ff / menu [7] -> [8]).
+#   Or pass a specific subset (e.g. --plans card_plan_pcie.json) or offline files
+#   (--dump card-dump.json --defects card-defects.json --die-rows-from snapshot.json).
+#   Burning experimental PCIe Gen4 MAGIC_BITS_D records requires --override-unmapped-ff
+#   (menu [7] -> [8]).
 
 # 2. Review every decoded record, die ID row (8..15), and defect mask offline:
 python3 -m vfi_burn plan --plan private/plan.json

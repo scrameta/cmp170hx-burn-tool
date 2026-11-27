@@ -40,14 +40,20 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
+from .ffrecord import (
+    decode_ff,
+    discover_ga100_ff_tools_inputs,
+    fields_in_block,
+    import_ffcalc_plan,
+    import_ga100_ff_tools_plan,
+)
 from .fuses import (
     DIE_ID_ROWS,
     EXPERIMENTAL_BY_ADDR,
     EXPERIMENTAL_BY_NAME,
     decode_experimental_register,
 )
-from .ga100 import GA100LiveAdapter
+from .ga100 import GA100LiveAdapter, read_ga100_import_state
 from .journal import Journal
 from .menu import BurnMenu, MenuSession
 from .mmio import resolve_register_address
@@ -228,12 +234,24 @@ def execute_decode(word_raw: str, *, io: CommandIO | None = None) -> int:
 
 def read_live_die_rows(bdf: str) -> dict[int, int]:
     """Read Die ID rows 8..15 read-only from a live CMP 170HX GPU."""
+    return read_live_ga100_card_state(bdf, need_ff_rows=False, need_defects=False)["die_rows"]
+
+
+def read_live_ga100_card_state(
+    bdf: str,
+    *,
+    need_ff_rows: bool = True,
+    need_defects: bool = True,
+) -> dict:
+    """Read Die ID rows and (optionally) FF rows + genuine defect masks read-only from a live GPU."""
     with GA100LiveAdapter(bdf, writable=False) as backend:
         check_host_readonly_safe(backend.host())
-        pci = backend.pci_id()
-        if pci != SKU_CMP170HX_8GB:
-            raise BurnError(f"unexpected PCI ID {pci} at {bdf} (expected {SKU_CMP170HX_8GB})")
-        return {r: backend.die_row(r) for r in DIE_ID_ROWS}
+        return read_ga100_import_state(
+            backend,
+            need_ff_rows=need_ff_rows,
+            need_defects=need_defects,
+            label=f"live GPU {bdf}",
+        )
 
 
 def _check_imported_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
@@ -281,10 +299,10 @@ def execute_import_ffcalc(
 def execute_import_ga100_ff_tools(
     *,
     plans: Sequence[str],
-    dump: str,
-    defects: str,
     out: str,
     base_sm: int,
+    dump: str | None = None,
+    defects: str | None = None,
     override_sm: int | None = None,
     die_rows_from: str | None = None,
     bdf: str | None = None,
@@ -294,15 +312,29 @@ def execute_import_ga100_ff_tools(
     io: CommandIO | None = None,
 ) -> int:
     io = io or CommandIO()
-    live_die = read_live_die_rows(bdf) if bdf else None
+    discovered_plans, auto_dump, auto_defects = discover_ga100_ff_tools_inputs(plans)
+    resolved_dump = dump or (str(auto_dump) if auto_dump is not None else None)
+    resolved_defects = defects or (str(auto_defects) if auto_defects is not None else None)
+
+    live_state: dict | None = None
+    if bdf:
+        live_state = read_live_ga100_card_state(
+            bdf,
+            need_ff_rows=(resolved_dump is None),
+            need_defects=(resolved_defects is None),
+        )
+
     plan_dict = import_ga100_ff_tools_plan(
-        plans,
-        dump,
-        defects,
+        [info.path for info in discovered_plans],
+        resolved_dump,
+        resolved_defects,
         base_sm_ceiling=base_sm,
         override_sm_ceiling=override_sm,
-        die_rows=live_die,
+        die_rows=live_state["die_rows"] if live_state is not None else None,
         die_rows_path=die_rows_from,
+        live_ff_rows=live_state["ff_rows"] if live_state is not None else None,
+        live_shadow_masks=live_state["shadow_masks"] if live_state is not None else None,
+        live_defect_masks=live_state["defect_masks"] if live_state is not None else None,
         prepend_noop_test=prepend_noop_test,
         link_cap2_before=link_cap2_before,
         link_cap2_after=link_cap2_after,

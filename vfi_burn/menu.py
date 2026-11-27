@@ -41,10 +41,16 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
-from .fuses import DIE_ID_ROWS
-from .ga100 import GA100LiveAdapter
-from .model import BurnError, Plan, SKU_CMP170HX_8GB, require_private_file, u32
+from .ffrecord import (
+    decode_ff,
+    discover_ga100_ff_tools_inputs,
+    fields_in_block,
+    import_ffcalc_plan,
+    import_ga100_ff_tools_plan,
+    is_ga100_ff_tools_plan_file,
+)
+from .ga100 import GA100LiveAdapter, read_ga100_import_state
+from .model import BurnError, Plan, require_private_file, u32
 
 _BDF_INPUT_RE = re.compile(r"^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
@@ -254,6 +260,151 @@ class BurnMenu:
             return
         fn()
 
+    def _read_live_import_state(
+        self,
+        bdf: str,
+        *,
+        need_ff_rows: bool,
+        need_defects: bool,
+    ) -> dict:
+        with GA100LiveAdapter(bdf.strip(), writable=False) as backend:
+            check_host_readonly_safe(backend.host())
+            return read_ga100_import_state(
+                backend,
+                need_ff_rows=need_ff_rows,
+                need_defects=need_defects,
+                label=f"live GPU {bdf.strip()}",
+            )
+
+    def _import_ga100_ff_tools_interactive(self, initial_path: str | None = None) -> None:
+        raw_plans = (
+            initial_path
+            if initial_path is not None
+            else self._ask("Path to ga100-ff-tools plan directory or JSON file(s)")
+        )
+        raw_inputs = shlex.split(raw_plans.replace(",", " ")) if raw_plans else []
+        if not raw_inputs:
+            raise BurnError("at least one ga100-ff-tools plan directory or JSON path is required")
+
+        discovered, auto_dump, auto_defects = discover_ga100_ff_tools_inputs(raw_inputs)
+        selected = discovered
+        if len(discovered) > 1 and any(Path(p).is_dir() for p in raw_inputs):
+            self.show(f"\nFound {len(discovered)} ga100-ff-tools plan(s):")
+            for i, info in enumerate(discovered, start=1):
+                row_span = (
+                    f"row {info.first_row}"
+                    if info.first_row == info.last_row
+                    else f"rows {info.first_row}..{info.last_row}"
+                )
+                rec_word = "record" if info.record_count == 1 else "records"
+                self.show(
+                    f"  [{i}] {info.path.name}  (mode={info.mode}, {row_span}, {info.record_count} {rec_word})"
+                )
+            pick = self._ask("Which plans to import? ('all', or numbers like '1,2' or '3')", "all")
+            if pick.lower() != "all":
+                chosen_idxs: list[int] = []
+                for tok in pick.replace(",", " ").split():
+                    if "-" in tok:
+                        a_s, b_s = tok.split("-", 1)
+                        a_i, b_i = int(a_s), int(b_s)
+                        if not (1 <= a_i <= b_i <= len(discovered)):
+                            raise BurnError(f"plan selection {tok!r} outside 1..{len(discovered)}")
+                        chosen_idxs.extend(range(a_i, b_i + 1))
+                    else:
+                        idx = int(tok)
+                        if not (1 <= idx <= len(discovered)):
+                            raise BurnError(f"plan selection {idx} outside 1..{len(discovered)}")
+                        chosen_idxs.append(idx)
+                if not chosen_idxs:
+                    raise BurnError("no plans selected")
+                seen_i: set[int] = set()
+                selected = []
+                for idx in chosen_idxs:
+                    if idx not in seen_i:
+                        seen_i.add(idx)
+                        selected.append(discovered[idx - 1])
+
+        resolved_dump: str | None = str(auto_dump) if auto_dump is not None else None
+        resolved_defects: str | None = str(auto_defects) if auto_defects is not None else None
+        live_state: dict | None = None
+        die_path: str | None = None
+
+        if resolved_dump and resolved_defects:
+            self.show(
+                f"Auto-detected card dump ({Path(resolved_dump).name}) and defects ({Path(resolved_defects).name})."
+            )
+            die_src = self._ask(
+                "Die ID rows 8..15 source (blank if in dump, JSON path, or live PCI BDF)",
+                self.s.bdf,
+            )
+            if die_src:
+                if _BDF_INPUT_RE.match(die_src.strip().lower()):
+                    live_state = self._read_live_import_state(
+                        die_src.strip(), need_ff_rows=False, need_defects=False
+                    )
+                else:
+                    die_path = die_src
+        else:
+            self.show(
+                "\nCard dump/defects JSONs were not found next to these plans — vfi_burn can read "
+                "current FF rows, Die IDs, and genuine defect masks directly (read-only) from your GPU."
+            )
+            src = self._ask(
+                "Live GPU PCI BDF (e.g. 0000:05:00.0, or 'files' to enter dump/defects JSON paths)",
+                self.s.bdf,
+            )
+            if not src:
+                raise BurnError(
+                    "need a live GPU PCI BDF (or type 'files' to provide ff_dump + read_defects JSONs)"
+                )
+            if src.strip().lower() == "files":
+                resolved_dump = self._ask("ga100-ff-tools ff_dump.py JSON path", resolved_dump)
+                resolved_defects = self._ask("ga100-ff-tools read_defects.py JSON path", resolved_defects)
+                die_src = self._ask(
+                    "Die ID rows 8..15 source (blank if in dump, JSON path, or live PCI BDF)",
+                    self.s.bdf,
+                )
+                if die_src:
+                    if _BDF_INPUT_RE.match(die_src.strip().lower()):
+                        live_state = self._read_live_import_state(
+                            die_src.strip(), need_ff_rows=False, need_defects=False
+                        )
+                    else:
+                        die_path = die_src
+            else:
+                bdf = src.strip()
+                live_state = self._read_live_import_state(
+                    bdf,
+                    need_ff_rows=(resolved_dump is None),
+                    need_defects=(resolved_defects is None),
+                )
+                if not self.s.bdf and not self.s.fake_path and not self.s.adapter_spec:
+                    self.s.bdf = bdf
+                    self.s.execute_live = False
+                    self.show(f"Target GPU also set to {bdf} (read-only).")
+
+        out = self._ask("Output mode-0600 vfi_burn plan path", "private/plan.json")
+        base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
+        if not base_sm_s:
+            raise BurnError("SM ceiling is required; the card cannot supply it")
+
+        plan_dict = import_ga100_ff_tools_plan(
+            [info.path for info in selected],
+            resolved_dump,
+            resolved_defects,
+            base_sm_ceiling=int(base_sm_s, 0),
+            die_rows=live_state["die_rows"] if live_state is not None else None,
+            die_rows_path=die_path,
+            live_ff_rows=live_state["ff_rows"] if live_state is not None else None,
+            live_shadow_masks=live_state["shadow_masks"] if live_state is not None else None,
+            live_defect_masks=live_state["defect_masks"] if live_state is not None else None,
+        )
+        write_private_json(out, plan_dict)
+        loaded = Plan.load(out)
+        self._validate_plan_for_setup(loaded)
+        self.s.plan_path = out
+        self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
+
     # ------------------------------------------------------------------ [1] Setup
     def _menu_setup(self) -> None:
         while True:
@@ -265,14 +416,23 @@ class BurnMenu:
             self.show(f"  [e] Select journal path          (current: {self.s.journal_path})")
             self.show(f"  [f] Select test receipt path     (current: {self.s.receipt_path or 'none'})")
             self.show(f"  [g] Toggle Live Execute mode     (current: {'ON' if self.s.execute_live else 'OFF (safe)'})")
-            self.show("  [h] Import ga100-ff-tools plan(s) + dump + defects -> new 0600 plan")
+            self.show("  [h] Import ga100-ff-tools plan dir or JSON(s) -> new 0600 plan")
             self.show("  [0] Back to main menu")
             sub = self.input_fn("Setup [a-h, 0]: ").strip().lower()
             if sub in ("0", "", "b0", "back"):
                 return
             if sub == "a":
-                path = self._ask("Path to mode-0600 plan JSON", self.s.plan_path)
+                path = self._ask("Path to mode-0600 plan JSON (or ga100-ff-tools dir/plan)", self.s.plan_path)
                 if path:
+                    p_obj = Path(path)
+                    if p_obj.is_dir() or is_ga100_ff_tools_plan_file(p_obj):
+                        self.show(
+                            f"Detected ga100-ff-tools plan(s) at {path} "
+                            "(needs one-step import into vfi_burn schema_version=1 format)."
+                        )
+                        if self._ask("Import into a vfi_burn plan now? (y/n)", "y").lower().startswith("y"):
+                            self._import_ga100_ff_tools_interactive(initial_path=path)
+                            continue
                     p = Plan.load(path)
                     self._validate_plan_for_setup(p)
                     self.s.plan_path = path
@@ -294,47 +454,7 @@ class BurnMenu:
                 self.s.plan_path = out
                 self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
             elif sub == "h":
-                raw_plans = self._ask("ga100-ff-tools plan JSON path(s) (space- or comma-separated)")
-                plan_list = shlex.split(raw_plans.replace(",", " ")) if raw_plans else []
-                if not plan_list:
-                    raise BurnError("at least one ga100-ff-tools plan JSON path is required")
-                dp = self._ask("ga100-ff-tools ff_dump.py JSON path")
-                dfp = self._ask("ga100-ff-tools read_defects.py JSON path")
-                die_src = self._ask(
-                    "Die ID rows 8..15 source (blank if in dump, JSON path, or live PCI BDF)",
-                    self.s.bdf,
-                )
-                out = self._ask("Output mode-0600 plan path", "private/plan.json")
-                base_sm_s = self._ask("Operator-supplied non-defective SM ceiling (REQUIRED, e.g. 122)")
-                if not base_sm_s:
-                    raise BurnError("SM ceiling is required; the card cannot supply it")
-                live_die: dict[int, int] | None = None
-                die_path: str | None = None
-                if die_src:
-                    if _BDF_INPUT_RE.match(die_src.strip().lower()):
-                        with GA100LiveAdapter(die_src.strip(), writable=False) as backend:
-                            check_host_readonly_safe(backend.host())
-                            pci = backend.pci_id()
-                            if pci != SKU_CMP170HX_8GB:
-                                raise BurnError(
-                                    f"unexpected PCI ID {pci} at {die_src} (expected {SKU_CMP170HX_8GB})"
-                                )
-                            live_die = {r: backend.die_row(r) for r in DIE_ID_ROWS}
-                    else:
-                        die_path = die_src
-                plan_dict = import_ga100_ff_tools_plan(
-                    plan_list,
-                    dp,
-                    dfp,
-                    base_sm_ceiling=int(base_sm_s, 0),
-                    die_rows=live_die,
-                    die_rows_path=die_path,
-                )
-                write_private_json(out, plan_dict)
-                loaded = Plan.load(out)
-                self._validate_plan_for_setup(loaded)
-                self.s.plan_path = out
-                self.show(f"Imported & loaded {out} ({len(loaded.records)} records).")
+                self._import_ga100_ff_tools_interactive()
             elif sub == "c":
                 bdf = self._ask("CMP 170HX PCI BDF (e.g. 0000:05:00.0)", self.s.bdf)
                 self.s.bdf = bdf or None

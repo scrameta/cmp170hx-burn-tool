@@ -183,24 +183,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     imp_ga_p = sub.add_parser(
         "import-ga100-ff-tools",
-        help="convert one or more ga100-ff-tools plan JSONs + ff_dump.py + read_defects.py into a mode-0600 vfi_burn plan",
+        help="convert a ga100-ff-tools plan directory or JSON file(s) into a mode-0600 vfi_burn plan "
+        "(reads card state live via --bdf or from optional --dump/--defects)",
     )
     imp_ga_p.add_argument(
         "--plans",
         nargs="+",
         required=True,
-        help="one or more mode-0600 ga100-ff-tools plan JSONs from one ffcard.py derive run "
-        "(e.g. *_plan_0_noop.json *_plan_sm_hbm.json [*_plan_pcie.json *_plan_nvlink.json])",
+        help="directory containing ga100-ff-tools plan JSONs, or one or more plan JSON paths "
+        "(e.g. /path/to/cmp170_burn or *_plan_0_noop.json *_plan_sm_hbm.json)",
     )
     imp_ga_p.add_argument(
         "--dump",
-        required=True,
-        help="mode-0600 ga100-ff-tools ff_dump.py JSON (covering rows 222..486+)",
+        default=None,
+        help="optional mode-0600 ga100-ff-tools ff_dump.py JSON (auto-detected if next to plans; "
+        "otherwise read live via --bdf)",
     )
     imp_ga_p.add_argument(
         "--defects",
-        required=True,
-        help="mode-0600 ga100-ff-tools read_defects.py JSON",
+        default=None,
+        help="optional mode-0600 ga100-ff-tools read_defects.py JSON (auto-detected if next to plans; "
+        "otherwise read live via --bdf on a cold/sensed card)",
     )
     imp_ga_p.add_argument("--out", required=True, help="output path for new mode-0600 vfi_burn plan JSON")
     imp_ga_p.add_argument(
@@ -214,13 +217,14 @@ def build_parser() -> argparse.ArgumentParser:
     imp_ga_p.add_argument(
         "--die-rows-from",
         default=None,
-        help="mode-0600 JSON supplying Die ID rows 8..15 (vfi_burn snapshot, ff_dump.py --start 8, "
-        "ffcalc dump, or plain {\"8\":...,\"15\":...}); unnecessary if --dump already includes rows 8..15",
+        help="optional mode-0600 JSON supplying Die ID rows 8..15 (vfi_burn snapshot, ff_dump.py --start 8, "
+        "ffcalc dump, or plain {\"8\":...,\"15\":...}); unnecessary when using --bdf or ff_dump --start 8",
     )
     imp_ga_p.add_argument(
         "--bdf",
         default=None,
-        help="read Die ID rows 8..15 read-only from the live CMP 170HX GPU (e.g. 0000:05:00.0)",
+        help="read Die ID rows 8..15 (and current FF rows + defect masks if --dump/--defects omitted) "
+        "read-only from the live CMP 170HX GPU (e.g. 0000:05:00.0)",
     )
     imp_ga_p.add_argument(
         "--link-cap2-before",

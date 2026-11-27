@@ -909,16 +909,21 @@ def _build_vfi_plan_from_records(
     if len(set(planned_rows)) != len(planned_rows):
         raise BurnError(f"{source_name} burn plan uses the same row twice")
     expected_first = next_row - (1 if prepend_noop_test else 0)
-    valid_starts = [expected_first]
-    if allow_shifted_first_row and prepend_noop_test:
-        valid_starts.append(expected_first + 1)
-    if planned_rows[0] not in valid_starts or planned_rows != list(
-        range(planned_rows[0], planned_rows[0] + len(planned_rows))
-    ):
-        raise BurnError(
-            f"{source_name} planned rows {planned_rows[:3]}... are not contiguous from the first free "
-            f"FF row {expected_first} of this dump (stale dump or plan?)"
-        )
+    if allow_shifted_first_row:
+        # ga100-ff-tools splits a derive run across multiple files (0_noop, sm_hbm, pcie, nvlink);
+        # selecting a later subset (e.g. pcie alone or 0_noop+pcie) has ascending rows >= expected_first,
+        # while baseline.fingerprint + per-record old_data prove exact card state compatibility.
+        if planned_rows != sorted(planned_rows) or planned_rows[0] < expected_first:
+            raise BurnError(
+                f"{source_name} planned rows {planned_rows[:3]}... are out of order or behind "
+                f"the card's first free FF row {expected_first} (already burned or stale dump/plan?)"
+            )
+    else:
+        if planned_rows != list(range(expected_first, expected_first + len(planned_rows))):
+            raise BurnError(
+                f"{source_name} planned rows {planned_rows[:3]}... are not contiguous from the first free "
+                f"FF row {expected_first} of this dump (stale dump or plan?)"
+            )
     if (next_row + len(planned_rows) - 1) > FF_ROW_MAX:
         raise BurnError("plan does not fit in the remaining FF rows")
 
@@ -1251,43 +1256,236 @@ def _verify_ga100_expect_registers(
             )
 
 
+@dataclass(frozen=True)
+class DiscoveredGA100Plan:
+    path: Path
+    mode: str
+    first_row: int
+    last_row: int
+    record_count: int
+    card: str | None
+    baseline_last_row: int
+    baseline_fingerprint: str
+
+
+def _classify_ga100_json_obj(obj: object) -> str | None:
+    """Return 'plan', 'dump', 'defects', or None for a parsed JSON object."""
+    if not isinstance(obj, dict) or obj.get("schema_version") == 1:
+        return None
+    recs = obj.get("records")
+    base = obj.get("baseline")
+    if (
+        isinstance(recs, list)
+        and recs
+        and isinstance(recs[0], dict)
+        and "encoded" in recs[0]
+        and "row" in recs[0]
+        and isinstance(base, dict)
+        and "last_row" in base
+        and "fingerprint" in base
+    ):
+        return "plan"
+    if isinstance(obj.get("rows"), list) and obj.get("rows") and (
+        "shadow" in obj or "blank_rows" in obj or "inferred_ff_options" in obj
+    ):
+        return "dump"
+    regs = obj.get("registers")
+    if isinstance(regs, list) and any(
+        isinstance(e, dict) and str(e.get("name", "")).strip().upper() == "OPT_GPC_DEFECTIVE"
+        for e in regs
+    ):
+        return "defects"
+    return None
+
+
+def _try_parse_json_file(path: Path) -> dict | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def is_ga100_ff_tools_plan_file(path: str | Path) -> bool:
+    """Return True if ``path`` is a regular JSON file matching the ga100-ff-tools plan format."""
+    obj = _try_parse_json_file(Path(path))
+    return _classify_ga100_json_obj(obj) == "plan"
+
+
+def _plan_info_from_obj(path: Path, obj: dict) -> DiscoveredGA100Plan:
+    recs = obj["records"]
+    rows = [int(r["row"]) for r in recs]
+    base = obj["baseline"]
+    return DiscoveredGA100Plan(
+        path=path,
+        mode=str(obj.get("mode", path.stem)),
+        first_row=min(rows),
+        last_row=max(rows),
+        record_count=len(recs),
+        card=str(obj["card"]) if obj.get("card") is not None else None,
+        baseline_last_row=u32(base["last_row"], f"{path.name}.baseline.last_row"),
+        baseline_fingerprint=str(base["fingerprint"]).strip().lower(),
+    )
+
+
+def discover_ga100_ff_tools_inputs(
+    paths: str | Path | Sequence[str | Path],
+) -> tuple[list[DiscoveredGA100Plan], Path | None, Path | None]:
+    """Discover ga100-ff-tools plan JSONs (and optional sibling dump/defects JSONs) from
+    one or more directory or file paths.
+
+    Returns ``(plans_sorted_by_first_row, auto_dump_path, auto_defects_path)``.
+    """
+    if isinstance(paths, (str, Path)):
+        raw_list: list[Path] = [Path(paths)]
+    else:
+        raw_list = [Path(p) for p in paths]
+    if not raw_list:
+        raise BurnError("at least one ga100-ff-tools plan directory or JSON file path is required")
+
+    plans_by_path: dict[Path, DiscoveredGA100Plan] = {}
+    search_dirs: list[Path] = []
+    source_dump_names: list[str] = []
+    source_defect_names: list[str] = []
+    auto_dump: Path | None = None
+    auto_defects: Path | None = None
+
+    for p in raw_list:
+        if p.is_symlink():
+            raise BurnError(f"ga100-ff-tools path must not be a symlink: {p}")
+        if not p.exists():
+            raise BurnError(f"ga100-ff-tools path not found: {p}")
+        if p.is_dir():
+            search_dirs.append(p)
+            for child in sorted(p.glob("*.json")):
+                obj = _try_parse_json_file(child)
+                kind = _classify_ga100_json_obj(obj)
+                if kind == "plan" and obj is not None:
+                    plans_by_path[child.resolve()] = _plan_info_from_obj(child, obj)
+                    if obj.get("source_dump"):
+                        source_dump_names.append(str(obj["source_dump"]))
+                    if obj.get("source_defects"):
+                        source_defect_names.append(str(obj["source_defects"]))
+                elif kind == "dump" and auto_dump is None:
+                    auto_dump = child
+                elif kind == "defects" and auto_defects is None:
+                    auto_defects = child
+        else:
+            search_dirs.append(p.parent)
+            obj = _try_parse_json_file(p)
+            if _classify_ga100_json_obj(obj) != "plan" or obj is None:
+                raise BurnError(
+                    f"{p} does not look like a ga100-ff-tools plan JSON "
+                    "(expected 'records' with 'encoded'/'row' and 'baseline')"
+                )
+            plans_by_path[p.resolve()] = _plan_info_from_obj(p, obj)
+            if obj.get("source_dump"):
+                source_dump_names.append(str(obj["source_dump"]))
+            if obj.get("source_defects"):
+                source_defect_names.append(str(obj["source_defects"]))
+
+    if not plans_by_path:
+        raise BurnError(
+            f"no ga100-ff-tools plan JSON files found in {', '.join(str(p) for p in raw_list)}"
+        )
+
+    # Check referenced source_dump / source_defects filenames in plan dir(s) and parent dir(s).
+    unique_dirs: list[Path] = []
+    for d in search_dirs:
+        for cand_dir in (d, d.parent):
+            if cand_dir not in unique_dirs and cand_dir.is_dir():
+                unique_dirs.append(cand_dir)
+
+    if auto_dump is None:
+        for name in source_dump_names:
+            for d in unique_dirs:
+                cand = d / name
+                if _classify_ga100_json_obj(_try_parse_json_file(cand)) == "dump":
+                    auto_dump = cand
+                    break
+            if auto_dump is not None:
+                break
+
+    if auto_defects is None:
+        for name in source_defect_names:
+            for d in unique_dirs:
+                cand = d / name
+                if _classify_ga100_json_obj(_try_parse_json_file(cand)) == "defects":
+                    auto_defects = cand
+                    break
+            if auto_defects is not None:
+                break
+
+    if auto_dump is None or auto_defects is None:
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for child in sorted(d.glob("*.json")):
+                kind = _classify_ga100_json_obj(_try_parse_json_file(child))
+                if kind == "dump" and auto_dump is None:
+                    auto_dump = child
+                elif kind == "defects" and auto_defects is None:
+                    auto_defects = child
+
+    plans = sorted(plans_by_path.values(), key=lambda info: (info.first_row, info.path.name))
+    return plans, auto_dump, auto_defects
+
+
 def import_ga100_ff_tools_plan(
-    plan_paths: Sequence[str | Path],
-    dump_path: str | Path,
-    defects_path: str | Path,
+    plan_paths: str | Path | Sequence[str | Path],
+    dump_path: str | Path | None = None,
+    defects_path: str | Path | None = None,
     *,
     base_sm_ceiling: int,
     override_sm_ceiling: int | None = None,
     die_rows: dict[int, int] | None = None,
     die_rows_path: str | Path | None = None,
+    live_ff_rows: dict[int, int] | None = None,
+    live_shadow_masks: dict[str, int] | None = None,
+    live_defect_masks: dict[str, int] | None = None,
     prepend_noop_test: bool | None = None,
     link_cap2_before: int = 0x06,
     link_cap2_after: int = 0x1E,
 ) -> dict:
-    """Convert one or more kprinssu/ga100-ff-tools plan JSONs + ff_dump.py + read_defects.py
+    """Convert one or more kprinssu/ga100-ff-tools plan JSONs (or a directory containing them)
     into a single strict mode-0600 vfi_burn plan dict (schema_version=1).
 
-    Multiple plans from the same ``ffcard.py derive`` run (e.g. ``0_noop``, ``sm_hbm``,
-    ``pcie``, ``nvlink``) can be passed together; they are validated to share the same
-    baseline (``last_row`` + 16-hex ``fingerprint``) and sorted by starting row.
+    Card baseline state (FF rows 222..486, Die ID rows 8..15, fused shadows, and genuine
+    defect masks) can come from EITHER:
+      - ``dump_path`` (``ff_dump.py`` JSON) + ``defects_path`` (``read_defects.py`` JSON), OR
+      - read-only live GPU readings (``live_ff_rows``, ``die_rows``, ``live_shadow_masks``,
+        ``live_defect_masks`` — populated by CLI ``--bdf`` or menu live import), OR
+      - a combination (e.g. ``defects_path`` from a cold card + live FF/Die rows via ``--bdf``).
 
-    Die ID rows 8..15 are required by vfi_burn and NEVER fabricated. Because stock
-    ``ff_dump.py`` defaults to ``--start 222``, supply them via one of:
-      - rows 8..15 inside ``dump_path`` (``ff_dump.py --start 8``), OR
-      - ``die_rows_path`` (a vfi_burn snapshot, ffcalc dump, ``ff_dump.py --start 8`` dump,
-        or plain ``{"8": ..., "15": ...}`` JSON), OR
-      - ``die_rows`` dict read read-only from the live card (CLI ``--bdf``).
+    Multiple plans from the same ``ffcard.py derive`` run (e.g. ``0_noop``, ``sm_hbm``,
+    ``pcie``, ``nvlink``) or a single subset (e.g. ``pcie`` alone) are validated against
+    ``baseline.fingerprint`` over rows ``222..baseline.last_row`` and every record's ``old_data``.
     """
     if isinstance(base_sm_ceiling, bool) or not isinstance(base_sm_ceiling, int) or base_sm_ceiling <= 0:
         raise BurnError("base_sm_ceiling must be a positive integer supplied by the operator")
     if isinstance(plan_paths, (str, Path)):
-        plan_paths = [plan_paths]
-    if not plan_paths:
+        raw_plan_inputs: list[Path] = [Path(plan_paths)]
+    else:
+        raw_plan_inputs = [Path(p) for p in plan_paths]
+    if not raw_plan_inputs:
+        raise BurnError("at least one ga100-ff-tools plan directory or JSON path is required")
+
+    # Expand any directories in plan_paths into sorted ga100-ff-tools plan files.
+    expanded_plan_paths: list[Path] = []
+    for p in raw_plan_inputs:
+        if p.is_dir():
+            discovered, _, _ = discover_ga100_ff_tools_inputs([p])
+            expanded_plan_paths.extend(info.path for info in discovered)
+        else:
+            expanded_plan_paths.append(p)
+    if not expanded_plan_paths:
         raise BurnError("at least one ga100-ff-tools plan JSON path is required")
 
     # 1. Load & validate all ga100-ff-tools plan files.
     loaded_plans: list[tuple[Path, dict]] = []
-    for raw_p in plan_paths:
+    for raw_p in expanded_plan_paths:
         pp = require_private_file(raw_p, "ga100-ff-tools plan")
         try:
             obj = json.loads(pp.read_text(encoding="utf-8"))
@@ -1303,6 +1501,9 @@ def import_ga100_ff_tools_plan(
             raise BurnError(
                 f"ga100-ff-tools plan {pp} is missing 'baseline.last_row' / 'baseline.fingerprint'"
             )
+        sub_rows = [int(r["row"]) for r in recs if isinstance(r, dict) and "row" in r]
+        if len(sub_rows) == len(recs) and sub_rows != list(range(sub_rows[0], sub_rows[0] + len(sub_rows))):
+            raise BurnError(f"ga100-ff-tools plan {pp.name} has non-contiguous internal rows {sub_rows}")
         loaded_plans.append((pp, obj))
 
     first_base = loaded_plans[0][1]["baseline"]
@@ -1324,38 +1525,58 @@ def import_ga100_ff_tools_plan(
             )
     loaded_plans.sort(key=lambda pair: int(pair[1]["records"][0]["row"]))
 
-    # 2. Load & validate ff_dump.py dump JSON.
-    dp = require_private_file(dump_path, "ga100-ff-tools dump")
-    try:
-        dump_obj = json.loads(dp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in ga100-ff-tools dump {dp}: {exc}") from exc
-    if not isinstance(dump_obj, dict):
-        raise BurnError("ga100-ff-tools dump root must be a JSON object")
-    if dump_obj.get("shadow_only") is True:
-        raise BurnError("ga100-ff-tools dump was captured with --shadow-only (no FF rows)")
-    if dump_obj.get("read_errors"):
-        raise BurnError(f"ga100-ff-tools dump has read_errors on rows {dump_obj['read_errors']}")
-    if dump_obj.get("controller_idle") is False:
-        raise BurnError("ga100-ff-tools dump reports controller_idle=false")
-    if dump_obj.get("crc_status") is not None:
-        crc_val = u32(dump_obj["crc_status"], "dump.crc_status")
-        if crc_val != 0x55:
-            raise BurnError(f"ga100-ff-tools dump crc_status=0x{crc_val:02x} (expected 0x55)")
-
-    raw_rows = dump_obj.get("rows")
-    if not isinstance(raw_rows, list) or not raw_rows:
-        raise BurnError("ga100-ff-tools dump is missing 'rows' list (from ff_dump.py)")
+    # 2. Load FF rows 222..486 from dump_path and/or live_ff_rows.
+    dump_obj: dict | None = None
     ff_rows: dict[int, int] = {}
-    for entry in raw_rows:
-        if not isinstance(entry, dict) or "row" not in entry:
-            raise BurnError("ga100-ff-tools dump 'rows' entries must be JSON objects with 'row'")
-        r_idx = int(entry["row"])
-        if entry.get("error") or entry.get("raw") is None:
-            raise BurnError(f"ga100-ff-tools dump row {r_idx} was not read cleanly")
-        ff_rows[r_idx] = u32(entry["raw"], f"dump.rows[{r_idx}]")
-    for b_row in dump_obj.get("blank_rows", []):
-        ff_rows.setdefault(int(b_row), FF_EMPTY_WORD)
+    if dump_path is not None:
+        dp = require_private_file(dump_path, "ga100-ff-tools dump")
+        try:
+            dump_obj = json.loads(dp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise BurnError(f"invalid JSON in ga100-ff-tools dump {dp}: {exc}") from exc
+        if not isinstance(dump_obj, dict):
+            raise BurnError("ga100-ff-tools dump root must be a JSON object")
+        if dump_obj.get("shadow_only") is True:
+            raise BurnError("ga100-ff-tools dump was captured with --shadow-only (no FF rows)")
+        if dump_obj.get("read_errors"):
+            raise BurnError(f"ga100-ff-tools dump has read_errors on rows {dump_obj['read_errors']}")
+        if dump_obj.get("controller_idle") is False:
+            raise BurnError("ga100-ff-tools dump reports controller_idle=false")
+        if dump_obj.get("crc_status") is not None:
+            crc_val = u32(dump_obj["crc_status"], "dump.crc_status")
+            if crc_val != 0x55:
+                raise BurnError(f"ga100-ff-tools dump crc_status=0x{crc_val:02x} (expected 0x55)")
+
+        raw_rows = dump_obj.get("rows")
+        if not isinstance(raw_rows, list) or not raw_rows:
+            raise BurnError("ga100-ff-tools dump is missing 'rows' list (from ff_dump.py)")
+        for entry in raw_rows:
+            if not isinstance(entry, dict) or "row" not in entry:
+                raise BurnError("ga100-ff-tools dump 'rows' entries must be JSON objects with 'row'")
+            r_idx = int(entry["row"])
+            if entry.get("error") or entry.get("raw") is None:
+                raise BurnError(f"ga100-ff-tools dump row {r_idx} was not read cleanly")
+            ff_rows[r_idx] = u32(entry["raw"], f"dump.rows[{r_idx}]")
+        for b_row in dump_obj.get("blank_rows", []):
+            ff_rows.setdefault(int(b_row), FF_EMPTY_WORD)
+
+    if live_ff_rows is not None:
+        parsed_live = {int(k): u32(v, f"live_ff_rows.{k}") for k, v in live_ff_rows.items()}
+        if ff_rows:
+            for r in range(FF_ROW_MIN, FF_ROW_MAX + 1):
+                if r in ff_rows and r in parsed_live and ff_rows[r] != parsed_live[r]:
+                    raise BurnError(
+                        f"live GPU FF row {r} (0x{parsed_live[r]:08x}) disagrees with "
+                        f"dump FF row {r} (0x{ff_rows[r]:08x})"
+                    )
+        else:
+            ff_rows = parsed_live
+
+    if not ff_rows:
+        raise BurnError(
+            "no FF row baseline provided: pass --bdf <BDF> to read current FF rows directly "
+            "(read-only) from the live GPU, or pass --dump <card-dump.json>"
+        )
 
     missing_ff = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if r not in ff_rows]
     if missing_ff:
@@ -1364,22 +1585,22 @@ def import_ga100_ff_tools_plan(
             f"{FF_ROW_MAX - FF_ROW_MIN + 1} FF rows (missing e.g. {missing_ff[:5]}); "
             "an unread row would look free"
         )
-    # Verify baseline last_row & 16-hex fingerprint against dump rows.
+    # Verify baseline prefix contiguity and 16-hex fingerprint over rows 222..base_last_row.
     used_rows = [r for r in range(FF_ROW_MIN, FF_ROW_MAX + 1) if ff_rows[r] != FF_EMPTY_WORD]
     if not used_rows:
-        raise BurnError("ga100-ff-tools dump has no occupied FF rows")
+        raise BurnError("ga100-ff-tools dump/card has no occupied FF rows")
     if used_rows != list(range(FF_ROW_MIN, used_rows[-1] + 1)):
-        raise BurnError("ga100-ff-tools dump FF rows are non-contiguous; vfi_burn's free-slot proof would refuse")
-    if used_rows[-1] != base_last_row:
+        raise BurnError("ga100-ff-tools FF rows are non-contiguous; vfi_burn's free-slot proof would refuse")
+    if used_rows[-1] < base_last_row:
         raise BurnError(
-            f"ga100-ff-tools dump last occupied row is {used_rows[-1]}, "
-            f"but plan baseline.last_row is {base_last_row} (stale dump or plan?)"
+            f"ga100-ff-tools dump/card last occupied row is {used_rows[-1]}, "
+            f"which is before plan baseline.last_row {base_last_row} (wrong card or stale dump?)"
         )
     computed_fp = ga100_ff_tools_fingerprint(ff_rows, base_last_row)
     if computed_fp != base_fp:
         raise BurnError(
-            f"ga100-ff-tools dump rows {FF_ROW_MIN}..{base_last_row} fingerprint {computed_fp} "
-            f"!= plan baseline.fingerprint {base_fp}: dump does not match this plan's card/state"
+            f"ga100-ff-tools rows {FF_ROW_MIN}..{base_last_row} fingerprint {computed_fp} "
+            f"!= plan baseline.fingerprint {base_fp}: dump/card does not match this plan's card/state"
         )
 
     # 3. Resolve Die ID rows 8..15 (never fabricated).
@@ -1407,50 +1628,88 @@ def import_ga100_ff_tools_plan(
             "or re-run ff_dump.py with --start 8 --end 487"
         )
 
-    # 4. Load & validate read_defects.py JSON.
-    dfp = require_private_file(defects_path, "ga100-ff-tools defects")
-    try:
-        defects_obj = json.loads(dfp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BurnError(f"invalid JSON in ga100-ff-tools defects {dfp}: {exc}") from exc
-    if not isinstance(defects_obj, dict) or not isinstance(defects_obj.get("registers"), list):
-        raise BurnError("ga100-ff-tools defects file must contain a 'registers' list (from read_defects.py)")
+    # 4. Load & validate genuine defect masks from defects_path and/or live_defect_masks.
     defect_regs: dict[str, int] = {}
-    for entry in defects_obj["registers"]:
-        if not isinstance(entry, dict) or "name" not in entry or "value" not in entry:
-            raise BurnError("ga100-ff-tools defects 'registers' entries must have 'name' and 'value'")
-        rname = str(entry["name"]).strip().upper()
-        defect_regs[rname] = u32(entry["value"], f"defects.{rname}")
+    defect_masks: dict[str, int] = {}
+    if defects_path is not None:
+        dfp = require_private_file(defects_path, "ga100-ff-tools defects")
+        try:
+            defects_obj = json.loads(dfp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise BurnError(f"invalid JSON in ga100-ff-tools defects {dfp}: {exc}") from exc
+        if not isinstance(defects_obj, dict) or not isinstance(defects_obj.get("registers"), list):
+            raise BurnError("ga100-ff-tools defects file must contain a 'registers' list (from read_defects.py)")
+        for entry in defects_obj["registers"]:
+            if not isinstance(entry, dict) or "name" not in entry or "value" not in entry:
+                raise BurnError("ga100-ff-tools defects 'registers' entries must have 'name' and 'value'")
+            rname = str(entry["name"]).strip().upper()
+            defect_regs[rname] = u32(entry["value"], f"defects.{rname}")
 
-    missing_def = [name for name in GA100_FF_TOOLS_REQUIRED_DEFECTS if name not in defect_regs]
-    if missing_def:
+        missing_def = [name for name in GA100_FF_TOOLS_REQUIRED_DEFECTS if name not in defect_regs]
+        if missing_def:
+            raise BurnError(
+                f"ga100-ff-tools defects file is missing required defect register(s): {', '.join(missing_def)}"
+            )
+        defect_masks = {
+            vfi_field: defect_regs[reg_name]
+            for reg_name, vfi_field in GA100_FF_TOOLS_DEFECT_TO_FIELD.items()
+            if reg_name in defect_regs
+        }
+    elif live_defect_masks is not None:
+        required_vfi_fields = {
+            GA100_FF_TOOLS_DEFECT_TO_FIELD[n] for n in GA100_FF_TOOLS_REQUIRED_DEFECTS
+        }
+        parsed_def = {str(k).strip().upper(): u32(v, f"live_defect_masks.{k}") for k, v in live_defect_masks.items()}
+        missing_live = sorted(required_vfi_fields - set(parsed_def))
+        if missing_live:
+            raise BurnError(
+                f"live GPU defect readout is missing required defect mask(s): {', '.join(missing_live)}"
+            )
+        defect_masks = parsed_def
+    else:
         raise BurnError(
-            f"ga100-ff-tools defects file is missing required defect register(s): {', '.join(missing_def)}"
+            "no genuine defect masks provided: pass --bdf <BDF> to read defect masks directly "
+            "(read-only) from a sensed/cold GPU, or pass --defects <card-defects.json>"
         )
-    defect_masks: dict[str, int] = {
-        vfi_field: defect_regs[reg_name]
-        for reg_name, vfi_field in GA100_FF_TOOLS_DEFECT_TO_FIELD.items()
-        if reg_name in defect_regs
-    }
 
-    # 5. Replay baseline FF rows and cross-check dump shadow + defects OPT_* registers.
+    # 5. Replay current FF rows and cross-check shadow + defects OPT_* registers.
     base_blocks = replay_ff_rows(ff_rows)
     replay_fields = decode_all_fields(base_blocks)
+    # If post-baseline rows are already burned (e.g. 0_noop + sm_hbm burned before importing pcie),
+    # shadow registers on the live card may reflect either the new cold-booted state (replay_fields)
+    # OR the pre-burn baseline state (baseline_replay_fields) if still in the same boot window.
+    baseline_only_fields = (
+        decode_all_fields(
+            replay_ff_rows({r: ff_rows[r] for r in range(FF_ROW_MIN, base_last_row + 1)})
+        )
+        if used_rows[-1] > base_last_row
+        else replay_fields
+    )
 
-    shadow = dump_obj.get("shadow")
-    if isinstance(shadow, dict):
+    def _check_shadow_map(shadow_map: dict, source_label: str) -> None:
         for opt_name, ff_key in GA100_FF_TOOLS_FIELD_TO_KEY.items():
-            if opt_name in shadow and shadow[opt_name] is not None:
-                sh_val = u32(shadow[opt_name], f"dump.shadow.{opt_name}")
-                if sh_val != replay_fields[ff_key]:
+            if opt_name in shadow_map and shadow_map[opt_name] is not None:
+                sh_val = u32(shadow_map[opt_name], f"{source_label}.{opt_name}")
+                valid_vals = {replay_fields[ff_key]}
+                if used_rows[-1] > base_last_row and opt_name not in ("OPT_PCIE_DEVIDA", "OPT_PCIE_DEVIDB"):
+                    valid_vals.add(baseline_only_fields[ff_key])
+                if sh_val not in valid_vals:
                     raise BurnError(
-                        f"ga100-ff-tools dump shadow {opt_name}=0x{sh_val:x} disagrees with FF replay "
-                        f"0x{replay_fields[ff_key]:x} (was ff_dump.py captured before SENSE_CTRL or on another card?)"
+                        f"{source_label} {opt_name}=0x{sh_val:x} disagrees with FF replay "
+                        f"0x{replay_fields[ff_key]:x} (was it captured before SENSE_CTRL or on another card?)"
                     )
+
+    if dump_obj is not None and isinstance(dump_obj.get("shadow"), dict):
+        _check_shadow_map(dump_obj["shadow"], "ga100-ff-tools dump shadow")
+    if live_shadow_masks is not None:
+        _check_shadow_map(live_shadow_masks, "live GPU shadow")
     for opt_name in ("OPT_PES_DISABLE", "OPT_ROP_L2_DISABLE"):
         if opt_name in defect_regs:
             ff_key = GA100_FF_TOOLS_FIELD_TO_KEY[opt_name]
-            if defect_regs[opt_name] != replay_fields[ff_key]:
+            valid_vals = {replay_fields[ff_key]}
+            if used_rows[-1] > base_last_row:
+                valid_vals.add(baseline_only_fields[ff_key])
+            if defect_regs[opt_name] not in valid_vals:
                 raise BurnError(
                     f"ga100-ff-tools defects {opt_name}=0x{defect_regs[opt_name]:x} disagrees with FF replay "
                     f"0x{replay_fields[ff_key]:x} (defects file from a different card/state?)"

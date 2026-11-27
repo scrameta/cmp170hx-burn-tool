@@ -19,6 +19,7 @@ from vfi_burn.commands import (
 )
 from vfi_burn.engine import Overrides, check_plan
 from vfi_burn.ffrecord import (
+    GA100_FF_TOOLS_FIELD_TO_KEY,
     decode_all_fields,
     encode_ff,
     ga100_ff_tools_fingerprint,
@@ -26,7 +27,8 @@ from vfi_burn.ffrecord import (
     load_die_rows_from_file,
     replay_ff_rows,
 )
-from vfi_burn.interfaces import Host
+from vfi_burn.fuses import FFCALC_KEY_TO_FIELD, FUSES_BY_KEY
+from vfi_burn.interfaces import Health, Host
 from vfi_burn.menu import BurnMenu, MenuSession
 from vfi_burn.model import BurnError, Plan
 
@@ -626,15 +628,107 @@ class TestGA100FFToolsImport(unittest.TestCase):
         self.assertEqual(loaded.die_rows, SYNTHETIC_DIE_ROWS)
         self.assertEqual(len(loaded.records), 4)
 
-    def test_menu_setup_option_h_imports_ga100_ff_tools_plan(self):
+    def _make_fake_live_cls(
+        self,
+        *,
+        rows_map: dict[int, int],
+        defects_by_vfi: dict[str, int],
+        shadow_decoded: dict[str, int] | None = None,
+        efp: int = 1,
+        dsov: int = 1,
+    ):
+        dec = shadow_decoded if shadow_decoded is not None else decode_all_fields(replay_ff_rows(rows_map))
+        reg_map: dict[int, int] = {}
+        for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
+            d_addr = FUSES_BY_KEY[ff_key].defect_addr
+            if d_addr is not None:
+                reg_map[d_addr] = defects_by_vfi.get(vfi_name, 0)
+        for opt_name, ff_key in GA100_FF_TOOLS_FIELD_TO_KEY.items():
+            f_addr = FUSES_BY_KEY[ff_key].fused_addr
+            if f_addr is not None:
+                reg_map[f_addr] = dec[ff_key]
+
+        class _FakeLiveFull:
+            def __init__(self, bdf, writable=False):
+                assert not writable
+                self.bdf = bdf
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def host(self):
+                return Host(
+                    bound_driver="pci-stub",
+                    nvidia_loaded=False,
+                    nouveau_loaded=False,
+                    lockdown="[none]",
+                    hold_active=True,
+                    boot_id="boot-live-1",
+                )
+
+            def pci_id(self):
+                return "10de:20c2"
+
+            def health(self):
+                return Health(
+                    fusectrl=0xE0040000,
+                    dsov=dsov,
+                    crc=0x55,
+                    plm=0xFFFFFFFF,
+                    plm_f8=0xFFFFFFFF,
+                    en_sw=0,
+                    efp=efp,
+                )
+
+            def die_row(self, idx: int) -> int:
+                return SYNTHETIC_DIE_ROWS[idx]
+
+            def fuse_row(self, idx: int) -> int:
+                return rows_map.get(idx, 0)
+
+            def register(self, addr: int) -> int:
+                return reg_map[addr]
+
+        return _FakeLiveFull
+
+    def _plans_only_dir(self) -> Path:
+        """Directory containing ONLY the 4 ga100-ff-tools plan JSONs (no dump or defects files)."""
+        d = self.work / "plans_only"
+        d.mkdir(mode=0o700)
+        for key in ("noop", "sm", "pcie", "nvlink"):
+            src = self.fx[key]
+            dst = d / src.name
+            dst.write_bytes(src.read_bytes())
+            dst.chmod(0o600)
+        return d
+
+    def _defects_by_vfi(self) -> dict[str, int]:
+        raw = json.loads(self.fx["defects"].read_text())["registers"]
+        reg_vals = {r["name"]: int(r["value"], 16) for r in raw}
+        out = {
+            "GPC_DISABLE": reg_vals["OPT_GPC_DEFECTIVE"],
+            "FBP_DISABLE": reg_vals["OPT_FBP_DEFECTIVE"],
+            "FBPA_DISABLE": reg_vals["OPT_FBPA_DEFECTIVE"],
+            "FBIO_DISABLE": reg_vals["OPT_FBIO_DEFECTIVE"],
+            "PES_DISABLE": reg_vals["OPT_PES_DEFECTIVE"],
+            "ROP_L2_DISABLE": reg_vals["OPT_ROP_L2_DEFECTIVE"],
+            "NVLINK_DISABLE": reg_vals["OPT_NVLINK_DEFECTIVE"],
+            "SYS_PIPE_DISABLE": 0x0,
+        }
+        for i in range(8):
+            out[f"TPC_GPC{i}_DISABLE"] = reg_vals[f"OPT_TPC_GPC{i}_DEFECTIVE"]
+        return out
+
+    def test_menu_setup_option_h_auto_detects_dump_and_defects(self):
         out = self.work / "menu_ga100.json"
         responses = iter(
             [
                 "1",  # Setup
                 "h",  # Import ga100-ff-tools
-                f"{self.fx['noop']} {self.fx['sm']}",  # plans
-                str(self.fx["dump"]),                  # dump
-                str(self.fx["defects"]),               # defects
+                f"{self.fx['noop']} {self.fx['sm']}",  # plans (dump+defects auto-detected in same dir!)
                 str(self.fx["die_snap"]),              # die rows JSON
                 str(out),                              # output path
                 "122",                                 # base SM ceiling
@@ -650,8 +744,161 @@ class TestGA100FFToolsImport(unittest.TestCase):
         output = "\n".join(lines)
         self.assertEqual(rc, 0, output)
         self.assertEqual(session.plan_path, str(out))
+        self.assertIn("Auto-detected card dump", output)
         self.assertIn("Imported & loaded", output)
         self.assertIn("=== PLAN REVIEW & EXPECTED OUTCOME", output)
+
+    def test_cli_import_directory_only_from_live_gpu_without_dump_or_defects_files(self):
+        plans_dir = self._plans_only_dir()
+        out = self.work / "cli_live_dir.json"
+        fake_cls = self._make_fake_live_cls(
+            rows_map=self.fx["rows_map"],
+            defects_by_vfi=self._defects_by_vfi(),
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("vfi_burn.commands.GA100LiveAdapter", fake_cls):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = main(
+                    [
+                        "import-ga100-ff-tools",
+                        "--plans",
+                        str(plans_dir),
+                        "--bdf",
+                        "0000:05:00.0",
+                        "--base-sm",
+                        "122",
+                        "--out",
+                        str(out),
+                    ]
+                )
+        self.assertEqual(rc, 0, stderr.getvalue())
+        loaded = Plan.load(out)
+        self.assertEqual(len(loaded.records), 9)  # all 4 plans: 1 noop + 3 sm + 4 pcie + 1 nvlink
+        self.assertIn("SYS_PIPE_DISABLE", loaded.defect_masks)  # read live from 0x8203AC!
+        self.assertEqual(loaded.die_rows, SYNTHETIC_DIE_ROWS)
+
+    def test_import_single_pcie_plan_on_fresh_and_partially_burned_card(self):
+        plans_dir = self._plans_only_dir()
+        pcie_only = plans_dir / self.fx["pcie"].name
+
+        # 1. Fresh card (rows 222..231 occupied, next free = 232; pcie numbered 236..239)
+        fake_fresh = self._make_fake_live_cls(
+            rows_map=self.fx["rows_map"],
+            defects_by_vfi=self._defects_by_vfi(),
+        )
+        out_fresh = self.work / "pcie_fresh.json"
+        with patch("vfi_burn.commands.GA100LiveAdapter", fake_fresh):
+            rc = execute_import_ga100_ff_tools(
+                plans=[str(pcie_only)],
+                bdf="0000:05:00.0",
+                base_sm=122,
+                out=str(out_fresh),
+                io=CommandIO(show=lambda *_: None),
+            )
+        self.assertEqual(rc, 0)
+        p_fresh = Plan.load(out_fresh)
+        self.assertEqual(len(p_fresh.records), 5)  # 1 auto-prepended no-op + 4 pcie
+        self.assertEqual(p_fresh.expected_next_row, self.fx["last_row"] + 1)
+
+        # 2. Partially burned card (0_noop + sm_hbm already burned at rows 232..235; next free = 236)
+        #    Test with BOTH cold-booted shadows and same-window (pre-burn) shadows!
+        partial_rows = dict(self.fx["rows_map"])
+        partial_rows[self.fx["last_row"] + 1] = encode_ff(1, 7, 0x0198)
+        partial_rows[self.fx["last_row"] + 2] = encode_ff(1, 7, 0x0180)
+        partial_rows[self.fx["last_row"] + 3] = encode_ff(1, 8, 0xF826)
+        partial_rows[self.fx["last_row"] + 4] = encode_ff(1, 19, 0x4200)
+        for label, shadow_dec in (
+            ("cold_booted", None),
+            ("same_window", self.fx["decoded_base"]),
+        ):
+            with self.subTest(shadows=label):
+                fake_partial = self._make_fake_live_cls(
+                    rows_map=partial_rows,
+                    defects_by_vfi=self._defects_by_vfi(),
+                    shadow_decoded=shadow_dec,
+                )
+                out_part = self.work / f"pcie_partial_{label}.json"
+                with patch("vfi_burn.commands.GA100LiveAdapter", fake_partial):
+                    rc2 = execute_import_ga100_ff_tools(
+                        plans=[str(pcie_only)],
+                        bdf="0000:05:00.0",
+                        base_sm=122,
+                        out=str(out_part),
+                        io=CommandIO(show=lambda *_: None),
+                    )
+                self.assertEqual(rc2, 0)
+                p_part = Plan.load(out_part)
+                self.assertEqual(p_part.expected_next_row, self.fx["last_row"] + 5)
+                self.assertEqual(len(p_part.records), 5)
+
+    def test_unsensed_live_gpu_efp_zero_refuses_defect_read_but_allows_defects_file(self):
+        plans_dir = self._plans_only_dir()
+        fake_unsensed = self._make_fake_live_cls(
+            rows_map=self.fx["rows_map"],
+            defects_by_vfi={k: 0 for k in self._defects_by_vfi()},
+            efp=0,
+            dsov=0,
+        )
+        out = self.work / "unsensed.json"
+        # Without --defects, EFP=0 MUST refuse rather than trusting zeroed defect shadows.
+        with patch("vfi_burn.commands.GA100LiveAdapter", fake_unsensed):
+            with self.assertRaisesRegex(BurnError, "UNSENSED.*EFP=0"):
+                execute_import_ga100_ff_tools(
+                    plans=[str(plans_dir)],
+                    bdf="0000:05:00.0",
+                    base_sm=122,
+                    out=str(out),
+                    io=CommandIO(show=lambda *_: None),
+                )
+
+        # With cold --defects supplied, CMD_READ of live FF + Die ID rows succeeds even at EFP=0!
+        with patch("vfi_burn.commands.GA100LiveAdapter", fake_unsensed):
+            rc = execute_import_ga100_ff_tools(
+                plans=[str(plans_dir / self.fx["noop"].name), str(plans_dir / self.fx["sm"].name)],
+                defects=str(self.fx["defects"]),
+                bdf="0000:05:00.0",
+                base_sm=122,
+                out=str(out),
+                io=CommandIO(show=lambda *_: None),
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(Plan.load(out).records), 4)
+
+    def test_menu_option_a_accepts_ga100_directory_with_live_gpu_and_subset_pick(self):
+        plans_dir = self._plans_only_dir()
+        out = self.work / "menu_dir_live.json"
+        fake_cls = self._make_fake_live_cls(
+            rows_map=self.fx["rows_map"],
+            defects_by_vfi=self._defects_by_vfi(),
+        )
+        responses = iter(
+            [
+                "1",             # Setup
+                "a",             # Select plan JSON -> point straight at directory!
+                str(plans_dir),  # ga100-ff-tools directory with only 4 plan files
+                "y",             # Import into a vfi_burn plan now?
+                "1,3",           # Pick [1] 0_noop + [3] pcie
+                "0000:05:00.0",  # Live GPU PCI BDF (no dump/defects JSON prompts!)
+                str(out),        # Output path
+                "122",           # Base SM ceiling
+                "0",             # Back to main menu
+                "2",             # Review Plan
+                "0",             # Quit
+            ]
+        )
+        lines: list[str] = []
+        session = MenuSession(journal_path=str(self.work / "menu_dir.jsonl"))
+        with patch("vfi_burn.menu.GA100LiveAdapter", fake_cls):
+            menu = BurnMenu(session, input_fn=lambda p="": next(responses), show=lines.append, check_tty=False)
+            rc = menu.run()
+        output = "\n".join(lines)
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(session.plan_path, str(out))
+        self.assertEqual(session.bdf, "0000:05:00.0")
+        self.assertFalse(session.execute_live)
+        self.assertIn("Found 4 ga100-ff-tools plan(s)", output)
+        self.assertIn("Imported & loaded", output)
+        self.assertEqual(len(Plan.load(out).records), 5)  # 1 noop + 4 pcie
 
 
 if __name__ == "__main__":
