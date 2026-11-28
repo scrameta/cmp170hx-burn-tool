@@ -27,6 +27,8 @@ from .console import (
     read_experimental_registers,
 )
 from .engine import (
+    cold_snapshot_warnings,
+    last_session_boot_id,
     Journal,
     Overrides,
     check_host_readonly_safe,
@@ -849,12 +851,19 @@ class BurnMenu:
         if pick == "1":
             if not self.s.bdf:
                 raise BurnError("select a live GPU (--bdf) in [1] Setup first")
-            prev = self._ask("Previous burn session boot_id (from journal)")
+            prev = self._ask(
+                "Previous burn session boot_id (from journal)",
+                last_session_boot_id(self.s.journal_path),
+            )
+            if not prev:
+                raise BurnError("previous burn session boot_id is required (see session_start in the journal)")
             out = self._ask("Output cold snapshot path", "private/cold.json")
             backend, owned = self._open_backend(writable=False)
             try:
                 check_host_readonly_safe(backend.host())
                 snap = backend.capture_cold_snapshot(previous_boot_id=prev, read_rows=True)
+                for warning in cold_snapshot_warnings(snap):
+                    self.show(f"WARNING: {warning}")
                 saved = write_private_json_interactive(
                     out,
                     snap,

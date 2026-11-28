@@ -31,6 +31,7 @@ from .console import (
     read_experimental_registers,
 )
 from .engine import (
+    cold_snapshot_warnings,
     Overrides,
     check_host_readonly_safe,
     check_plan,
@@ -380,6 +381,8 @@ def execute_snapshot(
             previous_boot_id=previous_boot_id,
             read_rows=read_rows,
         )
+    for warning in cold_snapshot_warnings(snap):
+        io.show(f"WARNING: {warning}")
     write_private_json(out, snap, overwrite=overwrite)
     io.show(
         f"Saved cold snapshot {out} (mode 0600) | boot_id={snap['boot_id']} "

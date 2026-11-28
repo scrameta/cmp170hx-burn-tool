@@ -2082,6 +2082,95 @@ def process_records(
     return pointer
 
 
+def cold_snapshot_controller_problems(ctrl_state) -> tuple[list[str], str | None]:
+    """Check a cold snapshot's ``controller_state`` for proof of a real power cycle.
+
+    Returns ``(problems, note)``. ``EN_SW_OVERRIDE=1`` is always refused. ``DSOV=0``
+    normally means a held glitch window, but on a card whose DSOV is cleared
+    permanently (e.g. by RIR records) it reads 0 on every boot. In that case the
+    snapshot is accepted only if the volatile arming state a burn session writes is
+    back at its reset values: EN_SW_OVERRIDE=0, SBFE_SHADOW=1, WDATA_WR_SECURE=1 and
+    PLM_f4 closed. Snapshots without those registers are refused for DSOV=0.
+    """
+    if not isinstance(ctrl_state, dict) or not ctrl_state:
+        return [], None
+    problems: list[str] = []
+    en_sw = (
+        u32(ctrl_state["en_sw"], "cold.controller_state.en_sw") if "en_sw" in ctrl_state else None
+    )
+    if en_sw is not None and (en_sw & 1) == 1:
+        problems.append(
+            "cold snapshot controller_state has EN_SW_OVERRIDE=1 (not a fresh cold boot)"
+        )
+    if "dsov" not in ctrl_state or u32(ctrl_state["dsov"], "cold.controller_state.dsov") != 0:
+        return problems, None
+    needed = ("en_sw", "sbfe", "wdata_wr_secure", "plm_f4")
+    missing = [k for k in needed if k not in ctrl_state]
+    if missing:
+        problems.append(
+            "cold snapshot controller_state has DSOV=0 and lacks the volatile reset evidence "
+            f"({', '.join(missing)}) needed to tell a power-cycled card with permanently clear "
+            "DSOV (e.g. RIR) from a held glitch window; recapture with this vfi_burn version"
+        )
+        return problems, None
+    sbfe = u32(ctrl_state["sbfe"], "cold.controller_state.sbfe")
+    wsec = u32(ctrl_state["wdata_wr_secure"], "cold.controller_state.wdata_wr_secure")
+    plm_f4 = u32(ctrl_state["plm_f4"], "cold.controller_state.plm_f4")
+    armed = []
+    if en_sw is not None and (en_sw & 1) != 0:
+        armed.append("EN_SW_OVERRIDE=1")
+    if (sbfe & 1) != 1:
+        armed.append(f"SBFE_SHADOW={hex32(sbfe)}")
+    if (wsec & 1) != 1:
+        armed.append(f"WDATA_WR_SECURE={hex32(wsec)}")
+    if plm_f4 == GOLDILOCKS_PLM:
+        armed.append("PLM_f4 open")
+    if armed:
+        problems.append(
+            "cold snapshot controller_state has DSOV=0 with volatile arming state not reset "
+            f"({', '.join(armed)}): still in a held glitch window or no power cycle; "
+            "power-cycle the card completely before capturing the cold snapshot"
+        )
+        return problems, None
+    return problems, (
+        "DSOV=0 on a reset card (permanently clear DSOV, e.g. RIR): accepted because "
+        "EN_SW_OVERRIDE=0, SBFE_SHADOW=1, WDATA_WR_SECURE=1 and PLM_f4 closed"
+    )
+
+
+def cold_snapshot_warnings(snap: dict) -> list[str]:
+    """Problems verify-cold would refuse, reported at capture time (before saving)."""
+    warnings, note = cold_snapshot_controller_problems(snap.get("controller_state"))
+    warnings = list(warnings)
+    if snap.get("boot_id") and snap.get("boot_id") == snap.get("previous_boot_id"):
+        warnings.append(
+            "this is the same host boot as the burn session (boot_id unchanged): power off "
+            "at the wall, cold boot, and capture again; verify-cold will refuse this snapshot"
+        )
+    if note and not warnings:
+        warnings.append(f"note only: {note}")
+    return warnings
+
+
+def last_session_boot_id(journal_path: str | Path | None) -> str | None:
+    """Return the boot_id of the most recent ``session_start`` in a journal, if any."""
+    if not journal_path:
+        return None
+    p = Path(journal_path)
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("event") == "session_start" and item.get("boot_id"):
+            return str(item["boot_id"])
+    return None
+
+
 def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal) -> dict:
     """Offline compare; user-provided snapshot evidence is NOT authenticated hardware proof."""
     logged_comparison = False
@@ -2101,17 +2190,9 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
         if cold["boot_id"] == cold["previous_boot_id"]:
             raise BurnError("not a distinct cold boot")
 
-        ctrl_state = cold.get("controller_state")
-        if isinstance(ctrl_state, dict) and ctrl_state:
-            if "dsov" in ctrl_state and u32(ctrl_state["dsov"], "cold.controller_state.dsov") == 0:
-                raise BurnError(
-                    "cold snapshot controller_state has DSOV=0 (still in a held glitch window; "
-                    "power-cycle card completely before capturing cold snapshot)"
-                )
-            if "en_sw" in ctrl_state and (u32(ctrl_state["en_sw"], "cold.controller_state.en_sw") & 1) == 1:
-                raise BurnError(
-                    "cold snapshot controller_state has EN_SW_OVERRIDE=1 (not a fresh cold boot)"
-                )
+        ctrl_problems, ctrl_note = cold_snapshot_controller_problems(cold.get("controller_state"))
+        if ctrl_problems:
+            raise BurnError("; ".join(ctrl_problems))
 
         raw_die = cold.get("die_rows")
         if not isinstance(raw_die, dict):
@@ -2262,6 +2343,7 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
             differences=diffs,
             status="PASS" if not diffs else "FAIL",
             evidence_kind="operator_provided_cold_snapshot_not_authenticated",
+            controller_note=ctrl_note,
         )
         logged_comparison = True
         if diffs:

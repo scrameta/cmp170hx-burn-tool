@@ -959,6 +959,11 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
                 "dsov": f"0x{self.controller.rd(REG_DSOV_STATUS):08x}",
                 "en_sw": f"0x{self.controller.rd(REG_EN_SW_OVERRIDE):08x}",
                 "plm_f8": f"0x{self.controller.rd(REG_PLM_F8):08x}",
+                # Volatile arming state: proves a power cycle when DSOV reads 0 on
+                # every boot (permanently clear DSOV, e.g. RIR records).
+                "sbfe": f"0x{self.controller.rd(REG_SBFE_SHADOW):08x}",
+                "wdata_wr_secure": f"0x{self.controller.rd(REG_WDATA_WR_SECURE):08x}",
+                "plm_f4": f"0x{self.controller.rd(REG_PLM_F4):08x}",
             }
             for exp in EXPERIMENTAL_INSPECT_REGS:
                 try:

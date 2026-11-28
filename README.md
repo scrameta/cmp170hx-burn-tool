@@ -124,6 +124,7 @@ adapter_template.py    # ABC-backed template for custom hardware adapters
 - `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` are held back from the `attempt` journal entry until the record's outcome is fsynced (Ctrl-C or an SSH drop cannot land mid-program); `FUSEWDATA` is reset to the `0` no-burn latch after every program
 - Any `0xBADxxxxx` register read is treated as poison (same test as `cmp170hx-8gb-vfi-tools`). A fuse *row* reading `0xBADxxxxx` is real OTP data (an FF record with block data `0xBAD0..0xBADF`) unless the controller is unhealthy straight after the read or a second read differs; such records are never burned
 - Real-stage `verify-cold` requires `fpf_rows` and fails if any journaled row reads `0` after the cold boot
+- `verify-cold` refuses a snapshot taken in a held glitch window. On cards whose DSOV is permanently clear (e.g. RIR records), `DSOV=0` on every boot, so it instead requires the volatile arming state to be back at its reset values (`EN_SW_OVERRIDE=0`, `SBFE_SHADOW=1`, `WDATA_WR_SECURE=1`, `PLM_f4` closed); snapshots captured before this check existed must be recaptured
 
 ### Granular Manual Overrides (No blanket `--force`)
 
