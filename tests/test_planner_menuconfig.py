@@ -259,7 +259,7 @@ class TestCardStateReadout(unittest.TestCase):
         with self.assertRaisesRegex(BurnError, "CRC_STATUS"):
             read_ga100_card_state(adapter, label="bad-crc")
 
-        adapter2 = _build_sim_adapter({**state, "pci_id": "10de:20b0"}, goldilocks=False)
+        adapter2 = _build_sim_adapter({**state, "pci_id": "10de:2204"}, goldilocks=False)
         with self.assertRaisesRegex(BurnError, "unexpected PCI ID"):
             read_ga100_card_state(adapter2, label="wrong-pci")
 
@@ -832,6 +832,60 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         self.assertEqual(tokens_ok.count("CONFIRM A100 DEVID 0x20F1"), 2)
         self.assertEqual(gold_ad2.fuse_row(card.next_free_row + 1), 0x41E20942)
         self.assertEqual(gold_ad2.fuse_row(card.next_free_row + 2), 0x41E20982)
+
+        # 8. Revert round-trip: a card currently running as A100 PCIe 40 GB (10de:20f1)
+        #    with existing c2/b37 & c2/b38 FF rows can be reverted back to CMP 170HX 10 GB (0x2082)
+        #    or 8 GB (0x20C2) via menuconfig and burned with CONFIRM CMP DEVID!
+        self.assertEqual(encode_a100_devid_ff_words(0x20C2), (0x41840942, 0x41840982))
+        self.assertEqual(encode_a100_devid_ff_words(0x2082), (0x41040942, 0x41040982))
+        st_a100 = _synthetic_card_state()
+        st_a100["pci_id"] = "10de:20f1"
+        base_next = card.next_free_row
+        st_a100["ff_rows"][base_next] = 0x41E20942
+        st_a100["ff_rows"][base_next + 1] = 0x41E20982
+        ad_a100 = _build_sim_adapter(st_a100, goldilocks=True)
+        ad_a100.active_sense_readonly()
+        card_a100 = capture_card_snapshot(ad_a100)
+        self.assertEqual(card_a100.pci_id, "10de:20f1")
+
+        # Open PCIe Device ID [6], pick CMP 170HX 10 GB [7], back [b], preview [8], back [b], save [s]
+        rev_inputs = iter(["6", "7", "b", "8", "b", "s"])
+        rev_shown: list[str] = []
+        rev_cfg = run_menuconfig(
+            card_a100,
+            use_curses=False,
+            input_fn=lambda _p="": next(rev_inputs),
+            show=rev_shown.append,
+        )
+        self.assertIsNotNone(rev_cfg)
+        self.assertEqual(rev_cfg.a100_devid, 0x2082)
+        rev_menu_txt = "\n".join(rev_shown)
+        self.assertIn("WARNING — CMP 170HX PCIe DEVICE ID REVERT SELECTED", rev_menu_txt)
+        self.assertIn("0x41E2->0x4104", rev_menu_txt)
+
+        rev_plan_path = self.work / "plan_revert_cmp_2082.json"
+        write_private_json(rev_plan_path, build_plan_from_config(card_a100, rev_cfg))
+        rev_plan = Plan.load(rev_plan_path)
+        check_plan(rev_plan)
+        rev_review = "\n".join(format_plan_review(rev_plan, reader=ad_a100))
+        self.assertIn("REVERT; REQUIRES CMP 170HX VBIOS", rev_review)
+
+        rev_tokens: list[str] = []
+        with Journal(self.work / "devid_revert.jsonl") as jr:
+            process_records(
+                rev_plan,
+                ad_a100,
+                ad_a100,
+                jr,
+                stage="all",
+                dry_run=False,
+                overrides=Overrides(no_test_receipt=True),
+                confirm=lambda _p, tok: (rev_tokens.append(tok), True)[1],
+                show=lambda _s: None,
+            )
+        self.assertEqual(rev_tokens.count("CONFIRM CMP DEVID 0x2082"), 2)
+        self.assertEqual(ad_a100.fuse_row(card_a100.next_free_row + 1), 0x41040942)
+        self.assertEqual(ad_a100.fuse_row(card_a100.next_free_row + 2), 0x41040982)
 
     def test_mig_sys_pipe_unlock_preserves_defects_and_nvlink(self):
         # Build a synthetic card with SYS_PIPE_DISABLE=0xFE (7 disabled), DEFECTIVE=0x80 (only bit 7 defective)

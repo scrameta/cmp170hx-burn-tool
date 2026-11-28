@@ -31,13 +31,21 @@ FF_EMPTY_WORD = 0x00000000
 # + 128 GB BAR1 confirmation).
 DEVICE_ID_DENIED_BLOCKS: frozenset[tuple[int, int]] = frozenset({(2, 37), (2, 38)})
 
-# Verified A100 GA100 target PCI Device IDs for intentional DEVIDA (c2/b37) + DEVIDB (c2/b38)
-# conversion (encoded in FF as ``device_id << 1`` with bit 0 == 0).
+# Verified GA100 target PCI Device IDs for intentional DEVIDA (c2/b37) + DEVIDB (c2/b38)
+# conversion or revert (encoded in FF as ``device_id << 1`` with bit 0 == 0).
 A100_TARGET_DEVICE_IDS: dict[int, str] = {
     0x20F1: "A100 PCIe 40 GB (10de:20f1)",
     0x20B5: "A100 PCIe 80 GB (10de:20b5)",
     0x20B0: "A100 SXM4 40 GB (10de:20b0)",
     0x20B2: "A100 SXM4 80 GB (10de:20b2)",
+}
+CMP170HX_TARGET_DEVICE_IDS: dict[int, str] = {
+    0x20C2: "CMP 170HX 8 GB (10de:20c2)",
+    0x2082: "CMP 170HX 10 GB (10de:2082)",
+}
+BURNABLE_TARGET_DEVICE_IDS: dict[int, str] = {
+    **A100_TARGET_DEVICE_IDS,
+    **CMP170HX_TARGET_DEVICE_IDS,
 }
 
 # Core fuse-controller BAR0 registers (verified across GA100 references).

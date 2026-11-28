@@ -41,6 +41,7 @@ from .ffrecord import (
 from .fuse_rules import evaluate_fuse_combinations
 from .fuses import (
     A100_TARGET_DEVICE_IDS,
+    BURNABLE_TARGET_DEVICE_IDS,
     EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
     EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
     EXPERIMENTAL_INSPECT_REGS,
@@ -511,11 +512,18 @@ def format_plan_review(
         devid_info = decode_a100_devid_ff_word(rec.word) if rec.kind == "devid" else None
         if devid_info is not None:
             which_dev, target_dev = devid_info
-            audit_warnings.append(
-                f"[{row_label} / {rec.name}] A100 IDENTITY CONVERSION ({which_dev} -> 0x{target_dev:04x} "
-                f"{A100_TARGET_DEVICE_IDS[target_dev]}): requires matching A100 VBIOS flash after cold boot "
-                "AND motherboard 128 GB 64-bit BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)"
-            )
+            if target_dev in A100_TARGET_DEVICE_IDS:
+                audit_warnings.append(
+                    f"[{row_label} / {rec.name}] A100 IDENTITY CONVERSION ({which_dev} -> 0x{target_dev:04x} "
+                    f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]}): requires matching A100 VBIOS flash after cold boot "
+                    "AND motherboard 128 GB 64-bit BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)"
+                )
+            else:
+                audit_warnings.append(
+                    f"[{row_label} / {rec.name}] CMP 170HX IDENTITY REVERT ({which_dev} -> 0x{target_dev:04x} "
+                    f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]}): requires matching CMP 170HX VBIOS flash after cold boot "
+                    "if an A100 VBIOS is currently installed"
+                )
         else:
             for w in analysis["warnings"]:
                 audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
@@ -657,9 +665,14 @@ def format_plan_review(
                 _which, target_dev = devid_info
                 if target_dev not in seen_devids:
                     seen_devids.add(target_dev)
+                    vbios_note = (
+                        "REQUIRES A100 VBIOS + 128 GB BAR1"
+                        if target_dev in A100_TARGET_DEVICE_IDS
+                        else "REVERT; REQUIRES CMP 170HX VBIOS"
+                    )
                     outcome_lines.append(
                         f"  [!] PCIe Device ID   : {plan.pci_id} -> 10de:{target_dev:04x} "
-                        f"({A100_TARGET_DEVICE_IDS[target_dev]}; DEVIDA+DEVIDB — REQUIRES A100 VBIOS + 128 GB BAR1)"
+                        f"({BURNABLE_TARGET_DEVICE_IDS[target_dev]}; DEVIDA+DEVIDB — {vbios_note})"
                     )
         elif rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
             outcome_lines.append(

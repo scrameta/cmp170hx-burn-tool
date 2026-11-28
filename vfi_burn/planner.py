@@ -25,6 +25,7 @@ from .ffrecord import (
 from .fuse_rules import CombinationIssue, evaluate_fuse_combinations
 from .fuses import (
     A100_TARGET_DEVICE_IDS,
+    BURNABLE_TARGET_DEVICE_IDS,
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FFCALC_KEY_TO_FIELD,
@@ -398,10 +399,10 @@ class UnlockConfig:
         self.nvlink_enabled = bool(enabled)
 
     def set_a100_devid(self, target_devid: int | None) -> None:
-        if target_devid is not None and target_devid not in A100_TARGET_DEVICE_IDS:
-            supported = ", ".join(f"0x{d:04x}" for d in sorted(A100_TARGET_DEVICE_IDS))
+        if target_devid is not None and target_devid not in BURNABLE_TARGET_DEVICE_IDS:
+            supported = ", ".join(f"0x{d:04x}" for d in sorted(BURNABLE_TARGET_DEVICE_IDS))
             raise BurnError(
-                f"unsupported A100 target Device ID 0x{target_devid:04x}; supported: {supported}"
+                f"unsupported target Device ID 0x{target_devid:04x}; supported: {supported}"
             )
         self.a100_devid = target_devid
 
@@ -449,7 +450,7 @@ class UnlockConfig:
     def target_devid_label(self) -> str:
         if self.a100_devid is None:
             return f"keep ({self.card.pci_id})"
-        return f"10de:{self.a100_devid:04x} ({A100_TARGET_DEVICE_IDS[self.a100_devid]})"
+        return f"10de:{self.a100_devid:04x} ({BURNABLE_TARGET_DEVICE_IDS[self.a100_devid]})"
 
     def desired_floorsweep_masks(self) -> dict[str, int]:
         """Compute coherent target disable masks for all floorsweep fields."""
@@ -543,7 +544,8 @@ class UnlockConfig:
             f"NVLink: {nvl}",
         ]
         if self.a100_devid is not None:
-            parts.append(f"DevID: 0x{self.a100_devid:04x} [A100 VBIOS+BAR1!]")
+            tag = "A100 VBIOS+BAR1!" if self.a100_devid in A100_TARGET_DEVICE_IDS else "CMP VBIOS!"
+            parts.append(f"DevID: 0x{self.a100_devid:04x} [{tag}]")
         if self.sys_pipe_unlock:
             parts.append(f"MIG/SYS_PIPE: {self.card.current_sys_pipe_count()}->{self.card.max_healthy_sys_pipe_count()}/8")
         return " | ".join(parts)
@@ -713,13 +715,18 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
             }
         )
 
-    # 4. Optional A100 PCIe Device ID conversion (paired DEVIDA c2/b37 + DEVIDB c2/b38).
+    # 4. Optional PCIe Device ID conversion / revert (paired DEVIDA c2/b37 + DEVIDB c2/b38).
     #    Encoded as ``target_devid << 1`` (bit 0 = 0). Always emitted as an atomic pair.
     if config.a100_devid is not None:
         target_dev = config.a100_devid
         devida_word, devidb_word = encode_a100_devid_ff_words(target_dev)
         block_data = (target_dev << 1) & 0xFFFF
-        dev_desc = A100_TARGET_DEVICE_IDS[target_dev]
+        dev_desc = BURNABLE_TARGET_DEVICE_IDS[target_dev]
+        vbios_note = (
+            "REQUIRES A100 VBIOS + 128 GB BAR1"
+            if target_dev in A100_TARGET_DEVICE_IDS
+            else "REVERT; REQUIRES CMP 170HX VBIOS"
+        )
         for blk, word, which_field, which_label in (
             (37, devida_word, "pcie_devida", "DEVIDA"),
             (38, devidb_word, "pcie_devidb", "DEVIDB"),
@@ -739,7 +746,7 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
                     "word": word,
                     "kind": "devid",
                     "fields": [which_field],
-                    "note": f"{dev_desc} ({which_label}) — REQUIRES A100 VBIOS + 128 GB BAR1",
+                    "note": f"{dev_desc} ({which_label}) — {vbios_note}",
                     "source_label": f"derived_devid[{which_label}]",
                 }
             )

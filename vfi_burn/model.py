@@ -8,15 +8,30 @@ import json
 
 SKU_CMP170HX_8GB = "10de:20c2"
 SKU_CMP170HX_10GB = "10de:2082"
-SUPPORTED_CMP170HX_SKUS = (SKU_CMP170HX_8GB, SKU_CMP170HX_10GB)
+SKU_A100_PCIE_40GB = "10de:20f1"
+SKU_A100_PCIE_80GB = "10de:20b5"
+SKU_A100_SXM4_40GB = "10de:20b0"
+SKU_A100_SXM4_80GB = "10de:20b2"
+SUPPORTED_CMP170HX_SKUS = (
+    SKU_CMP170HX_8GB,
+    SKU_CMP170HX_10GB,
+    SKU_A100_PCIE_40GB,
+    SKU_A100_PCIE_80GB,
+    SKU_A100_SXM4_40GB,
+    SKU_A100_SXM4_80GB,
+)
 SKU_DISPLAY_NAMES: dict[str, str] = {
     SKU_CMP170HX_8GB: "CMP 170HX 8 GB",
     SKU_CMP170HX_10GB: "CMP 170HX 10 GB",
+    SKU_A100_PCIE_40GB: "A100 PCIe 40 GB (GA100)",
+    SKU_A100_PCIE_80GB: "A100 PCIe 80 GB (GA100)",
+    SKU_A100_SXM4_40GB: "A100 SXM4 40 GB (GA100)",
+    SKU_A100_SXM4_80GB: "A100 SXM4 80 GB (GA100)",
 }
 
 
 def sku_display_name(pci_id: str) -> str:
-    """Return a human-readable model label for a supported CMP 170HX PCI ID."""
+    """Return a human-readable model label for a supported GA100/CMP 170HX PCI ID."""
     return SKU_DISPLAY_NAMES.get(pci_id.strip().lower(), f"PCI {pci_id}")
 
 

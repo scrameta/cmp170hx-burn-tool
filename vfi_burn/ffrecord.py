@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .fuse_rules import evaluate_fuse_combinations, poweroff_domain_for_group
 from .fuses import (
     A100_TARGET_DEVICE_IDS,
+    BURNABLE_TARGET_DEVICE_IDS,
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FFCALC_KEY_TO_FIELD,
@@ -367,13 +368,15 @@ def compute_sm_count(gpc_disable: int, tpc_disables: list[int]) -> int:
 
 
 def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
-    """If ``word`` is a validated A100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record,
-    return ``(which, devid)`` (e.g. ``("DEVIDA", 0x20F1)``); otherwise return ``None``.
+    """If ``word`` is a validated GA100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record
+    (either an A100 target or a CMP 170HX 8 GB / 10 GB revert target), return
+    ``(which, devid)`` (e.g. ``("DEVIDA", 0x20F1)``); otherwise return ``None``.
 
     Enforces:
       - Valid non-IFF FF record targeting ``(2, 37)`` (DEVIDA) or ``(2, 38)`` (DEVIDB)
       - Bit 0 of block data is 0 (preserves chain2 bit 592 / ``DEVIDA[15]=0``)
-      - ``data >> 1`` is in ``A100_TARGET_DEVICE_IDS`` (``0x20F1``, ``0x20B5``, ``0x20B0``, ``0x20B2``)
+      - ``data >> 1`` is in ``BURNABLE_TARGET_DEVICE_IDS``
+        (A100 ``0x20F1``/``0x20B5``/``0x20B0``/``0x20B2`` or CMP 170HX ``0x20C2``/``0x2082``)
     """
     try:
         rec = decode_ff(word)
@@ -384,17 +387,17 @@ def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
     if (rec.data & 1) != 0:
         return None
     devid = rec.data >> 1
-    if devid not in A100_TARGET_DEVICE_IDS:
+    if devid not in BURNABLE_TARGET_DEVICE_IDS:
         return None
     return ("DEVIDA" if rec.block == 37 else "DEVIDB", devid)
 
 
 def encode_a100_devid_ff_words(target_devid: int) -> tuple[int, int]:
-    """Encode paired ``(devida_word, devidb_word)`` FF records for a supported A100 Device ID."""
-    if target_devid not in A100_TARGET_DEVICE_IDS:
-        supported = ", ".join(f"0x{d:04x}" for d in sorted(A100_TARGET_DEVICE_IDS))
+    """Encode paired ``(devida_word, devidb_word)`` FF records for a supported A100 or CMP 170HX Device ID."""
+    if target_devid not in BURNABLE_TARGET_DEVICE_IDS:
+        supported = ", ".join(f"0x{d:04x}" for d in sorted(BURNABLE_TARGET_DEVICE_IDS))
         raise BurnError(
-            f"unsupported A100 target device ID 0x{target_devid:04x}; supported: {supported}"
+            f"unsupported target device ID 0x{target_devid:04x}; supported: {supported}"
         )
     block_data = (target_devid << 1) & 0xFFFF
     return encode_ff(2, 37, block_data), encode_ff(2, 38, block_data)
@@ -945,9 +948,12 @@ def build_vfi_plan_from_records(
         if is_devid and devid_info is not None:
             which_dev, target_dev = devid_info
             target_name = f"PCIE_{which_dev}"
-            note = item.get("note") or (
-                f"{A100_TARGET_DEVICE_IDS[target_dev]} — requires matching A100 VBIOS + 128 GB BAR1"
+            default_note = (
+                f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]} — requires matching A100 VBIOS + 128 GB BAR1"
+                if target_dev in A100_TARGET_DEVICE_IDS
+                else f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]} — revert; requires matching CMP 170HX VBIOS"
             )
+            note = item.get("note") or default_note
             old_tag = f"0x{replay_old:04x}->" if replay_old is not None else "FPF->"
             decode_desc = (
                 f"FF chain={chain} blk={block} {old_tag}0x{sim['new_block']:04x} "

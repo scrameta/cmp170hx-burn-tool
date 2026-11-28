@@ -11,7 +11,14 @@ import sys
 from typing import Callable
 
 from .ffrecord import encode_ff
-from .fuses import A100_TARGET_DEVICE_IDS, SM_PER_TPC, TOTAL_FBP, TOTAL_GPC, TPC_PER_GPC
+from .fuses import (
+    A100_TARGET_DEVICE_IDS,
+    BURNABLE_TARGET_DEVICE_IDS,
+    SM_PER_TPC,
+    TOTAL_FBP,
+    TOTAL_GPC,
+    TPC_PER_GPC,
+)
 from .model import BurnError, SKU_CMP170HX_10GB, SKU_CMP170HX_8GB
 from .planner import CardSnapshot, UnlockConfig, derive_ff_records
 
@@ -38,17 +45,28 @@ def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str
         "",
     ]
     if config.a100_devid is not None:
-        lines.extend(
-            [
-                "!!! WARNING — A100 PCIe DEVICE ID CONVERSION SELECTED !!!",
-                f"!!! Target: {card.pci_id} -> 10de:{config.a100_devid:04x} ({A100_TARGET_DEVICE_IDS[config.a100_devid]})",
-                "!!! - Card WILL NOT POST on stock CMP 170HX VBIOS after cold boot; back up CMP ROM",
-                "!!!   (nvflash --save) BEFORE burning and flash matching A100 VBIOS right after.",
-                "!!! - Host BIOS MUST support 128 GB 64-bit BAR1 (Above 4G, CSM OFF, ReBAR ON);",
-                "!!!   POST failure requires offline CH341A SPI recovery.",
-                "",
-            ]
-        )
+        if config.a100_devid in A100_TARGET_DEVICE_IDS:
+            lines.extend(
+                [
+                    "!!! WARNING — A100 PCIe DEVICE ID CONVERSION SELECTED !!!",
+                    f"!!! Target: {card.pci_id} -> 10de:{config.a100_devid:04x} ({BURNABLE_TARGET_DEVICE_IDS[config.a100_devid]})",
+                    "!!! - Card WILL NOT POST on stock CMP 170HX VBIOS after cold boot; back up CMP ROM",
+                    "!!!   (nvflash --save) BEFORE burning and flash matching A100 VBIOS right after.",
+                    "!!! - Host BIOS MUST support 128 GB 64-bit BAR1 (Above 4G, CSM OFF, ReBAR ON);",
+                    "!!!   POST failure requires offline CH341A SPI recovery.",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "!!! WARNING — CMP 170HX PCIe DEVICE ID REVERT SELECTED !!!",
+                    f"!!! Target: {card.pci_id} -> 10de:{config.a100_devid:04x} ({BURNABLE_TARGET_DEVICE_IDS[config.a100_devid]})",
+                    "!!! - If an A100 VBIOS is currently installed, card WILL NOT POST on it after cold boot;",
+                    "!!!   flash your backed-up matching CMP 170HX VBIOS right after cold power cycle.",
+                    "",
+                ]
+            )
     try:
         items, issues = derive_ff_records(card, config)
     except BurnError as exc:
@@ -185,11 +203,11 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 locked=card.nvlink_all_defective(),
             ),
             _MenuEntry(
-                label=f"    PCIe Device ID (A100 Identity): {config.target_devid_label()}  --->",
+                label=f"    PCIe Device ID (A100 / CMP 170HX): {config.target_devid_label()}  --->",
                 help_text=(
-                    "WARNING: Converts fused DEVIDA (c2/b37) + DEVIDB (c2/b38) to an A100 Device ID "
-                    "(20F1/20B5/20B0/20B2). Requires flashing matching A100 VBIOS after cold boot "
-                    "AND host 128 GB BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)."
+                    "WARNING: Sets fused DEVIDA (c2/b37) + DEVIDB (c2/b38) to an A100 ID "
+                    "(20F1/20B5/20B0/20B2) or reverts back to CMP 170HX (20C2 8 GB / 2082 10 GB). "
+                    "Requires matching VBIOS after cold boot (A100 also needs 128 GB BAR1)."
                 ),
                 submenu="devid",
             ),
@@ -424,9 +442,13 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
         return "PCIe Link Speed (radio selection)", entries
 
     if screen == "devid":
-        dev_warning = (
+        a100_warning = (
             "WARNING: Requires matching A100 VBIOS flash after cold boot (stock CMP ROM will NOT POST) "
             "AND host BIOS 128 GB BAR1 support (Above 4G ON, CSM OFF, ReBAR ON; else CH341A SPI recovery)."
+        )
+        cmp_warning = (
+            "WARNING: Reverts fused DEVIDA (c2/b37) + DEVIDB (c2/b38) back to CMP 170HX. "
+            "If an A100 VBIOS is currently installed, flash your backed-up CMP 170HX VBIOS after cold boot."
         )
         rec_10g = "  [matches 10 GB / 40 GB HBM2e card]" if card.pci_id == SKU_CMP170HX_10GB else ""
         rec_8g = "  [matches 8 GB / 80 GB HBM2e card]" if card.pci_id == SKU_CMP170HX_8GB else ""
@@ -434,27 +456,37 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             (
                 None,
                 f"Keep current PCIe Device ID ({card.pci_id}) — no VBIOS change",
-                "Leave DEVIDA (c2/b37) and DEVIDB (c2/b38) untouched; keeps stock CMP 170HX VBIOS compatibility.",
+                "Leave DEVIDA (c2/b37) and DEVIDB (c2/b38) untouched; keeps current VBIOS compatibility.",
             ),
             (
                 0x20F1,
                 f"A100 PCIe 40 GB  (10de:20f1) — DEVIDA+DEVIDB (2 FF rows){rec_10g}",
-                dev_warning,
+                a100_warning,
             ),
             (
                 0x20B5,
                 f"A100 PCIe 80 GB  (10de:20b5) — DEVIDA+DEVIDB (2 FF rows){rec_8g}",
-                dev_warning,
+                a100_warning,
             ),
             (
                 0x20B0,
                 "A100 SXM4 40 GB  (10de:20b0) — DEVIDA+DEVIDB (2 FF rows)",
-                dev_warning,
+                a100_warning,
             ),
             (
                 0x20B2,
                 "A100 SXM4 80 GB  (10de:20b2) — DEVIDA+DEVIDB (2 FF rows)",
-                dev_warning,
+                a100_warning,
+            ),
+            (
+                0x20C2,
+                "CMP 170HX 8 GB   (10de:20c2) — revert DEVIDA+DEVIDB (2 FF rows; needs CMP 8 GB VBIOS)",
+                cmp_warning,
+            ),
+            (
+                0x2082,
+                "CMP 170HX 10 GB  (10de:2082) — revert DEVIDA+DEVIDB (2 FF rows; needs CMP 10 GB VBIOS)",
+                cmp_warning,
             ),
         ]
         entries = []
@@ -465,9 +497,14 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 config.set_a100_devid(tid)
                 if tid is None:
                     return f"PCIe Device ID reset to keep ({card.pci_id})."
+                if tid in A100_TARGET_DEVICE_IDS:
+                    return (
+                        f"WARNING: Device ID set to 10de:{tid:04x} ({BURNABLE_TARGET_DEVICE_IDS[tid]}). "
+                        "Needs A100 VBIOS after cold boot + 128 GB BAR1!"
+                    )
                 return (
-                    f"WARNING: Device ID set to 10de:{tid:04x} ({A100_TARGET_DEVICE_IDS[tid]}). "
-                    "Needs A100 VBIOS after cold boot + 128 GB BAR1!"
+                    f"WARNING: Device ID set to revert 10de:{tid:04x} ({BURNABLE_TARGET_DEVICE_IDS[tid]}). "
+                    "Needs matching CMP 170HX VBIOS after cold boot!"
                 )
 
             entries.append(
@@ -478,7 +515,7 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                     on_enter=_pick,
                 )
             )
-        return "PCIe Device ID — A100 Identity (WARNING: requires A100 VBIOS + 128 GB BAR1)", entries
+        return "PCIe Device ID — A100 / CMP 170HX (WARNING: must match flashed VBIOS)", entries
 
     if screen == "preview":
         preview_lines = _compute_preview_lines(card, config)

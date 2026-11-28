@@ -24,7 +24,7 @@ from .ffrecord import (
     verify_noop_test_record,
 )
 from .fuse_rules import poweroff_domains_for_groups
-from .fuses import A100_TARGET_DEVICE_IDS
+from .fuses import A100_TARGET_DEVICE_IDS, BURNABLE_TARGET_DEVICE_IDS
 from .journal import Journal, deferred_signals
 from .model import (
     BurnError,
@@ -1701,32 +1701,47 @@ def process_records(
             devid_info = decode_a100_devid_ff_word(record.word)
             if devid_info is None:
                 raise BurnError(
-                    f"{record.name}: REFUSED; invalid A100 DEVID record word {hex32(record.word)}"
+                    f"{record.name}: REFUSED; invalid PCIe DEVID record word {hex32(record.word)}"
                 )
             which_dev, target_dev = devid_info
-            dev_desc = A100_TARGET_DEVICE_IDS[target_dev]
-            token = f"CONFIRM A100 DEVID 0x{target_dev:04X}"
-            show("\n" + "!" * 76)
-            show(f"!!! CRITICAL WARNING — PERMANENT A100 PCIe DEVICE ID CONVERSION ({which_dev})")
-            show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
-            show("!!!")
-            show("!!! 1. VBIOS REQUIRED AFTER COLD BOOT:")
-            show("!!!    Once fused, this card WILL NOT POST on its stock CMP 170HX VBIOS.")
-            show("!!!    Back up your stock CMP ROM (nvflash --save) BEFORE burning, and")
-            show("!!!    flash the matching A100 VBIOS immediately after cold power cycle.")
-            show("!!!")
-            show("!!! 2. 128 GB 64-BIT BAR1 MMIO WINDOW REQUIRED:")
-            show("!!!    Motherboard BIOS MUST have Above 4G Decoding ON, CSM OFF,")
-            show("!!!    Re-Size BAR ON, and MMIO High Size >= 128 GB. If POST fails,")
-            show("!!!    there is NO in-band recovery — you will need a CH341A SPI clip.")
-            show("!!!" )
-            show("!!! 3. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
-            show("!" * 76)
-            if not _confirm_token(
-                confirm,
-                f"Type '{token}' to confirm A100 VBIOS + 128 GB BAR1 readiness: ",
-                token,
-            ):
+            dev_desc = BURNABLE_TARGET_DEVICE_IDS[target_dev]
+            is_a100_target = target_dev in A100_TARGET_DEVICE_IDS
+            if is_a100_target:
+                token = f"CONFIRM A100 DEVID 0x{target_dev:04X}"
+                show("\n" + "!" * 76)
+                show(f"!!! CRITICAL WARNING — PERMANENT A100 PCIe DEVICE ID CONVERSION ({which_dev})")
+                show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
+                show("!!!")
+                show("!!! 1. VBIOS REQUIRED AFTER COLD BOOT:")
+                show("!!!    Once fused, this card WILL NOT POST on its stock CMP 170HX VBIOS.")
+                show("!!!    Back up your stock CMP ROM (nvflash --save) BEFORE burning, and")
+                show("!!!    flash the matching A100 VBIOS immediately after cold power cycle.")
+                show("!!!")
+                show("!!! 2. 128 GB 64-BIT BAR1 MMIO WINDOW REQUIRED:")
+                show("!!!    Motherboard BIOS MUST have Above 4G Decoding ON, CSM OFF,")
+                show("!!!    Re-Size BAR ON, and MMIO High Size >= 128 GB. If POST fails,")
+                show("!!!    there is NO in-band recovery — you will need a CH341A SPI clip.")
+                show("!!!")
+                show("!!! 3. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
+                show("!" * 76)
+                prompt_msg = f"Type '{token}' to confirm A100 VBIOS + 128 GB BAR1 readiness: "
+                decline_err = "A100 Device ID conversion not confirmed"
+            else:
+                token = f"CONFIRM CMP DEVID 0x{target_dev:04X}"
+                show("\n" + "!" * 76)
+                show(f"!!! WARNING — PERMANENT PCIe DEVICE ID REVERT TO CMP 170HX ({which_dev})")
+                show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
+                show("!!!")
+                show("!!! 1. MATCHING CMP 170HX VBIOS REQUIRED AFTER COLD BOOT:")
+                show("!!!    If this card currently has an A100 VBIOS flashed, it WILL NOT POST")
+                show("!!!    on that A100 ROM once fused back to CMP 170HX — flash your backed-up")
+                show("!!!    CMP 170HX VBIOS (matching 8 GB / 10 GB) right after cold power cycle.")
+                show("!!!")
+                show("!!! 2. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
+                show("!" * 76)
+                prompt_msg = f"Type '{token}' to confirm CMP 170HX VBIOS readiness: "
+                decline_err = "CMP 170HX Device ID revert not confirmed"
+            if not _confirm_token(confirm, prompt_msg, token):
                 journal.append(event="declined", row=pointer, record=record.name, reason=token)
                 if written_records:
                     _run_poweroff_sanity(
@@ -1736,7 +1751,7 @@ def process_records(
                         baseline_blocks=sanity_baseline,
                         reason="operator_declined",
                     )
-                raise BurnError("A100 Device ID conversion not confirmed")
+                raise BurnError(decline_err)
 
         if rec_touches_pcie or record.kind == "reconfig":
             review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()
