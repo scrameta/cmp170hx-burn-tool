@@ -440,16 +440,16 @@ class GA100FuseController(FuseControllerHAL):
             raise BurnError("controller not armed: " + "; ".join(problems))
 
     def _relatch_no_burn(self, orig_addr: int | None) -> None:
-        """Best effort, only when FUSECTRL is idle (never after poison): restore FUSEADDR
-        and put the FUSEWDATA=0 no-burn latch back, so a stray CMD_PROGRAM (other tool,
-        operator typo, firmware) cannot re-burn the staged word into whatever row
-        FUSEADDR now selects."""
+        """Best effort, only when FUSECTRL is idle (never after poison): put the
+        FUSEWDATA=0 no-burn latch back BEFORE restoring FUSEADDR, so a stray
+        CMD_PROGRAM (other tool, operator typo, firmware) cannot re-burn the staged
+        word into whatever row FUSEADDR selects."""
         try:
             if not is_fusectrl_idle(self.rd(REG_FUSECTRL)):
                 return
+            self._wr(REG_FUSEWDATA, 0)
             if orig_addr is not None:
                 self._wr(REG_FUSEADDR, orig_addr)
-            self._wr(REG_FUSEWDATA, 0)
         except Exception:
             pass
 
@@ -544,6 +544,9 @@ class GA100FuseController(FuseControllerHAL):
         # ---- point of no return: CMD_PROGRAM ----
         try:
             self._wr(REG_FUSECTRL, CMD_PROGRAM)
+            # Let the fuse macro leave IDLE (~1 ms program pulse) before polling,
+            # so _relatch_no_burn can never race with an active program cycle.
+            self._sleep(0.005)
             self.poll_idle(timeout_s)
         finally:
             self._relatch_no_burn(orig_addr)

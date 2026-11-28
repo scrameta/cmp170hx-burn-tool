@@ -365,9 +365,9 @@ sequenceDiagram
         Note over Ctl,FUSE: POINT OF NO RETURN
         Ctl->>FUSE: write FUSECTRL = 2 (CMD_PROGRAM)
         FUSE-->>FUSE: row |= FUSEWDATA (busy, about 1 ms)
-        Ctl->>FUSE: poll FUSECTRL until idle (up to 10 s, halt on poison)
+        Note over Ctl,FUSE: sleep 5 ms, then poll FUSECTRL until idle (up to 10 s, halt on poison)
     end
-    Ctl->>FUSE: if idle, write FUSEADDR = original and FUSEWDATA = 0 (always, via finally)
+    Ctl->>FUSE: if idle, write FUSEWDATA = 0 then restore FUSEADDR = original (always, via finally)
     Ctl->>FUSE: read_row(row) via CMD_READ
     alt read-back == word
         Ctl-->>Ctl: return word
