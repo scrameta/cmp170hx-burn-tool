@@ -500,22 +500,33 @@ def _apply_field_to_blocks(
     current_blocks: dict[int, dict[int, int]],
     desired_blocks: dict[int, dict[int, int]],
     ff_key: str,
+    current_val: int,
     target_val: int,
 ) -> None:
-    """Overlay ``ff_key = target_val`` into ``desired_blocks``, hard-denying device-ID & absent blocks."""
+    """Overlay changed bits of ``ff_key`` into ``desired_blocks``, hard-denying device-ID & absent blocks.
+
+    Unchanged bit positions (``cur_bit == want_bit``) are skipped so multi-block fields
+    (e.g. ``pes_disable`` spanning c1/b15..b17 or ``rop_l2_disable`` spanning c1/b19..b21)
+    do not fail when a trailing block was never written in factory FF because all of its
+    disable bits are already 0 and remain 0.
+    """
     f = FIELDS_BY_KEY[ff_key]
     for offset in range(f.width):
+        cur_bit = (current_val >> offset) & 1
+        want_bit = (target_val >> offset) & 1
+        if cur_bit == want_bit:
+            continue
         bit_pos = f.bit + offset
         blk, local_bit = divmod(bit_pos, 16)
         if (f.chain, blk) in DEVICE_ID_DENIED_BLOCKS:
             raise BurnError(f"REFUSED: {ff_key} overlaps read-only device-ID block c{f.chain}/b{blk}")
         if blk not in current_blocks.get(f.chain, {}):
             raise BurnError(
-                f"REFUSED: cannot modify {ff_key} because c{f.chain}/b{blk} is absent from "
-                "this card's FF prefix (neighboring bits in that 16-bit block are unknown)"
+                f"REFUSED: cannot modify {ff_key} bit {offset} because c{f.chain}/b{blk} is absent "
+                "from this card's FF prefix (neighboring bits in that 16-bit block are unknown)"
             )
         val = desired_blocks.setdefault(f.chain, {})[blk]
-        if (target_val >> offset) & 1:
+        if want_bit:
             val |= 1 << local_bit
         else:
             val &= ~(1 << local_bit)
@@ -544,7 +555,13 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
     )
     for key in (*sm_hbm_keys, "nvlink_disable"):
         if desired_masks[key] != card.current_fields[key]:
-            _apply_field_to_blocks(card.current_blocks, desired_blocks, key, desired_masks[key])
+            _apply_field_to_blocks(
+                card.current_blocks,
+                desired_blocks,
+                key,
+                card.current_fields[key],
+                desired_masks[key],
+            )
 
     # 2. Apply PCIe speed/boot changes (chain 2 blocks 39, 49, and optionally 47, 46 for Gen4).
     pcie_notes: dict[tuple[int, int], str] = {}
@@ -563,7 +580,9 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
             "pcie_boot_gen3_dis",
         ):
             if card.current_fields[key] != 0:
-                _apply_field_to_blocks(card.current_blocks, desired_blocks, key, 0)
+                _apply_field_to_blocks(
+                    card.current_blocks, desired_blocks, key, card.current_fields[key], 0
+                )
         pcie_notes[(2, 39)] = "DISABLE_GEN3_SPEED (bit1+bit9)"
         pcie_notes[(2, 49)] = "BOOT_GEN23 + BOOT_GEN3 disable"
         if config.pcie_mode == "gen4":
@@ -587,7 +606,9 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
             "pcie_boot_gen3_dis",
         ):
             if card.current_fields[key] != 1:
-                _apply_field_to_blocks(card.current_blocks, desired_blocks, key, 1)
+                _apply_field_to_blocks(
+                    card.current_blocks, desired_blocks, key, card.current_fields[key], 1
+                )
         pcie_notes[(2, 39)] = "Lock DISABLE_GEN3_SPEED (Gen1/Gen2)"
         pcie_notes[(2, 49)] = "Lock BOOT_GEN23 + BOOT_GEN3 disable"
 

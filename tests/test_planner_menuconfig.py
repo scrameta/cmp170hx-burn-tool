@@ -437,6 +437,37 @@ class TestUnlockAndLockPlanner(unittest.TestCase):
         with self.assertRaisesRegex(BurnError, "absent from this card's FF prefix"):
             derive_ff_records(card, cfg)
 
+    def test_absent_unchanged_trailing_block_c1_b17_allowed_but_modifying_it_refused(self):
+        # Card where GPC2 is defective (0x04), GPC5/6 are factory-disabled (gpc_cur=0x64),
+        # and GPC7 is ALREADY enabled (so c1/b17 holding GPC7 PES bits 272..274 is absent from FF!).
+        state = _synthetic_card_state(gpc_def=0x04, gpc_cur=0x64, tpc_defs={5: 0x02})
+        # Remove c1/b17 from ff_rows and repack contiguously from row 222.
+        raw_nonzero = [
+            w for r, w in sorted(state["ff_rows"].items())
+            if w != 0 and (decode_ff(w).chain, decode_ff(w).block) != (1, 17)
+        ]
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, FF_ROW_MAX + 1)}
+        for idx, w in enumerate(raw_nonzero):
+            ff_rows[FF_ROW_MIN + idx] = w
+        state["ff_rows"] = ff_rows
+        card = snapshot_from_raw_state(**state)
+        self.assertNotIn(17, card.current_blocks.get(1, {}))
+
+        # Unlocking all healthy compute changes GPC5/6 PES bits in c1/b16 only (GPC7 PES stays 0) -> SUCCEEDS!
+        cfg = UnlockConfig.from_card(card)
+        cfg.unlock_all_healthy_compute()
+        items, issues = derive_ff_records(card, cfg)
+        self.assertEqual([i for i in issues if i.severity == "error"], [])
+        self.assertNotIn((1, 17), {(it["chain"], it["block"]) for it in items})
+        plan_dict = build_plan_from_config(card, cfg)
+        self.assertEqual(plan_dict["ceiling"]["base_sm"], 110)
+
+        # Explicitly trying to LOCK GPC7 requires modifying pes_disable bits in absent c1/b17 -> STILL REFUSED!
+        cfg_lock7 = UnlockConfig.from_card(card)
+        cfg_lock7.set_gpc(7, False)
+        with self.assertRaisesRegex(BurnError, r"cannot modify pes_disable.*c1/b17 is absent"):
+            derive_ff_records(card, cfg_lock7)
+
     def test_empty_selection_refused(self):
         cfg = UnlockConfig.from_card(self.card)
         with self.assertRaisesRegex(BurnError, "no fuse changes selected"):
