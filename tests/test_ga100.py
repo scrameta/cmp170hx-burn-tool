@@ -410,6 +410,49 @@ class TestGA100Controller(unittest.TestCase):
                 rec = verify_cold_snapshot(plan, cold, stage="test", journal=j)
             self.assertEqual(rec["status"], "PASS")
 
+    def test_program_row_settles_before_poll_and_zeros_wdata_before_restoring_addr(self):
+        mmio = FakeGA100MMIO(rows={222: encode_ff(1, 5, 0x9867)})
+        mmio.regs[REG_FUSEADDR] = 77  # distinct original FUSEADDR to verify restore order
+        events: list[tuple] = []
+
+        orig_read32 = mmio.read32
+        orig_write32 = mmio.write32
+
+        def traced_read32(offset):
+            val = orig_read32(offset)
+            events.append(("RD", offset, val))
+            return val
+
+        def traced_write32(offset, value, **kwargs):
+            events.append(("WR", offset, value))
+            return orig_write32(offset, value, **kwargs)
+
+        def traced_sleep(secs):
+            events.append(("SLEEP", secs))
+
+        mmio.read32 = traced_read32
+        mmio.write32 = traced_write32
+
+        ctl = GA100FuseController(mmio, read_only=False, sleep=traced_sleep)
+        ctl.sense_ctrl()
+        events.clear()
+
+        word = encode_ff(1, 19, 0x4200)
+        got = ctl.program_row(223, word)
+        self.assertEqual(got, word)
+
+        # 1. Immediately after CMD_PROGRAM, controller must sleep 5 ms BEFORE polling FUSECTRL.
+        prog_idx = events.index(("WR", REG_FUSECTRL, CMD_PROGRAM))
+        self.assertEqual(events[prog_idx + 1], ("SLEEP", 0.005))
+
+        # 2. In _relatch_no_burn, FUSEWDATA=0 must be written strictly BEFORE FUSEADDR is restored.
+        post_writes = [
+            (ev[1], ev[2]) for ev in events[prog_idx + 1 :] if ev[0] == "WR"
+        ]
+        self.assertGreaterEqual(len(post_writes), 2)
+        self.assertEqual(post_writes[0], (REG_FUSEWDATA, 0))
+        self.assertEqual(post_writes[1], (REG_FUSEADDR, 77))
+
 
 if __name__ == "__main__":
     unittest.main()
