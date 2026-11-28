@@ -225,8 +225,11 @@ class TestBurnInterlocks(unittest.TestCase):
             222: encode_ff(1, 7, 0x0123),    # FBPA (no-op target)
             223: encode_ff(1, 19, 0x4290),   # FBP_DISABLE=0x852, ROP_L2[0]=0
         }
+        # No genuinely dead units. (This fixture used FBP_DEFECTIVE=0x840 with all-zero
+        # FBPA/FBIO/ROP_L2 defect pairs and FF slices left enabled for those FBPs, which
+        # the FBP defect cross-check now correctly refuses as an incoherent readout.)
         defect_masks = {
-            field: (0x840 if field == "FBP_DISABLE" else 0)
+            field: 0
             for key, field in FFCALC_KEY_TO_FIELD.items()
             if FUSES_BY_KEY[key].defect_addr is not None
         }

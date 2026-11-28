@@ -30,6 +30,7 @@ from .ffrecord import (
     compute_sm_count,
     decode_a100_devid_ff_word,
     decode_ff,
+    fbp_defect_consistency_issues,
 )
 from .fuses import (
     DEVICE_ID_DENIED_BLOCKS,
@@ -867,6 +868,9 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
                     f"live defect mask {field} differs from or is missing in plan: {value:#010x}"
                 )
             actual[field] = value
+        fbp_issues = fbp_defect_consistency_issues(actual)
+        if fbp_issues:
+            raise BurnError("live memory defect masks are inconsistent: " + "; ".join(fbp_issues))
         tpc = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
         if "GPC_DISABLE" not in actual or any(k not in actual for k in tpc):
             raise BurnError("cannot derive native healthy SM ceiling")

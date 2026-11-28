@@ -18,6 +18,7 @@ from .ffrecord import (
     decode_all_fields,
     encode_a100_devid_ff_words,
     encode_ff,
+    fbp_defect_consistency_issues,
     ff_word_safety_audit,
     fields_in_block,
     replay_ff_rows,
@@ -309,6 +310,15 @@ def snapshot_from_raw_state(
                     f"fused shadow {ff_key}=0x{sh_val:x} disagrees with FF replay 0x{decoded[ff_key]:x}"
                     f"{iff_hint}"
                 )
+
+    fbp_issues = fbp_defect_consistency_issues(defect_masks)
+    if fbp_issues:
+        raise BurnError(
+            "REFUSED: genuine memory defect masks are inconsistent ("
+            + "; ".join(fbp_issues)
+            + "). The four registers should carry one dead-FBP judgement; re-read the card "
+            "and check the register map before planning anything."
+        )
 
     current_masks = {
         vfi_name: decoded[ff_key]
