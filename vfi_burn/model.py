@@ -128,8 +128,10 @@ class Record:
         if not isinstance(r, dict):
             raise BurnError("record must be a JSON object")
         kind = r.get("kind", "regular")
-        if kind not in ("test", "regular", "pcie", "reconfig"):
-            raise BurnError(f"unknown record kind {kind!r}; expected test, regular, pcie, or reconfig")
+        if kind not in ("test", "regular", "pcie", "reconfig", "devid"):
+            raise BurnError(
+                f"unknown record kind {kind!r}; expected test, regular, pcie, reconfig, or devid"
+            )
         defect_sensitive = r.get("defect_sensitive", False)
         if not isinstance(defect_sensitive, bool):
             raise BurnError("defect_sensitive must be a JSON boolean")

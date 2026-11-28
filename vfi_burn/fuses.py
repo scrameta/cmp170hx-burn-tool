@@ -26,9 +26,19 @@ TOTAL_FUSE_ROWS = 512
 DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
 FF_EMPTY_WORD = 0x00000000
 
-# Chain 2 blocks 37 and 38 carry read-only PCIe device-ID fuses (DEVIDA/DEVIDB) and no
-# burnable fields; unconditionally denied in both the engine and low-level fuse controller.
+# Chain 2 blocks 37 and 38 carry PCIe device-ID fuses (DEVIDA/DEVIDB); denied by default
+# unless explicitly validated as an intentional A100 identity conversion (requires A100 VBIOS
+# + 128 GB BAR1 confirmation).
 DEVICE_ID_DENIED_BLOCKS: frozenset[tuple[int, int]] = frozenset({(2, 37), (2, 38)})
+
+# Verified A100 GA100 target PCI Device IDs for intentional DEVIDA (c2/b37) + DEVIDB (c2/b38)
+# conversion (encoded in FF as ``device_id << 1`` with bit 0 == 0).
+A100_TARGET_DEVICE_IDS: dict[int, str] = {
+    0x20F1: "A100 PCIe 40 GB (10de:20f1)",
+    0x20B5: "A100 PCIe 80 GB (10de:20b5)",
+    0x20B0: "A100 SXM4 40 GB (10de:20b0)",
+    0x20B2: "A100 SXM4 80 GB (10de:20b2)",
+}
 
 # Core fuse-controller BAR0 registers (verified across GA100 references).
 REG_PMC_BOOT_0 = 0x00000000

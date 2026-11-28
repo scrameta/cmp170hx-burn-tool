@@ -28,6 +28,7 @@ from .ffrecord import (
     FF_ROW_MAX,
     FF_ROW_MIN,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_ff,
 )
 from .fuses import (
@@ -459,6 +460,7 @@ class GA100FuseController(FuseControllerHAL):
         *,
         timeout_s: float = 10.0,
         pre_trigger_check=None,
+        allow_a100_devid: bool = False,
     ) -> int:
         """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions.
 
@@ -477,10 +479,11 @@ class GA100FuseController(FuseControllerHAL):
                 )
             ff = decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
             if (ff.chain, ff.block) in DEVICE_ID_DENIED_BLOCKS:
-                raise BurnError(
-                    f"REFUSED: FF word 0x{word:08x} targets read-only PCIe device-ID block "
-                    f"(chain {ff.chain} block {ff.block})"
-                )
+                if not (allow_a100_devid and decode_a100_devid_ff_word(word) is not None):
+                    raise BurnError(
+                        f"REFUSED: FF word 0x{word:08x} targets read-only PCIe device-ID block "
+                        f"(chain {ff.chain} block {ff.block})"
+                    )
             if is_poison(word):
                 raise BurnError(
                     f"REFUSED: payload 0x{word:08x} has 0xBADx block data: deliberately not burned "
@@ -772,10 +775,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
-    def write_one_record(self, row: int, word: int) -> None:
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
         if not self.writable:
             raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
-        self.controller.program_row(row, word)
+        self.controller.program_row(row, word, allow_a100_devid=allow_a100_devid)
 
     def capture_cold_snapshot(
         self,

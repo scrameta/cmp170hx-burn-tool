@@ -13,6 +13,7 @@ from .ffrecord import (
     apply_ff_word_to_masks,
     classify_ff_functional_groups,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_ff,
     evaluate_poweroff_sanity,
     ff_word_defect_audit,
@@ -23,6 +24,7 @@ from .ffrecord import (
     verify_noop_test_record,
 )
 from .fuse_rules import poweroff_domains_for_groups
+from .fuses import A100_TARGET_DEVICE_IDS
 from .journal import Journal, deferred_signals
 from .model import (
     BurnError,
@@ -527,7 +529,19 @@ def reconcile(
         old_block = baseline_blocks.get(ff.chain, {}).get(ff.block)
 
     # Unconditional device-ID / burnable=False deny + unknown/unmapped FF safety audit.
-    hard_denials, overridable_ff = ff_word_safety_audit(record.word, old_block)
+    # Explicit kind="devid" records are permitted ONLY when they encode a validated A100
+    # DEVIDA (c2/b37) or DEVIDB (c2/b38) payload (further gated at burn time by BIOS/BAR1 confirm).
+    is_valid_a100_devid = False
+    if record.kind == "devid":
+        if decode_a100_devid_ff_word(record.word) is None:
+            raise BurnError(
+                f"{record.name}: REFUSED; kind='devid' word {hex32(record.word)} is not a "
+                "validated A100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record"
+            )
+        is_valid_a100_devid = True
+    hard_denials, overridable_ff = ff_word_safety_audit(
+        record.word, old_block, allow_a100_devid=is_valid_a100_devid
+    )
     if hard_denials:
         raise BurnError(f"{record.name}: REFUSED; " + "; ".join(hard_denials))
     if enforce_known_ff and overridable_ff and not allow_unmapped_ff:
@@ -682,6 +696,26 @@ def check_plan(
             require_noop_test=has_baseline,
         )
         record_cold.update(r.expected_cold)
+    devid_targets: dict[str, set[int]] = {}
+    for r in plan.records:
+        if r.kind == "devid":
+            info = decode_a100_devid_ff_word(r.word)
+            if info is not None:
+                which, devid = info
+                devid_targets.setdefault(which, set()).add(devid)
+    if devid_targets:
+        if set(devid_targets) != {"DEVIDA", "DEVIDB"}:
+            raise BurnError(
+                "REFUSED: A100 PCIe Device ID plan must burn BOTH DEVIDA (c2/b37) and "
+                "DEVIDB (c2/b38) together to prevent a split half-identity"
+            )
+        all_ids = devid_targets["DEVIDA"] | devid_targets["DEVIDB"]
+        if len(all_ids) != 1:
+            raise BurnError(
+                "REFUSED: A100 PCIe Device ID plan has conflicting DEVIDA/DEVIDB targets ("
+                + ", ".join(f"0x{d:04x}" for d in sorted(all_ids))
+                + ")"
+            )
     if plan.final_expected_cold:
         for field, value in record_cold.items():
             if field in plan.final_expected_cold and plan.final_expected_cold[field] != value:
@@ -959,7 +993,13 @@ def _write_verify_or_halt(
     health: Health | None = None
     host_after: Host | None = None
     try:
-        writer.write_one_record(pointer, record.word)
+        if record.kind == "devid":
+            try:
+                writer.write_one_record(pointer, record.word, allow_a100_devid=True)
+            except TypeError:
+                writer.write_one_record(pointer, record.word)
+        else:
+            writer.write_one_record(pointer, record.word)
     except PreTriggerRefusal as exc:
         # The writer guarantees CMD_PROGRAM was never issued: nothing can have burned.
         journal.append(
@@ -1656,6 +1696,47 @@ def process_records(
                     f"current LnkCap2 ({hex32(observed_link)}) does not match reviewed "
                     f"before state ({hex32(record.link_cap2_before)})"
                 )
+
+        if record.kind == "devid":
+            devid_info = decode_a100_devid_ff_word(record.word)
+            if devid_info is None:
+                raise BurnError(
+                    f"{record.name}: REFUSED; invalid A100 DEVID record word {hex32(record.word)}"
+                )
+            which_dev, target_dev = devid_info
+            dev_desc = A100_TARGET_DEVICE_IDS[target_dev]
+            token = f"CONFIRM A100 DEVID 0x{target_dev:04X}"
+            show("\n" + "!" * 76)
+            show(f"!!! CRITICAL WARNING — PERMANENT A100 PCIe DEVICE ID CONVERSION ({which_dev})")
+            show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
+            show("!!!")
+            show("!!! 1. VBIOS REQUIRED AFTER COLD BOOT:")
+            show("!!!    Once fused, this card WILL NOT POST on its stock CMP 170HX VBIOS.")
+            show("!!!    Back up your stock CMP ROM (nvflash --save) BEFORE burning, and")
+            show("!!!    flash the matching A100 VBIOS immediately after cold power cycle.")
+            show("!!!")
+            show("!!! 2. 128 GB 64-BIT BAR1 MMIO WINDOW REQUIRED:")
+            show("!!!    Motherboard BIOS MUST have Above 4G Decoding ON, CSM OFF,")
+            show("!!!    Re-Size BAR ON, and MMIO High Size >= 128 GB. If POST fails,")
+            show("!!!    there is NO in-band recovery — you will need a CH341A SPI clip.")
+            show("!!!" )
+            show("!!! 3. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
+            show("!" * 76)
+            if not _confirm_token(
+                confirm,
+                f"Type '{token}' to confirm A100 VBIOS + 128 GB BAR1 readiness: ",
+                token,
+            ):
+                journal.append(event="declined", row=pointer, record=record.name, reason=token)
+                if written_records:
+                    _run_poweroff_sanity(
+                        plan, verified_rows, journal, show,
+                        committed_records=already_committed + written_records,
+                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
+                        baseline_blocks=sanity_baseline,
+                        reason="operator_declined",
+                    )
+                raise BurnError("A100 Device ID conversion not confirmed")
 
         if rec_touches_pcie or record.kind == "reconfig":
             review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()

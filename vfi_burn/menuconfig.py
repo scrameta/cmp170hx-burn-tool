@@ -11,8 +11,8 @@ import sys
 from typing import Callable
 
 from .ffrecord import encode_ff
-from .fuses import SM_PER_TPC, TOTAL_FBP, TOTAL_GPC, TPC_PER_GPC
-from .model import BurnError
+from .fuses import A100_TARGET_DEVICE_IDS, SM_PER_TPC, TOTAL_FBP, TOTAL_GPC, TPC_PER_GPC
+from .model import BurnError, SKU_CMP170HX_10GB, SKU_CMP170HX_8GB
 from .planner import CardSnapshot, UnlockConfig, derive_ff_records
 
 try:
@@ -37,6 +37,18 @@ def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str
         f"Config: {config.summary_line()}",
         "",
     ]
+    if config.a100_devid is not None:
+        lines.extend(
+            [
+                "!!! WARNING — A100 PCIe DEVICE ID CONVERSION SELECTED !!!",
+                f"!!! Target: {card.pci_id} -> 10de:{config.a100_devid:04x} ({A100_TARGET_DEVICE_IDS[config.a100_devid]})",
+                "!!! - Card WILL NOT POST on stock CMP 170HX VBIOS after cold boot; back up CMP ROM",
+                "!!!   (nvflash --save) BEFORE burning and flash matching A100 VBIOS right after.",
+                "!!! - Host BIOS MUST support 128 GB 64-bit BAR1 (Above 4G, CSM OFF, ReBAR ON);",
+                "!!!   POST failure requires offline CH341A SPI recovery.",
+                "",
+            ]
+        )
     try:
         items, issues = derive_ff_records(card, config)
     except BurnError as exc:
@@ -59,9 +71,10 @@ def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str
         row = card.next_free_row + idx
         note = f"  [{it['note']}]" if it.get("note") else ""
         fields_s = ",".join(it["fields"]) or "raw"
+        old_s = f"0x{it['old']:04X}" if it.get("old") is not None else "FPF   "
         lines.append(
             f"  row {row:3d}: 0x{it['word']:08X}  c{it['chain']}/b{it['block']:<2d} "
-            f"0x{it['old']:04X}->0x{it['new']:04X}  ({fields_s}){note}"
+            f"{old_s}->0x{it['new']:04X}  ({fields_s}){note}"
         )
     if issues:
         lines.append("")
@@ -170,6 +183,54 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 on_toggle=_toggle_nvlink,
                 on_enter=_toggle_nvlink,
                 locked=card.nvlink_all_defective(),
+            ),
+            _MenuEntry(
+                label=f"    PCIe Device ID (A100 Identity): {config.target_devid_label()}  --->",
+                help_text=(
+                    "WARNING: Converts fused DEVIDA (c2/b37) + DEVIDB (c2/b38) to an A100 Device ID "
+                    "(20F1/20B5/20B0/20B2). Requires flashing matching A100 VBIOS after cold boot "
+                    "AND host 128 GB BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)."
+                ),
+                submenu="devid",
+            ),
+            _MenuEntry(
+                label=(
+                    (
+                        f"[X] [EXPERIMENTAL] MIG / SYS_PIPE (already max healthy: "
+                        f"{card.current_sys_pipe_count()}/{card.max_healthy_sys_pipe_count()} pipes)"
+                    )
+                    if card.sys_pipe_unlockable_mask() == 0
+                    else (
+                        f"[{'*' if config.sys_pipe_unlock else ' '}] [EXPERIMENTAL] Unlock MIG / SYS_PIPE "
+                        f"({card.current_sys_pipe_count()}->{card.max_healthy_sys_pipe_count()}/8 pipes, c1/b23)"
+                    )
+                ),
+                help_text=(
+                    "EXPERIMENTAL: Clears non-defective bits of OPT_SYS_PIPE_DISABLE (c1/b23) "
+                    "which controls the 8 GA100 hardware compute/MIG pipes (SYS_PIPE0..7). "
+                    "Never clears genuinely defective bits in OPT_SYS_PIPE_DEFECTIVE."
+                ),
+                on_toggle=(
+                    (lambda: "All non-defective SYS_PIPE units are already enabled on this card.")
+                    if card.sys_pipe_unlockable_mask() == 0
+                    else (
+                        lambda: (
+                            config.set_sys_pipe_unlock(not config.sys_pipe_unlock),
+                            f"MIG / SYS_PIPE unlock set to {'ON' if config.sys_pipe_unlock else 'OFF'}.",
+                        )[1]
+                    )
+                ),
+                on_enter=(
+                    (lambda: "All non-defective SYS_PIPE units are already enabled on this card.")
+                    if card.sys_pipe_unlockable_mask() == 0
+                    else (
+                        lambda: (
+                            config.set_sys_pipe_unlock(not config.sys_pipe_unlock),
+                            f"MIG / SYS_PIPE unlock set to {'ON' if config.sys_pipe_unlock else 'OFF'}.",
+                        )[1]
+                    )
+                ),
+                locked=(card.sys_pipe_unlockable_mask() == 0),
             ),
             _MenuEntry(
                 label=f"    Preview Exact FF Records ({ff_summary})  --->",
@@ -361,6 +422,63 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 )
             )
         return "PCIe Link Speed (radio selection)", entries
+
+    if screen == "devid":
+        dev_warning = (
+            "WARNING: Requires matching A100 VBIOS flash after cold boot (stock CMP ROM will NOT POST) "
+            "AND host BIOS 128 GB BAR1 support (Above 4G ON, CSM OFF, ReBAR ON; else CH341A SPI recovery)."
+        )
+        rec_10g = "  [matches 10 GB / 40 GB HBM2e card]" if card.pci_id == SKU_CMP170HX_10GB else ""
+        rec_8g = "  [matches 8 GB / 80 GB HBM2e card]" if card.pci_id == SKU_CMP170HX_8GB else ""
+        choices: list[tuple[int | None, str, str]] = [
+            (
+                None,
+                f"Keep current PCIe Device ID ({card.pci_id}) — no VBIOS change",
+                "Leave DEVIDA (c2/b37) and DEVIDB (c2/b38) untouched; keeps stock CMP 170HX VBIOS compatibility.",
+            ),
+            (
+                0x20F1,
+                f"A100 PCIe 40 GB  (10de:20f1) — DEVIDA+DEVIDB (2 FF rows){rec_10g}",
+                dev_warning,
+            ),
+            (
+                0x20B5,
+                f"A100 PCIe 80 GB  (10de:20b5) — DEVIDA+DEVIDB (2 FF rows){rec_8g}",
+                dev_warning,
+            ),
+            (
+                0x20B0,
+                "A100 SXM4 40 GB  (10de:20b0) — DEVIDA+DEVIDB (2 FF rows)",
+                dev_warning,
+            ),
+            (
+                0x20B2,
+                "A100 SXM4 80 GB  (10de:20b2) — DEVIDA+DEVIDB (2 FF rows)",
+                dev_warning,
+            ),
+        ]
+        entries = []
+        for target_id, lbl, hlp in choices:
+            sel = "*" if config.a100_devid == target_id else " "
+
+            def _pick(tid: int | None = target_id) -> str:
+                config.set_a100_devid(tid)
+                if tid is None:
+                    return f"PCIe Device ID reset to keep ({card.pci_id})."
+                return (
+                    f"WARNING: Device ID set to 10de:{tid:04x} ({A100_TARGET_DEVICE_IDS[tid]}). "
+                    "Needs A100 VBIOS after cold boot + 128 GB BAR1!"
+                )
+
+            entries.append(
+                _MenuEntry(
+                    label=f"({sel}) {lbl}",
+                    help_text=hlp,
+                    on_toggle=_pick,
+                    on_enter=_pick,
+                )
+            )
+        return "PCIe Device ID — A100 Identity (WARNING: requires A100 VBIOS + 128 GB BAR1)", entries
 
     if screen == "preview":
         preview_lines = _compute_preview_lines(card, config)

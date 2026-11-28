@@ -32,6 +32,7 @@ from .ffrecord import (
     analyze_ff_block,
     classify_ff_functional_groups,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_all_fields,
     decode_ff,
     decode_present_fields,
@@ -39,6 +40,7 @@ from .ffrecord import (
 )
 from .fuse_rules import evaluate_fuse_combinations
 from .fuses import (
+    A100_TARGET_DEVICE_IDS,
     EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
     EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
     EXPERIMENTAL_INSPECT_REGS,
@@ -506,8 +508,17 @@ def format_plan_review(
             sim_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
         record_analyses.append((idx, rec, analysis, None))
 
-        for w in analysis["warnings"]:
-            audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
+        devid_info = decode_a100_devid_ff_word(rec.word) if rec.kind == "devid" else None
+        if devid_info is not None:
+            which_dev, target_dev = devid_info
+            audit_warnings.append(
+                f"[{row_label} / {rec.name}] A100 IDENTITY CONVERSION ({which_dev} -> 0x{target_dev:04x} "
+                f"{A100_TARGET_DEVICE_IDS[target_dev]}): requires matching A100 VBIOS flash after cold boot "
+                "AND motherboard 128 GB 64-bit BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)"
+            )
+        else:
+            for w in analysis["warnings"]:
+                audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
         if rec.kind == "reconfig" and not plan.reconfig_semantics_verified:
             audit_warnings.append(
                 f"[{row_label} / {rec.name}] RECONFIG record semantics are NOT marked verified in plan"
@@ -637,9 +648,20 @@ def format_plan_review(
                     f"  {tag} {key.upper():16} : {hex32(bv)} -> {hex32(av)} | {'; '.join(parts)}{caution}"
                 )
 
-    # 4d. Declared PCIe LnkCap2 / Reconfig / No-op Test summaries
+    # 4d. Declared PCIe LnkCap2 / A100 Device ID / Reconfig / No-op Test summaries
+    seen_devids: set[int] = set()
     for idx, rec, analysis, _ in record_analyses:
-        if rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
+        if rec.kind == "devid":
+            devid_info = decode_a100_devid_ff_word(rec.word)
+            if devid_info is not None:
+                _which, target_dev = devid_info
+                if target_dev not in seen_devids:
+                    seen_devids.add(target_dev)
+                    outcome_lines.append(
+                        f"  [!] PCIe Device ID   : {plan.pci_id} -> 10de:{target_dev:04x} "
+                        f"({A100_TARGET_DEVICE_IDS[target_dev]}; DEVIDA+DEVIDB — REQUIRES A100 VBIOS + 128 GB BAR1)"
+                    )
+        elif rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
             outcome_lines.append(
                 f"  [+] PCIe Link Cap2   : {hex32(rec.link_cap2_before)} -> {hex32(rec.link_cap2_after)} ({rec.decode})"
             )

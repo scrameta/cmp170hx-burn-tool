@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from .fuse_rules import evaluate_fuse_combinations, poweroff_domain_for_group
 from .fuses import (
+    A100_TARGET_DEVICE_IDS,
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FFCALC_KEY_TO_FIELD,
@@ -365,16 +366,54 @@ def compute_sm_count(gpc_disable: int, tpc_disables: list[int]) -> int:
     return total
 
 
+def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
+    """If ``word`` is a validated A100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record,
+    return ``(which, devid)`` (e.g. ``("DEVIDA", 0x20F1)``); otherwise return ``None``.
+
+    Enforces:
+      - Valid non-IFF FF record targeting ``(2, 37)`` (DEVIDA) or ``(2, 38)`` (DEVIDB)
+      - Bit 0 of block data is 0 (preserves chain2 bit 592 / ``DEVIDA[15]=0``)
+      - ``data >> 1`` is in ``A100_TARGET_DEVICE_IDS`` (``0x20F1``, ``0x20B5``, ``0x20B0``, ``0x20B2``)
+    """
+    try:
+        rec = decode_ff(word)
+    except BurnError:
+        return None
+    if rec.chain != 2 or rec.block not in (37, 38):
+        return None
+    if (rec.data & 1) != 0:
+        return None
+    devid = rec.data >> 1
+    if devid not in A100_TARGET_DEVICE_IDS:
+        return None
+    return ("DEVIDA" if rec.block == 37 else "DEVIDB", devid)
+
+
+def encode_a100_devid_ff_words(target_devid: int) -> tuple[int, int]:
+    """Encode paired ``(devida_word, devidb_word)`` FF records for a supported A100 Device ID."""
+    if target_devid not in A100_TARGET_DEVICE_IDS:
+        supported = ", ".join(f"0x{d:04x}" for d in sorted(A100_TARGET_DEVICE_IDS))
+        raise BurnError(
+            f"unsupported A100 target device ID 0x{target_devid:04x}; supported: {supported}"
+        )
+    block_data = (target_devid << 1) & 0xFFFF
+    return encode_ff(2, 37, block_data), encode_ff(2, 38, block_data)
+
+
 def ff_word_safety_audit(
     word: int,
     old_block: int | None = None,
+    *,
+    allow_a100_devid: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Audit one 32-bit FF word for hard-denied and overridable safety violations.
 
     Returns ``(hard_denials, overridable_issues)``:
-      - ``hard_denials`` are NEVER overridable (device-ID blocks c2/b37-38, any changed
-        ``burnable=False`` bit, or overlap with a ``burnable=False`` field when ``old_block``
-        is unknown so preservation of e.g. ``pcie_devidb[15]`` in c2/b39 cannot be proved).
+      - ``hard_denials`` are NEVER overridable (device-ID blocks c2/b37-38 unless
+        ``allow_a100_devid=True`` AND ``word`` is a validated A100 DEVIDA/DEVIDB record;
+        any changed ``burnable=False`` bit; or overlap with a ``burnable=False`` field
+        when ``old_block`` is unknown so preservation of e.g. ``pcie_devidb[15]`` in
+        c2/b39 cannot be proved).
       - ``overridable_issues`` are refused by default and require explicit
         ``--override-unmapped-ff`` + operator approval (unknown FF blocks, changed unmapped
         bits, unmapped bits with unknown baseline, or ``opt_in`` fields such as full ``magic_d``).
@@ -384,6 +423,8 @@ def ff_word_safety_audit(
     overridable: list[str] = []
 
     if (rec.chain, rec.block) in DEVICE_ID_DENIED_BLOCKS:
+        if allow_a100_devid and decode_a100_devid_ff_word(word) is not None:
+            return hard_denials, overridable
         hard_denials.append(
             f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} targets unconditionally denied "
             "read-only PCIe device-ID block (chain 2 blocks 37/38)"
@@ -850,7 +891,11 @@ def build_vfi_plan_from_records(
                     f"{src_label} row {row}: planned old=0x{expected_old:04x} != "
                     f"replayed current block 0x{replay_old:04x}"
                 )
-        hard_denials, overridable_issues = ff_word_safety_audit(word, replay_old)
+        devid_info = decode_a100_devid_ff_word(word)
+        is_devid = (item.get("kind") == "devid") and (devid_info is not None)
+        hard_denials, overridable_issues = ff_word_safety_audit(
+            word, replay_old, allow_a100_devid=is_devid
+        )
         if hard_denials:
             raise BurnError(f"{src_label} row {row}: REFUSED; " + "; ".join(hard_denials))
         non_optin_issues = [msg for msg in overridable_issues if "opt-in field" not in msg]
@@ -863,10 +908,13 @@ def build_vfi_plan_from_records(
         fields = list(item.get("fields") or [])
         if not fields:
             fields = list(sim["changes"].keys()) or [f.key for f in fields_in_block(chain, block)]
-        is_pcie = ff_word_touches_pcie(word, replay_old) or any(
-            FIELD_FUNCTIONAL_GROUP.get(k, FIELDS_BY_KEY[k].category) == "pcie"
-            for k in fields
-            if k in FIELDS_BY_KEY
+        is_pcie = (not is_devid) and (
+            ff_word_touches_pcie(word, replay_old)
+            or any(
+                FIELD_FUNCTIONAL_GROUP.get(k, FIELDS_BY_KEY[k].category) == "pcie"
+                for k in fields
+                if k in FIELDS_BY_KEY
+            )
         )
 
         changed_masks = [
@@ -887,19 +935,33 @@ def build_vfi_plan_from_records(
 
         if idx == 0 and first_record_as_test:
             kind = "test"
+        elif is_devid:
+            kind = "devid"
         elif is_pcie:
             kind = "pcie"
         else:
             kind = "regular"
 
-        primary_field = fields[0] if fields else f"chain{chain}_blk{block}"
-        target_name = FFCALC_KEY_TO_FIELD.get(primary_field, primary_field.upper())
-        note = item.get("note")
-        note_suffix = f" ({note})" if note else ""
-        decode_desc = (
-            f"FF chain={chain} blk={block} 0x{sim['old_block']:04x}->0x{sim['new_block']:04x} "
-            f"fields={','.join(fields) or 'raw'}{note_suffix}"
-        )
+        if is_devid and devid_info is not None:
+            which_dev, target_dev = devid_info
+            target_name = f"PCIE_{which_dev}"
+            note = item.get("note") or (
+                f"{A100_TARGET_DEVICE_IDS[target_dev]} — requires matching A100 VBIOS + 128 GB BAR1"
+            )
+            old_tag = f"0x{replay_old:04x}->" if replay_old is not None else "FPF->"
+            decode_desc = (
+                f"FF chain={chain} blk={block} {old_tag}0x{sim['new_block']:04x} "
+                f"({which_dev}=0x{target_dev:04x}; {note})"
+            )
+        else:
+            primary_field = fields[0] if fields else f"chain{chain}_blk{block}"
+            target_name = FFCALC_KEY_TO_FIELD.get(primary_field, primary_field.upper())
+            note = item.get("note")
+            note_suffix = f" ({note})" if note else ""
+            decode_desc = (
+                f"FF chain={chain} blk={block} 0x{sim['old_block']:04x}->0x{sim['new_block']:04x} "
+                f"fields={','.join(fields) or 'raw'}{note_suffix}"
+            )
 
         rec_dict: dict = {
             "name": f"ROW_{row}_{target_name}",

@@ -178,6 +178,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="non-interactive: enable (--nvlink) or lock (--no-nvlink) NVLink",
     )
     cfg_p.add_argument(
+        "--a100-devid",
+        choices=("20f1", "20b5", "20b0", "20b2"),
+        default=None,
+        help=(
+            "non-interactive: convert PCIe Device ID (DEVIDA+DEVIDB) to A100 "
+            "(20f1=PCIe 40GB, 20b5=PCIe 80GB, 20b0=SXM4 40GB, 20b2=SXM4 80GB; requires A100 VBIOS + 128 GB BAR1)"
+        ),
+    )
+    cfg_p.add_argument(
+        "--enable-mig-sys-pipe",
+        action="store_true",
+        help="non-interactive: [EXPERIMENTAL] clear non-defective OPT_SYS_PIPE_DISABLE bits (c1/b23) for MIG",
+    )
+    cfg_p.add_argument(
         "--no-curses",
         action="store_true",
         help="use plain-text numbered menuconfig instead of full-screen curses TUI",
@@ -363,6 +377,8 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             unlock_sm_hbm=bool(args.sm_hbm),
             pcie_mode=args.pcie,
             nvlink=args.nvlink,
+            a100_devid=int(args.a100_devid, 16) if args.a100_devid else None,
+            enable_mig_sys_pipe=bool(args.enable_mig_sys_pipe),
             use_curses=False if args.no_curses else None,
             io=io,
         )

@@ -16,6 +16,7 @@ from .ffrecord import (
     build_vfi_plan_from_records,
     compute_sm_count,
     decode_all_fields,
+    encode_a100_devid_ff_words,
     encode_ff,
     ff_word_safety_audit,
     fields_in_block,
@@ -23,6 +24,7 @@ from .ffrecord import (
 )
 from .fuse_rules import CombinationIssue, evaluate_fuse_combinations
 from .fuses import (
+    A100_TARGET_DEVICE_IDS,
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FFCALC_KEY_TO_FIELD,
@@ -49,7 +51,7 @@ _PCIE_GEN4_B46_CLEAR = 0x2000
 
 @dataclass(frozen=True)
 class CardSnapshot:
-    """Verified read-only snapshot of a CMP 170HX 8 GB card used to derive unlock plans."""
+    """Verified read-only snapshot of a CMP 170HX (8 GB / 10 GB) card used to derive unlock plans."""
 
     pci_id: str
     die_rows: dict[int, int]
@@ -83,6 +85,21 @@ class CardSnapshot:
 
     def nvlink_all_defective(self) -> bool:
         return (self.defect_masks.get("NVLINK_DISABLE", 0) & 0x7) == 0x7
+
+    def sys_pipe_defective_mask(self) -> int:
+        return self.defect_masks.get("SYS_PIPE_DISABLE", 0) & 0xFF
+
+    def sys_pipe_current_disable(self) -> int:
+        return self.current_fields["sys_pipe_disable"] & 0xFF
+
+    def sys_pipe_unlockable_mask(self) -> int:
+        return self.sys_pipe_current_disable() & ~self.sys_pipe_defective_mask() & 0xFF
+
+    def current_sys_pipe_count(self) -> int:
+        return 8 - bin(self.sys_pipe_current_disable()).count("1")
+
+    def max_healthy_sys_pipe_count(self) -> int:
+        return 8 - bin(self.sys_pipe_defective_mask()).count("1")
 
     def gpc_currently_enabled(self, gpc: int) -> bool:
         return not bool((self.current_fields["gpc_disable"] >> gpc) & 1)
@@ -261,6 +278,8 @@ class UnlockConfig:
     fbp_enabled: list[bool] = field(default_factory=list)
     pcie_mode: str = "keep"  # "keep" | "gen3" | "gen4" | "lock_gen12"
     nvlink_enabled: bool = False
+    a100_devid: int | None = None  # None = keep current, or key in A100_TARGET_DEVICE_IDS
+    sys_pipe_unlock: bool = False  # EXPERIMENTAL: clear non-defective SYS_PIPE_DISABLE bits (MIG)
 
     def __post_init__(self) -> None:
         if not self.gpc_enabled:
@@ -285,6 +304,8 @@ class UnlockConfig:
         self.reset_memory()
         self.pcie_mode = "keep"
         self.nvlink_enabled = self.card.nvlink_currently_enabled()
+        self.a100_devid = None
+        self.sys_pipe_unlock = False
 
     # ------------------------------------------------------------------ Compute mutators
     def set_gpc(self, gpc: int, enabled: bool) -> None:
@@ -364,7 +385,7 @@ class UnlockConfig:
     def is_all_healthy_sm_hbm_unlocked(self) -> bool:
         return self.is_all_healthy_compute_unlocked() and self.is_all_healthy_memory_unlocked()
 
-    # ------------------------------------------------------------------ PCIe / NVLink
+    # ------------------------------------------------------------------ PCIe / NVLink / A100 Identity / MIG
     def set_pcie_mode(self, mode: str) -> None:
         m = mode.strip().lower()
         if m not in PCIE_MODES:
@@ -375,6 +396,21 @@ class UnlockConfig:
         if enabled and self.card.nvlink_all_defective():
             raise BurnError("all NVLink links are genuinely defective in OPT_NVLINK_DEFECTIVE — cannot enable")
         self.nvlink_enabled = bool(enabled)
+
+    def set_a100_devid(self, target_devid: int | None) -> None:
+        if target_devid is not None and target_devid not in A100_TARGET_DEVICE_IDS:
+            supported = ", ".join(f"0x{d:04x}" for d in sorted(A100_TARGET_DEVICE_IDS))
+            raise BurnError(
+                f"unsupported A100 target Device ID 0x{target_devid:04x}; supported: {supported}"
+            )
+        self.a100_devid = target_devid
+
+    def set_sys_pipe_unlock(self, enabled: bool) -> None:
+        if enabled and self.card.sys_pipe_unlockable_mask() == 0:
+            raise BurnError(
+                "all non-defective SYS_PIPE units are already enabled on this card"
+            )
+        self.sys_pipe_unlock = bool(enabled)
 
     # ------------------------------------------------------------------ Target masks & readouts
     def target_sm_count(self) -> int:
@@ -409,6 +445,11 @@ class UnlockConfig:
         if self.pcie_mode == "gen4":
             return "Gen4"
         return "Lock Gen1/Gen2"
+
+    def target_devid_label(self) -> str:
+        if self.a100_devid is None:
+            return f"keep ({self.card.pci_id})"
+        return f"10de:{self.a100_devid:04x} ({A100_TARGET_DEVICE_IDS[self.a100_devid]})"
 
     def desired_floorsweep_masks(self) -> dict[str, int]:
         """Compute coherent target disable masks for all floorsweep fields."""
@@ -478,6 +519,12 @@ class UnlockConfig:
         else:
             out["nvlink_disable"] = c.current_fields["nvlink_disable"] & 0x7
 
+        # 4. MIG / SYS_PIPE (8 bits in c1/b23, experimental; never lock active pipes)
+        if self.sys_pipe_unlock:
+            out["sys_pipe_disable"] = c.sys_pipe_defective_mask()
+        else:
+            out["sys_pipe_disable"] = c.sys_pipe_current_disable()
+
         return out
 
     def summary_line(self) -> str:
@@ -489,11 +536,17 @@ class UnlockConfig:
         cur_fbp = self.card.current_fbp_count()
         tgt_fbp = self.target_fbp_count()
         nvl = "ON" if self.nvlink_enabled else "OFF"
-        return (
-            f"SMs: {cur_sm}->{tgt_sm} ({delta_s}, healthy max {max_sm}) | "
-            f"FBPs: {cur_fbp}->{tgt_fbp}/{TOTAL_FBP} | "
-            f"PCIe: {self.target_pcie_label()} | NVLink: {nvl}"
-        )
+        parts = [
+            f"SMs: {cur_sm}->{tgt_sm} ({delta_s}, healthy max {max_sm})",
+            f"FBPs: {cur_fbp}->{tgt_fbp}/{TOTAL_FBP}",
+            f"PCIe: {self.target_pcie_label()}",
+            f"NVLink: {nvl}",
+        ]
+        if self.a100_devid is not None:
+            parts.append(f"DevID: 0x{self.a100_devid:04x} [A100 VBIOS+BAR1!]")
+        if self.sys_pipe_unlock:
+            parts.append(f"MIG/SYS_PIPE: {self.card.current_sys_pipe_count()}->{self.card.max_healthy_sys_pipe_count()}/8")
+        return " | ".join(parts)
 
 
 def _apply_field_to_blocks(
@@ -553,7 +606,7 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
         "fbp_disable",
         "rop_l2_disable",
     )
-    for key in (*sm_hbm_keys, "nvlink_disable"):
+    for key in (*sm_hbm_keys, "nvlink_disable", "sys_pipe_disable"):
         if desired_masks[key] != card.current_fields[key]:
             _apply_field_to_blocks(
                 card.current_blocks,
@@ -659,6 +712,38 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
                 "source_label": f"derived[{idx}]",
             }
         )
+
+    # 4. Optional A100 PCIe Device ID conversion (paired DEVIDA c2/b37 + DEVIDB c2/b38).
+    #    Encoded as ``target_devid << 1`` (bit 0 = 0). Always emitted as an atomic pair.
+    if config.a100_devid is not None:
+        target_dev = config.a100_devid
+        devida_word, devidb_word = encode_a100_devid_ff_words(target_dev)
+        block_data = (target_dev << 1) & 0xFFFF
+        dev_desc = A100_TARGET_DEVICE_IDS[target_dev]
+        for blk, word, which_field, which_label in (
+            (37, devida_word, "pcie_devida", "DEVIDA"),
+            (38, devidb_word, "pcie_devidb", "DEVIDB"),
+        ):
+            old_val = card.current_blocks.get(2, {}).get(blk)
+            hard, over = ff_word_safety_audit(word, old_val, allow_a100_devid=True)
+            if hard or over:
+                raise BurnError(f"c2/b{blk}: REFUSED; " + "; ".join(hard + over))
+            next_idx = len(items)
+            items.append(
+                {
+                    "row": card.next_free_row + 1 + next_idx,
+                    "chain": 2,
+                    "block": blk,
+                    "old": old_val,
+                    "new": block_data,
+                    "word": word,
+                    "kind": "devid",
+                    "fields": [which_field],
+                    "note": f"{dev_desc} ({which_label}) — REQUIRES A100 VBIOS + 128 GB BAR1",
+                    "source_label": f"derived_devid[{which_label}]",
+                }
+            )
+            desired_blocks.setdefault(2, {})[blk] = block_data
 
     final_decoded = decode_all_fields(desired_blocks)
     coherence_issues = evaluate_fuse_combinations(final_decoded)

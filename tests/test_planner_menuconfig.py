@@ -695,6 +695,180 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         self.assertEqual(menu._default_plan_path_for_card(card_10gb), "private/plan_2082.json")
         self.assertEqual(menu._default_plan_path_for_card(card_8gb), str(plan_8gb_path))
 
+    def test_a100_devid_codec_validation_menuconfig_and_simulated_burn(self):
+        from vfi_burn.console import format_plan_review
+        from vfi_burn.engine import Overrides, check_plan, process_records
+        from vfi_burn.ffrecord import (
+            decode_a100_devid_ff_word,
+            encode_a100_devid_ff_words,
+            ff_word_safety_audit,
+        )
+        from vfi_burn.journal import Journal
+
+        # 1. Exact bit encoding for all 4 A100 target IDs (device_id << 1, bit 0 == 0)
+        expected_words = {
+            0x20F1: (0x41E20942, 0x41E20982),
+            0x20B5: (0x416A0942, 0x416A0982),
+            0x20B0: (0x41600942, 0x41600982),
+            0x20B2: (0x41640942, 0x41640982),
+        }
+        for devid, (exp_a, exp_b) in expected_words.items():
+            wa, wb = encode_a100_devid_ff_words(devid)
+            self.assertEqual((wa, wb), (exp_a, exp_b))
+            self.assertEqual(decode_a100_devid_ff_word(wa), ("DEVIDA", devid))
+            self.assertEqual(decode_a100_devid_ff_word(wb), ("DEVIDB", devid))
+            # Default audit (allow_a100_devid=False) MUST still hard-deny c2/b37-38
+            hard, _ = ff_word_safety_audit(wa)
+            self.assertTrue(hard)
+            hard_ok, over_ok = ff_word_safety_audit(wa, allow_a100_devid=True)
+            self.assertEqual((hard_ok, over_ok), ([], []))
+
+        # Reject invalid IDs or corrupted bit 0
+        self.assertIsNone(decode_a100_devid_ff_word(encode_ff(2, 37, (0x20B5 << 1) | 1)))
+        self.assertIsNone(decode_a100_devid_ff_word(encode_ff(2, 37, 0x1234 << 1)))
+
+        # 2. Interactive menuconfig flow: open PCIe Device ID submenu [6], pick 0x20F1 [2],
+        #    go back [b], open Preview [8] (must handle old=None FPF cleanly), back [b], save [s]
+        card = capture_card_snapshot(self.cold_adapter)
+        inputs = iter(["6", "2", "b", "8", "b", "s"])
+        shown: list[str] = []
+        cfg = run_menuconfig(
+            card,
+            use_curses=False,
+            input_fn=lambda _p="": next(inputs),
+            show=shown.append,
+        )
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.a100_devid, 0x20F1)
+        menu_out = "\n".join(shown)
+        self.assertIn("WARNING — A100 PCIe DEVICE ID CONVERSION SELECTED", menu_out)
+        self.assertIn("0x41E20942", menu_out)
+        self.assertIn("0x41E20982", menu_out)
+        self.assertIn("FPF   ->0x41E2", menu_out)
+
+        # 3. Build plan, validate, and verify format_plan_review output
+        plan_path = self.work / "plan_a100_20f1.json"
+        plan_dict = build_plan_from_config(card, cfg)
+        write_private_json(plan_path, plan_dict)
+        plan = Plan.load(plan_path)
+        check_plan(plan)
+        self.assertEqual([r.kind for r in plan.records], ["test", "devid", "devid"])
+        self.assertEqual([r.word for r in plan.records[1:]], [0x41E20942, 0x41E20982])
+
+        review_txt = "\n".join(format_plan_review(plan, reader=self.cold_adapter))
+        self.assertIn("10de:20f1", review_txt)
+        self.assertIn("REQUIRES A100 VBIOS + 128 GB BAR1", review_txt)
+
+        # 4. Split half-identity (DEVIDA without DEVIDB) MUST be refused by check_plan
+        half_dict = json.loads(plan_path.read_text(encoding="utf-8"))
+        half_dict["records"] = half_dict["records"][:2]
+        half_path = self.work / "plan_half_devid.json"
+        write_private_json(half_path, half_dict)
+        with self.assertRaisesRegex(BurnError, "BOTH DEVIDA"):
+            check_plan(Plan.load(half_path))
+
+        # 5. Conflicting DEVIDA != DEVIDB MUST be refused by check_plan
+        conflict_dict = json.loads(plan_path.read_text(encoding="utf-8"))
+        conflict_dict["records"][2]["word"] = "0x416a0982"  # 0x20B5 vs 0x20F1
+        conflict_path = self.work / "plan_conflict_devid.json"
+        write_private_json(conflict_path, conflict_dict)
+        with self.assertRaisesRegex(BurnError, "conflicting DEVIDA/DEVIDB"):
+            check_plan(Plan.load(conflict_path))
+
+        # 6. Raw HAL program_row without allow_a100_devid=True MUST still refuse valid A100 DEVID
+        gold_ad = _build_sim_adapter(self.state, goldilocks=True)
+        gold_ad.active_sense_readonly()
+        with self.assertRaisesRegex(BurnError, "PCIe device-ID block"):
+            gold_ad.controller.program_row(card.next_free_row, 0x41E20942)
+
+        # 7. End-to-end simulated burn: declining CONFIRM A100 DEVID aborts before write;
+        #    confirming burns test + DEVIDA + DEVIDB cleanly through GA100FuseController HAL!
+        journal_path = self.work / "devid_burn.jsonl"
+        burn_out: list[str] = []
+        seen_tokens: list[str] = []
+
+        def _decline_devid(_prompt: str, token: str) -> bool:
+            seen_tokens.append(token)
+            return not token.startswith("CONFIRM A100 DEVID")
+
+        with Journal(journal_path) as j:
+            with self.assertRaisesRegex(BurnError, "A100 Device ID conversion not confirmed"):
+                process_records(
+                    plan,
+                    gold_ad,
+                    gold_ad,
+                    j,
+                    stage="all",
+                    dry_run=False,
+                    overrides=Overrides(no_test_receipt=True),
+                    confirm=_decline_devid,
+                    show=burn_out.append,
+                )
+        self.assertIn("CONFIRM A100 DEVID 0x20F1", seen_tokens)
+        self.assertIn("WILL NOT POST on its stock CMP 170HX VBIOS", "\n".join(burn_out))
+        self.assertIn("128 GB 64-BIT BAR1 MMIO WINDOW", "\n".join(burn_out))
+
+        # Now confirm all prompts and verify both DEVIDA & DEVIDB land in OTP!
+        gold_ad2 = _build_sim_adapter(self.state, goldilocks=True)
+        journal_path2 = self.work / "devid_burn_ok.jsonl"
+        tokens_ok: list[str] = []
+
+        def _accept_all(_prompt: str, token: str) -> bool:
+            tokens_ok.append(token)
+            return True
+
+        with Journal(journal_path2) as j2:
+            process_records(
+                plan,
+                gold_ad2,
+                gold_ad2,
+                j2,
+                stage="all",
+                dry_run=False,
+                overrides=Overrides(no_test_receipt=True),
+                confirm=_accept_all,
+                show=lambda _s: None,
+            )
+        self.assertEqual(tokens_ok.count("CONFIRM A100 DEVID 0x20F1"), 2)
+        self.assertEqual(gold_ad2.fuse_row(card.next_free_row + 1), 0x41E20942)
+        self.assertEqual(gold_ad2.fuse_row(card.next_free_row + 2), 0x41E20982)
+
+    def test_mig_sys_pipe_unlock_preserves_defects_and_nvlink(self):
+        # Build a synthetic card with SYS_PIPE_DISABLE=0xFE (7 disabled), DEFECTIVE=0x80 (only bit 7 defective)
+        st = _synthetic_card_state()
+        # Update c1/b23: bits 0..2 = nvlink_disable (0x7), bit 3 = unmapped 1 (0x8), bits 4..11 = sys_pipe_disable (0xFE)
+        # Keep top 4 bits (bits 12..15) = 0 -> b23 = 0x0FEF
+        for r, w in list(st["ff_rows"].items()):
+            if w != 0:
+                ff = decode_ff(w)
+                if (ff.chain, ff.block) == (1, 23):
+                    st["ff_rows"][r] = encode_ff(1, 23, 0x0FEF)
+        st["defect_masks"]["SYS_PIPE_DISABLE"] = 0x80
+        st["shadow_masks"]["sys_pipe_disable"] = 0xFE
+
+        ad = _build_sim_adapter(st, goldilocks=False)
+        card = capture_card_snapshot(ad)
+        self.assertEqual(card.current_sys_pipe_count(), 1)
+        self.assertEqual(card.max_healthy_sys_pipe_count(), 7)
+        self.assertEqual(card.sys_pipe_unlockable_mask(), 0x7E)
+
+        cfg = UnlockConfig.from_card(card)
+        cfg.set_sys_pipe_unlock(True)
+        items, issues = derive_ff_records(card, cfg)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(issues, [])
+        # Only non-defective SYS_PIPE bits cleared: 0x0FEF -> 0x080F (bit 11 = bit7 defect preserved, low 0x0F preserved!)
+        self.assertEqual(items[0]["chain"], 1)
+        self.assertEqual(items[0]["block"], 23)
+        self.assertEqual(items[0]["old"], 0x0FEF)
+        self.assertEqual(items[0]["new"], 0x080F)
+
+        plan_path = self.work / "plan_mig_sys_pipe.json"
+        write_private_json(plan_path, build_plan_from_config(card, cfg))
+        plan = Plan.load(plan_path)
+        self.assertEqual(plan.records[1].to_disable, 0x80)
+        self.assertEqual(plan.records[1].from_disable, 0xFE)
+
 
 class TestPCIGPUDiscoveryAndPicker(unittest.TestCase):
     def setUp(self):

@@ -363,8 +363,10 @@ class SimulatedGA100Adapter(FuseReader, FuseWriter):
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
-    def write_one_record(self, row: int, word: int) -> None:
-        self.controller.program_row(row, word)
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
+        self.controller.program_row(row, word, allow_a100_devid=allow_a100_devid)
 
     def to_snapshot_dict(self) -> dict:
         """Serialize current simulated PCIe state into the standard fake-snapshot JSON schema."""
@@ -421,6 +423,7 @@ def trace_hal_program_sequence(
     health: Health,
     *,
     skip_sense: bool = False,
+    allow_a100_devid: bool = False,
 ) -> tuple[list[PCIeTransaction], list[PCIeTransaction], list[PCIeTransaction]]:
     """Dry-run ``GA100FuseController`` on an ephemeral simulated PCIe bus to capture exact BAR0 writes.
 
@@ -453,7 +456,7 @@ def trace_hal_program_sequence(
         sense_writes = bus.writes()
         bus.clear()
 
-    ctl.program_row(row, word)
+    ctl.program_row(row, word, allow_a100_devid=allow_a100_devid)
     # program_row calls arm() -> read_row(blank check) -> stage + CMD_PROGRAM + relatch -> read_row(verify).
     all_prog_writes = bus.writes()
 

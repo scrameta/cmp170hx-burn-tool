@@ -246,6 +246,8 @@ def execute_configure(
     unlock_sm_hbm: bool = False,
     pcie_mode: str | None = None,
     nvlink: bool | None = None,
+    a100_devid: int | None = None,
+    enable_mig_sys_pipe: bool = False,
     use_curses: bool | None = None,
     io: CommandIO | None = None,
     sysfs_root: str = "/sys/bus/pci/devices",
@@ -280,7 +282,13 @@ def execute_configure(
         label = target.bdf or target.adapter or target.sim_pcie or target.fake or "GPU"
         card = capture_card_snapshot(backend, label=label)
 
-    non_interactive = unlock_sm_hbm or (pcie_mode is not None) or (nvlink is not None)
+    non_interactive = (
+        unlock_sm_hbm
+        or (pcie_mode is not None)
+        or (nvlink is not None)
+        or (a100_devid is not None)
+        or enable_mig_sys_pipe
+    )
     if non_interactive:
         cfg = UnlockConfig.from_card(card)
         if unlock_sm_hbm:
@@ -289,6 +297,10 @@ def execute_configure(
             cfg.set_pcie_mode(pcie_mode)
         if nvlink is not None:
             cfg.set_nvlink(nvlink)
+        if a100_devid is not None:
+            cfg.set_a100_devid(a100_devid)
+        if enable_mig_sys_pipe:
+            cfg.set_sys_pipe_unlock(True)
     else:
         custom_io = (io.input_fn is not input) or (io.show is not print)
         cfg = run_menuconfig(
