@@ -49,6 +49,14 @@ def hex32(value: int) -> str:
     return f"0x{value:08x}"
 
 
+LNKCAP2_SPEEDS_MASK = 0xFE  # PCIe Link Capabilities 2: Supported Link Speeds Vector, bits 7:1
+
+
+def lnkcap2_speeds(value: int) -> int:
+    """The Supported Link Speeds Vector of a LnkCap2 value (what the PCIe fuses decide)."""
+    return value & LNKCAP2_SPEEDS_MASK
+
+
 @dataclass(frozen=True)
 class Overrides:
     """Explicit, granular manual overrides. All default to False/None (fail-closed).
@@ -1824,7 +1832,7 @@ def process_records(
                 f"LnkCap2 current={hex32(observed_link)}, "
                 f"planned target={hex32(record.link_cap2_after)}"
             )
-            if observed_link != record.link_cap2_before:
+            if lnkcap2_speeds(observed_link) != lnkcap2_speeds(record.link_cap2_before):
                 raise BurnError(
                     f"current LnkCap2 ({hex32(observed_link)}) does not match reviewed "
                     f"before state ({hex32(record.link_cap2_before)})"
@@ -2323,6 +2331,15 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
         observed = cold.get("fields", {})
         if not isinstance(observed, dict):
             raise BurnError("cold snapshot fields must be a JSON object")
+
+        def _cold_matches(field: str, want: int, got: int) -> bool:
+            # LnkCap2: only the Supported Link Speeds Vector (bits 7:1) is a fuse outcome.
+            # Other bits (e.g. 23/24 Retimer Presence Detect Supported, which a device
+            # advertises once it supports 16 GT/s) are not part of the reviewed plan.
+            if field == "LnkCap2":
+                return lnkcap2_speeds(got) == lnkcap2_speeds(want)
+            return got == want
+
         diffs = {
             field: (
                 hex32(value),
@@ -2331,7 +2348,8 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
                 else "MISSING",
             )
             for field, value in expected.items()
-            if field not in observed or u32(observed[field], f"cold.fields.{field}") != value
+            if field not in observed
+            or not _cold_matches(field, value, u32(observed[field], f"cold.fields.{field}"))
         }
         event = journal.append(
             event="cold_snapshot_comparison",
@@ -2347,7 +2365,13 @@ def verify_cold_snapshot(plan: Plan, cold: dict, *, stage: str, journal: Journal
         )
         logged_comparison = True
         if diffs:
-            raise BurnError(f"cold snapshot differs: {diffs}")
+            missing = sorted(f for f, (_, got) in diffs.items() if got == "MISSING")
+            hint = (
+                f" (snapshot lacks {', '.join(missing)}: recapture it with this vfi_burn version)"
+                if missing
+                else ""
+            )
+            raise BurnError(f"cold snapshot differs: {diffs}{hint}")
     except Exception as exc:
         if not logged_comparison:
             journal.append(
