@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
 import json
+from pathlib import Path
 import sys
 from typing import Callable
 
@@ -20,6 +21,7 @@ from .backend import (
     load_adapter,
     snapshot_data,
     write_private_json,
+    write_private_json_interactive,
 )
 from .console import (
     ManualConsole,
@@ -111,11 +113,11 @@ def open_target(spec: TargetSpec, *, writable: bool = False):
             backend.close()
 
 
-def _save_sim_snapshot(backend, path: str) -> None:
+def _save_sim_snapshot(backend, path: str, *, overwrite: bool = False) -> None:
     if isinstance(backend, SimulatedGA100Adapter):
-        write_private_json(path, backend.to_snapshot_dict())
+        write_private_json(path, backend.to_snapshot_dict(), overwrite=overwrite)
     else:
-        write_private_json(path, snapshot_data(backend))
+        write_private_json(path, snapshot_data(backend), overwrite=overwrite)
 
 
 def _require_live_execute_ready(backend, io: CommandIO) -> None:
@@ -239,6 +241,24 @@ def _check_generated_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
     return final_masks
 
 
+def _describe_existing_plan(path: Path, card) -> str | None:
+    try:
+        existing = Plan.load(path)
+    except Exception:
+        return None
+    if existing.pci_id != card.pci_id or existing.die_rows != card.die_rows:
+        return (
+            f"WARNING: existing file {path} is a plan for a DIFFERENT card "
+            f"({existing.pci_id} {sku_display_name(existing.pci_id)}, "
+            f"sha={existing.content_hash[:12]})."
+        )
+    return (
+        f"Existing file {path} is an earlier plan for this same card "
+        f"({existing.pci_id} {sku_display_name(existing.pci_id)}, "
+        f"{len(existing.records)} records, sha={existing.content_hash[:12]})."
+    )
+
+
 def execute_configure(
     *,
     target: TargetSpec,
@@ -249,6 +269,7 @@ def execute_configure(
     a100_devid: int | None = None,
     enable_mig_sys_pipe: bool = False,
     use_curses: bool | None = None,
+    overwrite: bool = False,
     io: CommandIO | None = None,
     sysfs_root: str = "/sys/bus/pci/devices",
 ) -> int:
@@ -314,15 +335,32 @@ def execute_configure(
             return 1
 
     plan_dict = build_plan_from_config(card, cfg)
-    write_private_json(out, plan_dict)
-    loaded = Plan.load(out)
+    if overwrite:
+        write_private_json(out, plan_dict, overwrite=True)
+        saved = out
+    elif not non_interactive:
+        saved = write_private_json_interactive(
+            out,
+            plan_dict,
+            input_fn=io.input_fn,
+            show=io.show,
+            path_prompt="Save mode-0600 plan JSON path",
+            describe_existing=lambda p: _describe_existing_plan(p, card),
+        )
+        if not saved:
+            io.show("Plan not saved; cancelled.")
+            return 1
+    else:
+        write_private_json(out, plan_dict, overwrite=False)
+        saved = out
+    loaded = Plan.load(saved)
     final_masks = _check_generated_plan(loaded, io)
-    io.show(f"Generated plan {out} (mode 0600) | {cfg.summary_line()}:")
+    io.show(f"Generated plan {saved} (mode 0600) | {cfg.summary_line()}:")
     _print_plan_summary(loaded, final_masks, io)
     if target.bdf:
-        io.show(f"Next: sudo python3 -m vfi_burn menu --bdf {target.bdf} --plan {out}")
+        io.show(f"Next: sudo python3 -m vfi_burn menu --bdf {target.bdf} --plan {saved}")
     elif target.fake:
-        io.show(f"Next: python3 -m vfi_burn menu --fake {target.fake} --plan {out}")
+        io.show(f"Next: python3 -m vfi_burn menu --fake {target.fake} --plan {saved}")
     return 0
 
 
@@ -332,6 +370,7 @@ def execute_snapshot(
     previous_boot_id: str,
     out: str,
     read_rows: bool = True,
+    overwrite: bool = False,
     io: CommandIO | None = None,
 ) -> int:
     io = io or CommandIO()
@@ -341,7 +380,7 @@ def execute_snapshot(
             previous_boot_id=previous_boot_id,
             read_rows=read_rows,
         )
-    write_private_json(out, snap)
+    write_private_json(out, snap, overwrite=overwrite)
     io.show(
         f"Saved cold snapshot {out} (mode 0600) | boot_id={snap['boot_id']} "
         f"rows_nonzero={len(snap['fpf_rows'])} SM_COUNT={snap['fields']['SM_COUNT']}"
@@ -528,6 +567,7 @@ def execute_simulate(
     max_records: int | None = None,
     dry_run: bool = False,
     save_fake: str | None = None,
+    overwrite: bool = False,
     overrides: Overrides | None = None,
     io: CommandIO | None = None,
 ) -> int:
@@ -557,7 +597,7 @@ def execute_simulate(
                 dry_run=dry_run,
             )
         if save_fake and not dry_run:
-            _save_sim_snapshot(backend, save_fake)
+            _save_sim_snapshot(backend, save_fake, overwrite=overwrite)
     io.show(
         "SIMULATION DRY-RUN ONLY: no fake rows modified."
         if dry_run
@@ -577,6 +617,7 @@ def _execute_manual_write(
     execute: bool,
     dry_run: bool,
     save_fake: str | None,
+    overwrite: bool = False,
     overrides: Overrides,
     allow_live: bool,
     io: CommandIO,
@@ -631,7 +672,7 @@ def _execute_manual_write(
             is_manual_single=True,
         )
     if is_sim and save_fake and not effective_dry:
-        _save_sim_snapshot(backend, save_fake)
+        _save_sim_snapshot(backend, save_fake, overwrite=overwrite)
     if effective_dry:
         io.show("DRY-RUN COMPLETE: no fuses written.")
     elif is_sim:
@@ -657,6 +698,7 @@ def execute_manual(
     execute: bool = False,
     dry_run: bool = False,
     save_fake: str | None = None,
+    overwrite: bool = False,
     overrides: Overrides | None = None,
     io: CommandIO | None = None,
 ) -> int:
@@ -683,6 +725,7 @@ def execute_manual(
                 execute=False,
                 dry_run=False,
                 save_fake=save_fake,
+                overwrite=overwrite,
                 overrides=ov,
                 allow_live=False,
                 io=io,
@@ -698,6 +741,7 @@ def execute_manual(
                 execute=execute,
                 dry_run=dry_run,
                 save_fake=save_fake,
+                overwrite=overwrite,
                 overrides=ov,
                 allow_live=True,
                 io=io,
@@ -804,6 +848,7 @@ def execute_verify_cold(
     stage: str,
     journal_path: str,
     receipt_out: str | None = None,
+    overwrite: bool = False,
     io: CommandIO | None = None,
 ) -> int:
     io = io or CommandIO()
@@ -817,7 +862,7 @@ def execute_verify_cold(
     with Journal(journal_path) as j:
         receipt = verify_cold_snapshot(p, cold_data, stage=stage, journal=j)
     if receipt_out:
-        write_private_json(receipt_out, receipt)
+        write_private_json(receipt_out, receipt, overwrite=overwrite)
     io.show(
         "PASS: supplied cold snapshot matches declared expectations; "
         "evidence is not independently authenticated"

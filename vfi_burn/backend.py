@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib
 import json
 import os
+import secrets
 
 from .interfaces import FuseReader, FuseWriter, Health, Host
 from .model import BurnError, PreTriggerRefusal, require_private_file, u32
@@ -171,7 +172,7 @@ def load_adapter(spec: str):
 
 
 def write_private_json(path: str | Path, data: dict, *, overwrite: bool = False) -> None:
-    """Atomically create a private mode-0600 JSON file inside a mode-0700 directory."""
+    """Atomically create (or replace when overwrite=True) a mode-0600 JSON file inside a mode-0700 directory."""
     p = Path(path)
     if p.is_symlink():
         raise BurnError(f"refusing symlink output: {p}")
@@ -182,22 +183,130 @@ def write_private_json(path: str | Path, data: dict, *, overwrite: bool = False)
         raise BurnError(
             f"private output directory must have mode 0700: {p.parent} — run: chmod 700 {p.parent}"
         )
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    flags |= os.O_TRUNC if overwrite else os.O_EXCL
-    try:
-        fd = os.open(p, flags, 0o600)
-    except FileExistsError as exc:
-        raise BurnError(f"output file already exists (refusing to overwrite): {p}") from exc
+    if p.is_dir():
+        raise BurnError(f"output path is a directory: {p}")
+    if not overwrite:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(p, flags, 0o600)
+        except FileExistsError as exc:
+            raise BurnError(
+                f"output file already exists (refusing to overwrite): {p} "
+                "(pass --overwrite to replace)"
+            ) from exc
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            p.unlink(missing_ok=True)
+            raise
+        return
+
+    # Atomic overwrite: stage in a mode-0600 sibling temp file, fsync, then os.replace.
+    tmp_path: Path | None = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(64):
+        cand = p.parent / f".{p.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+        try:
+            fd = os.open(cand, flags, 0o600)
+            tmp_path = cand
+            break
+        except FileExistsError:
+            continue
+    if tmp_path is None:
+        raise BurnError(f"could not allocate temporary file in {p.parent}")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-    except Exception:
-        if not overwrite:
-            p.unlink(missing_ok=True)
-        raise
+        if p.is_symlink():
+            raise BurnError(f"refusing symlink output: {p}")
+        os.replace(tmp_path, p)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def next_available_path(path: str | Path) -> str:
+    """Return a non-existing sibling path by appending _2, _3, ... before the file suffix."""
+    p = Path(path)
+    n = 2
+    while True:
+        cand = p.parent / f"{p.stem}_{n}{p.suffix}"
+        if not cand.exists() and not cand.is_symlink():
+            return str(cand)
+        n += 1
+
+
+def write_private_json_interactive(
+    path: str | Path,
+    data: dict,
+    *,
+    input_fn,
+    show,
+    path_prompt: str = "Output path",
+    describe_existing=None,
+) -> str | None:
+    """Write a private mode-0600 JSON file, prompting on collision instead of hard-failing.
+
+    Returns the written path string, or ``None`` if the operator cancels.
+    Never overwrites without an explicit affirmative choice; symlinks remain refused.
+    """
+    current = str(path)
+    while True:
+        p = Path(current)
+        if p.is_symlink():
+            raise BurnError(f"refusing symlink output: {p}")
+        if not p.exists():
+            try:
+                write_private_json(current, data, overwrite=False)
+                return current
+            except BurnError as exc:
+                if not p.exists():
+                    raise
+                show(f"NOTE: {exc}")
+        if p.is_dir():
+            show(f"Output path is a directory, not a file: {current}")
+            try:
+                alt = input_fn(f"{path_prompt} (blank to cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not alt:
+                return None
+            current = alt
+            continue
+
+        if callable(describe_existing):
+            note = describe_existing(p)
+            if note:
+                show(note)
+        while True:
+            try:
+                choice = input_fn(
+                    f"File already exists: {current} — [o]verwrite, [n]ew path, or [c]ancel [c]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if choice in ("o", "overwrite", "y", "yes"):
+                write_private_json(current, data, overwrite=True)
+                return current
+            if choice in ("n", "new", "r", "rename"):
+                suggested = next_available_path(current)
+                try:
+                    raw = input_fn(f"{path_prompt} [{suggested}]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return None
+                current = raw if raw else suggested
+                break
+            if choice in ("", "c", "cancel"):
+                return None
+            show("Please enter 'o' (overwrite), 'n' (new path), or 'c' (cancel).")
 
 
 def snapshot_data(ctl: FakeController) -> dict:

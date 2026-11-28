@@ -17,7 +17,7 @@ from .backend import (
     has_verified_writer,
     load_adapter,
     snapshot_data,
-    write_private_json,
+    write_private_json_interactive,
 )
 from .console import (
     ManualConsole,
@@ -296,6 +296,24 @@ class BurnMenu:
                 "Pick the matching plan or switch GPU before reviewing/burning."
             )
 
+    @staticmethod
+    def _describe_existing_plan(path: Path, card) -> str | None:
+        try:
+            existing = Plan.load(path)
+        except Exception:
+            return None
+        if existing.pci_id != card.pci_id or existing.die_rows != card.die_rows:
+            return (
+                f"WARNING: existing file {path} is a plan for a DIFFERENT card "
+                f"({existing.pci_id} {sku_display_name(existing.pci_id)}, "
+                f"sha={existing.content_hash[:12]})."
+            )
+        return (
+            f"Existing file {path} is an earlier plan for this same card "
+            f"({existing.pci_id} {sku_display_name(existing.pci_id)}, "
+            f"{len(existing.records)} records, sha={existing.content_hash[:12]})."
+        )
+
     def _configure_unlocks_interactive(self) -> bool:
         if not (self.s.bdf or self.s.fake_path or self.s.adapter_spec):
             bdf = prompt_select_gpu_bdf(
@@ -342,12 +360,22 @@ class BurnMenu:
         if not out:
             self.show("Plan not saved (no output path given).")
             return False
-        write_private_json(out, plan_dict)
-        loaded = Plan.load(out)
+        saved = write_private_json_interactive(
+            out,
+            plan_dict,
+            input_fn=self.input_fn,
+            show=self.show,
+            path_prompt="Save mode-0600 plan JSON path",
+            describe_existing=lambda p: self._describe_existing_plan(p, card),
+        )
+        if not saved:
+            self.show("Plan not saved.")
+            return False
+        loaded = Plan.load(saved)
         self._validate_plan_for_setup(loaded)
-        self.s.plan_path = out
+        self.s.plan_path = saved
         self.show(
-            f"Saved & loaded {out} ({loaded.pci_id} {sku_display_name(loaded.pci_id)}, "
+            f"Saved & loaded {saved} ({loaded.pci_id} {sku_display_name(loaded.pci_id)}, "
             f"{len(loaded.records)} records: 1 auto no-op test + "
             f"{len(loaded.records) - 1} real; {cfg.summary_line()}). "
             "Ready for [2] Review Plan, [3] Live Status, or [5] Dry-Run."
@@ -827,8 +855,17 @@ class BurnMenu:
             try:
                 check_host_readonly_safe(backend.host())
                 snap = backend.capture_cold_snapshot(previous_boot_id=prev, read_rows=True)
-                write_private_json(out, snap)
-                self.show(f"Saved cold snapshot to {out} (mode 0600, SM_COUNT={snap['fields']['SM_COUNT']}).")
+                saved = write_private_json_interactive(
+                    out,
+                    snap,
+                    input_fn=self.input_fn,
+                    show=self.show,
+                    path_prompt="Output cold snapshot path",
+                )
+                if saved:
+                    self.show(f"Saved cold snapshot to {saved} (mode 0600, SM_COUNT={snap['fields']['SM_COUNT']}).")
+                else:
+                    self.show("Cold snapshot not saved.")
             finally:
                 self._close_if_owned(backend, owned)
         elif pick == "2":
@@ -840,9 +877,19 @@ class BurnMenu:
             with Journal(self.s.journal_path) as j:
                 receipt = verify_cold_snapshot(p, cold_data, stage=stage, journal=j)
             if receipt_out:
-                write_private_json(receipt_out, receipt)
-                if stage == "test":
-                    self.s.receipt_path = receipt_out
+                saved = write_private_json_interactive(
+                    receipt_out,
+                    receipt,
+                    input_fn=self.input_fn,
+                    show=self.show,
+                    path_prompt="Receipt output path",
+                )
+                if saved:
+                    if stage == "test":
+                        self.s.receipt_path = saved
+                    self.show(f"Saved receipt to {saved} (mode 0600).")
+                else:
+                    self.show("Receipt not saved.")
             self.show("PASS: cold snapshot matches declared expectations (not independently authenticated).")
 
     # ------------------------------------------------------------------ [11] Experimental Registers
