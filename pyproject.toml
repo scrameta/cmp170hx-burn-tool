@@ -13,3 +13,6 @@ vfi-burn = "vfi_burn.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["vfi_burn*"]
+
+[tool.setuptools.package-data]
+vfi_burn = ["web_assets/*"]

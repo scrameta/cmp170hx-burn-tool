@@ -14,6 +14,9 @@ from .ffrecord import encode_ff
 from .fuses import (
     A100_TARGET_DEVICE_IDS,
     BURNABLE_TARGET_DEVICE_IDS,
+    BUS_BITS_PER_FBP,
+    CMP_VBIOS_GB_PER_FBP,
+    CUDA_CORES_PER_SM,
     SM_PER_TPC,
     TOTAL_FBP,
     TOTAL_GPC,
@@ -41,7 +44,7 @@ class _MenuEntry:
 def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str]:
     lines = [
         f"Card: {card.pci_id} | Next free FF row: {card.next_free_row} ({card.free_row_count} free slots)",
-        f"Config: {config.summary_line()}",
+        *config.before_after_summary().format_lines(),
         "",
     ]
     if config.a100_devid is not None:
@@ -123,7 +126,8 @@ def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str
 def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tuple[str, list[_MenuEntry]]:
     """Build title and selectable entries for the given menuconfig screen."""
     if screen == "root":
-        all_sm_hbm = config.is_all_healthy_sm_hbm_unlocked()
+        all_compute = config.is_all_healthy_compute_unlocked()
+        all_memory = config.is_all_healthy_memory_unlocked()
         cur_sm, tgt_sm, max_sm = (
             card.current_sm_count(),
             config.target_sm_count(),
@@ -134,6 +138,9 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             config.target_fbp_count(),
             card.max_healthy_fbp_count(),
         )
+        cur_bus, tgt_bus = card.bus_width_bits(cur_fbp), card.bus_width_bits(tgt_fbp)
+        cur_cmp_gb, tgt_cmp_gb = card.est_vram_cmp_gb(cur_fbp), card.est_vram_cmp_gb(tgt_fbp)
+        cur_a100_gb, tgt_a100_gb = card.est_vram_a100_gb(cur_fbp), card.est_vram_a100_gb(tgt_fbp)
         try:
             items, issues = derive_ff_records(card, config)
             ff_summary = f"+{len(items)} FF row(s)"
@@ -142,13 +149,26 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
         except BurnError as exc:
             ff_summary = f"ERROR: {exc}"
 
-        def _toggle_all_sm_hbm() -> str:
-            if config.is_all_healthy_sm_hbm_unlocked():
+        def _toggle_all_compute() -> str:
+            if config.is_all_healthy_compute_unlocked():
                 config.reset_compute()
+                return f"Reset Compute back to current card state ({config.target_sm_count()} SMs)."
+            config.unlock_all_healthy_compute()
+            return (
+                f"Unlocked all healthy Compute ({config.target_sm_count()} SMs / "
+                f"{config.target_sm_count() * CUDA_CORES_PER_SM:,} CUDA cores)."
+            )
+
+        def _toggle_all_memory() -> str:
+            if config.is_all_healthy_memory_unlocked():
                 config.reset_memory()
-                return "Reset Compute + Memory back to current card state."
-            config.unlock_all_healthy_sm_hbm()
-            return f"Unlocked all healthy Compute ({config.target_sm_count()} SMs) + Memory ({config.target_fbp_count()} FBPs)."
+                return f"Reset Memory back to current card state ({config.target_fbp_count()}/{TOTAL_FBP} FBPs)."
+            config.unlock_all_healthy_memory()
+            tf = config.target_fbp_count()
+            return (
+                f"Unlocked all healthy Memory ({tf}/{TOTAL_FBP} FBPs, {card.bus_width_bits(tf)}-bit, "
+                f"~{card.est_vram_cmp_gb(tf)} GB CMP / ~{card.est_vram_a100_gb(tf)} GB A100)."
+            )
 
         def _toggle_nvlink() -> str:
             if card.nvlink_all_defective():
@@ -165,36 +185,60 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                         else ("currently ON" if config.nvlink_enabled else "currently OFF")))
         )
 
+        vram_tag = (
+            f"~{tgt_a100_gb} GB A100"
+            if (config.a100_devid in A100_TARGET_DEVICE_IDS)
+            else f"~{cur_cmp_gb}->{tgt_cmp_gb} GB CMP / {cur_a100_gb}->{tgt_a100_gb} GB A100"
+        )
+
         entries = [
             _MenuEntry(
-                label=f"[{'*' if all_sm_hbm else ' '}] Unlock ALL healthy Compute + Memory (SM + HBM)",
-                help_text=(
-                    "One-step toggle: unlocks every non-defective GPC, TPC, PES, FBP, FBPA, FBIO, "
-                    "and ROP_L2 partition on this die. Press Space again to reset Compute+Memory "
-                    "to current card state. Use the submenus below to customize individual units."
+                label=(
+                    f"[{'*' if all_compute else ' '}] Unlock ALL healthy Compute "
+                    f"({max_sm} SMs / {max_sm * CUDA_CORES_PER_SM:,} CUDA cores)"
                 ),
-                on_toggle=_toggle_all_sm_hbm,
-                on_enter=_toggle_all_sm_hbm,
+                help_text=(
+                    "One-step Compute toggle: unlocks every non-defective GPC, TPC, and paired PES "
+                    "slice on this die without touching HBM/Memory fuses. Press Space again to reset "
+                    "Compute back to current card state."
+                ),
+                on_toggle=_toggle_all_compute,
+                on_enter=_toggle_all_compute,
             ),
             _MenuEntry(
                 label=(
                     f"    Compute (GPC / TPC / PES): {cur_sm}->{tgt_sm} SMs "
-                    f"(healthy max {max_sm}, {config.target_gpc_count()}/{TOTAL_GPC} GPCs)  --->"
+                    f"({tgt_sm * CUDA_CORES_PER_SM:,} CUDA, {config.target_gpc_count()}/{TOTAL_GPC} GPCs)  --->"
                 ),
                 help_text=(
-                    "Enter to unlock or lock individual GPCs (0..7) and individual TPCs (0..7, 2 SMs each). "
-                    "PES slices are kept coherent automatically so enabled GPCs always boot cleanly."
+                    "Enter to unlock or lock individual GPCs (0..7) and individual TPCs (0..7, 2 SMs / "
+                    "128 CUDA cores each). PES slices are kept coherent automatically."
                 ),
                 submenu="compute",
             ),
             _MenuEntry(
                 label=(
-                    f"    Memory / HBM (FBP / FBPA / FBIO / ROP_L2): {cur_fbp}->{tgt_fbp} FBPs "
-                    f"(healthy max {max_fbp}/{TOTAL_FBP})  --->"
+                    f"[{'*' if all_memory else ' '}] Unlock ALL healthy Memory / HBM "
+                    f"({max_fbp}/{TOTAL_FBP} FBPs, {card.bus_width_bits(max_fbp)}-bit, "
+                    f"~{card.est_vram_cmp_gb(max_fbp)} GB CMP / {card.est_vram_a100_gb(max_fbp)} GB A100)"
+                ),
+                help_text=(
+                    "One-step Memory toggle: unlocks every non-defective FBP along with its paired "
+                    "FBPA, FBIO, and ROP_L2 slices without touching Compute fuses. Press Space again "
+                    "to reset Memory back to current card state."
+                ),
+                on_toggle=_toggle_all_memory,
+                on_enter=_toggle_all_memory,
+            ),
+            _MenuEntry(
+                label=(
+                    f"    Memory / HBM (FBP / FBPA / FBIO / ROP_L2): {cur_fbp}->{tgt_fbp}/{TOTAL_FBP} FBPs "
+                    f"({cur_bus}->{tgt_bus}-bit, {vram_tag})  --->"
                 ),
                 help_text=(
                     "Enter to unlock or lock individual memory partitions (FBP0..FBP11). "
-                    "Paired FBPA, FBIO, and ROP_L2 slices are kept coherent automatically."
+                    f"Each FBP adds {BUS_BITS_PER_FBP}-bit bus width ({CMP_VBIOS_GB_PER_FBP} GB on CMP VBIOS, "
+                    f"{card.a100_gb_per_fbp()} GB under A100 VBIOS)."
                 ),
                 submenu="memory",
             ),
@@ -392,15 +436,26 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
         return f"GPC{g} — Individual TPCs (2 SMs each)", entries
 
     if screen == "memory":
+        a100_gb = card.a100_gb_per_fbp()
+        tgt_fbp = config.target_fbp_count()
+        max_fbp = card.max_healthy_fbp_count()
+        cur_fbp = card.current_fbp_count()
         entries = [
             _MenuEntry(
-                label=f"    [*] Unlock ALL healthy FBPs ({card.max_healthy_fbp_count()}/{TOTAL_FBP} FBPs)",
+                label=(
+                    f"    [*] Unlock ALL healthy FBPs ({max_fbp}/{TOTAL_FBP} FBPs, "
+                    f"{card.bus_width_bits(max_fbp)}-bit, ~{card.est_vram_cmp_gb(max_fbp)} GB CMP / "
+                    f"{card.est_vram_a100_gb(max_fbp)} GB A100)"
+                ),
                 help_text="Enable every non-defective FBP along with its paired FBPA, FBIO, and ROP_L2 slices.",
-                on_toggle=lambda: (config.unlock_all_healthy_memory(), f"Memory set to {config.target_fbp_count()} FBPs.")[1],
-                on_enter=lambda: (config.unlock_all_healthy_memory(), f"Memory set to {config.target_fbp_count()} FBPs.")[1],
+                on_toggle=lambda: (config.unlock_all_healthy_memory(), f"Memory set to {config.target_fbp_count()} FBPs ({card.bus_width_bits(config.target_fbp_count())}-bit).")[1],
+                on_enter=lambda: (config.unlock_all_healthy_memory(), f"Memory set to {config.target_fbp_count()} FBPs ({card.bus_width_bits(config.target_fbp_count())}-bit).")[1],
             ),
             _MenuEntry(
-                label=f"    [ ] Reset Memory to current card state ({card.current_fbp_count()}/{TOTAL_FBP} FBPs)",
+                label=(
+                    f"    [ ] Reset Memory to current card state ({cur_fbp}/{TOTAL_FBP} FBPs, "
+                    f"{card.bus_width_bits(cur_fbp)}-bit, ~{card.est_vram_cmp_gb(cur_fbp)} GB CMP)"
+                ),
                 help_text="Discard all Memory / HBM changes.",
                 on_toggle=lambda: (config.reset_memory(), "Memory reset to current card state.")[1],
                 on_enter=lambda: (config.reset_memory(), "Memory reset to current card state.")[1],
@@ -413,7 +468,7 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             if is_def:
                 entries.append(
                     _MenuEntry(
-                        label=f"[X] FBP{i:<2d} (slices {2 * i:2d},{2 * i + 1:2d})  (DEFECTIVE in OPT_FBP_DEFECTIVE — locked)",
+                        label=f"[X] FBP{i:<2d} (stack {i // 2}, slices {2 * i:2d},{2 * i + 1:2d})  (DEFECTIVE in OPT_FBP_DEFECTIVE — locked)",
                         help_text=f"FBP{i} is marked genuinely defective in OPT_FBP_DEFECTIVE and cannot be enabled.",
                         on_toggle=lambda i=i: f"FBP{i} is defective in OPT_FBP_DEFECTIVE — cannot enable.",
                         locked=True,
@@ -427,16 +482,32 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 )
                 def _toggle_fbp(i: int = i) -> str:
                     config.set_fbp(i, not config.fbp_enabled[i])
-                    return f"FBP{i} {'enabled' if config.fbp_enabled[i] else 'disabled'} ({config.target_fbp_count()} FBPs)."
+                    tf = config.target_fbp_count()
+                    return (
+                        f"FBP{i} {'enabled' if config.fbp_enabled[i] else 'disabled'} "
+                        f"({tf} FBPs, {card.bus_width_bits(tf)}-bit, "
+                        f"~{card.est_vram_cmp_gb(tf)} GB CMP / {card.est_vram_a100_gb(tf)} GB A100)."
+                    )
                 entries.append(
                     _MenuEntry(
-                        label=f"[{'*' if tgt_on else ' '}] FBP{i:<2d} (paired FBPA/FBIO/ROP_L2 slices {2 * i:2d},{2 * i + 1:2d})  [{state_tag}]",
-                        help_text=f"Toggle FBP{i} ON/OFF together with its paired FBPA, FBIO, and ROP_L2 slices.",
+                        label=(
+                            f"[{'*' if tgt_on else ' '}] FBP{i:<2d} (stack {i // 2}, slices {2 * i:2d},{2 * i + 1:2d}, "
+                            f"{BUS_BITS_PER_FBP}-bit, +{CMP_VBIOS_GB_PER_FBP} GB CMP / +{a100_gb} GB A100)  [{state_tag}]"
+                        ),
+                        help_text=(
+                            f"Toggle FBP{i} ON/OFF together with its paired FBPA, FBIO, and ROP_L2 slices "
+                            f"(+{BUS_BITS_PER_FBP}-bit bus, +{CMP_VBIOS_GB_PER_FBP} GB CMP VBIOS / +{a100_gb} GB A100 VBIOS)."
+                        ),
                         on_toggle=_toggle_fbp,
                         on_enter=_toggle_fbp,
                     )
                 )
-        return f"Memory / HBM — FBPs ({config.target_fbp_count()}/{card.max_healthy_fbp_count()} healthy)", entries
+        return (
+            f"Memory / HBM — {tgt_fbp}/{max_fbp} healthy FBPs "
+            f"({card.bus_width_bits(tgt_fbp)}-bit, ~{card.est_vram_cmp_gb(tgt_fbp)} GB CMP / "
+            f"{card.est_vram_a100_gb(tgt_fbp)} GB A100)",
+            entries,
+        )
 
     if screen == "pcie":
         choices = [

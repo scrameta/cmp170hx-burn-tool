@@ -537,7 +537,11 @@ def format_plan_review(
         for issue in evaluate_fuse_combinations(decode_present_fields(sim_blocks)):
             audit_warnings.append(f"[COMBINATION/{issue.rule_id}] {issue.message}")
 
-    # ------------------------------------------------------------------ 4. Expected Outcome (Enabled / Disabled)
+    # ------------------------------------------------------------------ 4. Before / After Capability Summary & Expected Outcome
+    from .planner import summarize_plan_before_after
+
+    lines.append("")
+    lines.extend(summarize_plan_before_after(plan).format_lines())
     lines.append("")
     lines.append("=== EXPECTED OUTCOME (WHAT WILL BE ENABLED / DISABLED) ===")
     outcome_lines: list[str] = []

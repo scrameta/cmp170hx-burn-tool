@@ -15,6 +15,7 @@ from .ffrecord import (
     FF_ROW_MIN,
     build_vfi_plan_from_records,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_all_fields,
     encode_a100_devid_ff_words,
     encode_ff,
@@ -28,6 +29,9 @@ from .fuses import (
     A100_SXM4_DEVICE_IDS,
     A100_TARGET_DEVICE_IDS,
     BURNABLE_TARGET_DEVICE_IDS,
+    BUS_BITS_PER_FBP,
+    CMP_VBIOS_GB_PER_FBP,
+    CUDA_CORES_PER_SM,
     DEVICE_ID_DENIED_BLOCKS,
     DIE_ID_ROWS,
     FFCALC_KEY_TO_FIELD,
@@ -40,9 +44,15 @@ from .fuses import (
     TOTAL_FBP,
     TOTAL_GPC,
     TPC_PER_GPC,
+    a100_gb_per_fbp_for_sku,
 )
 from .ga100 import read_ga100_card_state
-from .model import BurnError, SUPPORTED_CMP170HX_SKUS
+from .model import (
+    BurnError,
+    Plan,
+    SUPPORTED_CMP170HX_SKUS,
+    sku_display_name,
+)
 
 PCIE_MODES = ("keep", "gen3", "gen4", "lock_gen12")
 
@@ -226,11 +236,216 @@ class CardSnapshot:
             [self.defect_masks.get(f"TPC_GPC{g}_DISABLE", 0) for g in range(TOTAL_GPC)],
         )
 
+    def current_gpc_count(self) -> int:
+        return sum(1 for g in range(TOTAL_GPC) if self.gpc_currently_enabled(g))
+
+    def current_cuda_cores(self) -> int:
+        return self.current_sm_count() * CUDA_CORES_PER_SM
+
+    def max_healthy_cuda_cores(self) -> int:
+        return self.max_healthy_sm_count() * CUDA_CORES_PER_SM
+
     def current_fbp_count(self) -> int:
         return sum(1 for i in range(TOTAL_FBP) if self.fbp_currently_enabled(i))
 
     def max_healthy_fbp_count(self) -> int:
         return sum(1 for i in range(TOTAL_FBP) if not self.fbp_defective(i))
+
+    def a100_gb_per_fbp(self) -> int:
+        return a100_gb_per_fbp_for_sku(self.pci_id) or 4
+
+    def est_vram_cmp_gb(self, fbp_count: int) -> int:
+        return fbp_count * CMP_VBIOS_GB_PER_FBP
+
+    def est_vram_a100_gb(self, fbp_count: int) -> int:
+        return fbp_count * self.a100_gb_per_fbp()
+
+    def bus_width_bits(self, fbp_count: int) -> int:
+        return fbp_count * BUS_BITS_PER_FBP
+
+
+@dataclass(frozen=True)
+class BeforeAfterSummary:
+    """Structured Before/After hardware capability summary for UIs, Plan Review, and Cold Verify."""
+
+    pci_id_before: str
+    pci_id_after: str
+    sku_before: str
+    sku_after: str
+    sm_before: int | None
+    sm_after: int | None
+    sm_max_healthy: int | None
+    gpc_before: int | None
+    gpc_after: int | None
+    fbp_before: int | None
+    fbp_after: int | None
+    fbp_max_healthy: int | None
+    a100_gb_per_fbp: int
+    targeting_a100_vbios: bool
+    pcie_before: str
+    pcie_after: str
+    nvlink_before: bool | None
+    nvlink_after: bool | None
+    sys_pipe_before: int | None
+    sys_pipe_after: int | None
+    sys_pipe_max: int | None
+    nvdec_before: bool | None
+    nvdec_after: bool | None
+    nvjpg_ofa_before: bool | None
+    nvjpg_ofa_after: bool | None
+
+    @property
+    def cuda_cores_before(self) -> int | None:
+        return self.sm_before * CUDA_CORES_PER_SM if self.sm_before is not None else None
+
+    @property
+    def cuda_cores_after(self) -> int | None:
+        return self.sm_after * CUDA_CORES_PER_SM if self.sm_after is not None else None
+
+    @property
+    def cuda_cores_max_healthy(self) -> int | None:
+        return self.sm_max_healthy * CUDA_CORES_PER_SM if self.sm_max_healthy is not None else None
+
+    @property
+    def bus_width_before(self) -> int | None:
+        return self.fbp_before * BUS_BITS_PER_FBP if self.fbp_before is not None else None
+
+    @property
+    def bus_width_after(self) -> int | None:
+        return self.fbp_after * BUS_BITS_PER_FBP if self.fbp_after is not None else None
+
+    @property
+    def vram_cmp_before_gb(self) -> int | None:
+        return self.fbp_before * CMP_VBIOS_GB_PER_FBP if self.fbp_before is not None else None
+
+    @property
+    def vram_cmp_after_gb(self) -> int | None:
+        return self.fbp_after * CMP_VBIOS_GB_PER_FBP if self.fbp_after is not None else None
+
+    @property
+    def vram_a100_before_gb(self) -> int | None:
+        return self.fbp_before * self.a100_gb_per_fbp if self.fbp_before is not None else None
+
+    @property
+    def vram_a100_after_gb(self) -> int | None:
+        return self.fbp_after * self.a100_gb_per_fbp if self.fbp_after is not None else None
+
+    def vram_label(self) -> str:
+        if self.fbp_before is None or self.fbp_after is None:
+            return "unknown"
+        cmp_b, cmp_a = self.vram_cmp_before_gb, self.vram_cmp_after_gb
+        a100_b, a100_a = self.vram_a100_before_gb, self.vram_a100_after_gb
+        if self.targeting_a100_vbios:
+            return f"{cmp_b} GB (CMP) -> {a100_a} GB (A100 VBIOS, {self.a100_gb_per_fbp} GB/FBP)"
+        cmp_s = f"{cmp_b}->{cmp_a} GB" if cmp_b != cmp_a else f"{cmp_a} GB"
+        a100_s = f"{a100_b}->{a100_a} GB" if a100_b != a100_a else f"{a100_a} GB"
+        return f"{cmp_s} (CMP VBIOS) / {a100_s} (w/ A100 VBIOS)"
+
+    def features_list(self) -> list[dict]:
+        rows: list[dict] = []
+        if self.nvlink_before is not None and self.nvlink_after is not None:
+            rows.append({
+                "name": "NVLink",
+                "before": "ON" if self.nvlink_before else "OFF",
+                "after": "ON" if self.nvlink_after else "OFF",
+                "changed": self.nvlink_before != self.nvlink_after,
+            })
+        if self.sys_pipe_before is not None and self.sys_pipe_after is not None:
+            mx = f"/{self.sys_pipe_max}" if self.sys_pipe_max is not None else "/8"
+            rows.append({
+                "name": "MIG / SYS_PIPE",
+                "before": f"{self.sys_pipe_before}{mx} pipes",
+                "after": f"{self.sys_pipe_after}{mx} pipes",
+                "changed": self.sys_pipe_before != self.sys_pipe_after,
+            })
+        if self.nvdec_before is not None and self.nvdec_after is not None:
+            rows.append({
+                "name": "NVDEC x5 (exp)",
+                "before": "ON" if self.nvdec_before else "OFF",
+                "after": "ON" if self.nvdec_after else "OFF",
+                "changed": self.nvdec_before != self.nvdec_after,
+            })
+        if self.nvjpg_ofa_before is not None and self.nvjpg_ofa_after is not None:
+            rows.append({
+                "name": "NVJPG+OFA (exp)",
+                "before": "ON" if self.nvjpg_ofa_before else "OFF",
+                "after": "ON" if self.nvjpg_ofa_after else "OFF",
+                "changed": self.nvjpg_ofa_before != self.nvjpg_ofa_after,
+            })
+        rows.append({
+            "name": "PCIe Device ID",
+            "before": f"{self.pci_id_before} ({self.sku_before})",
+            "after": f"{self.pci_id_after} ({self.sku_after})",
+            "changed": self.pci_id_before != self.pci_id_after,
+        })
+        return rows
+
+    def to_dict(self) -> dict:
+        return {
+            "pci_id_before": self.pci_id_before,
+            "pci_id_after": self.pci_id_after,
+            "sku_before": self.sku_before,
+            "sku_after": self.sku_after,
+            "sm_before": self.sm_before,
+            "sm_after": self.sm_after,
+            "sm_max_healthy": self.sm_max_healthy,
+            "cuda_cores_before": self.cuda_cores_before,
+            "cuda_cores_after": self.cuda_cores_after,
+            "cuda_cores_max_healthy": self.cuda_cores_max_healthy,
+            "gpc_before": self.gpc_before,
+            "gpc_after": self.gpc_after,
+            "fbp_before": self.fbp_before,
+            "fbp_after": self.fbp_after,
+            "fbp_max_healthy": self.fbp_max_healthy,
+            "bus_width_before": self.bus_width_before,
+            "bus_width_after": self.bus_width_after,
+            "vram_cmp_before_gb": self.vram_cmp_before_gb,
+            "vram_cmp_after_gb": self.vram_cmp_after_gb,
+            "vram_a100_before_gb": self.vram_a100_before_gb,
+            "vram_a100_after_gb": self.vram_a100_after_gb,
+            "a100_gb_per_fbp": self.a100_gb_per_fbp,
+            "targeting_a100_vbios": self.targeting_a100_vbios,
+            "vram_label": self.vram_label(),
+            "pcie_before": self.pcie_before,
+            "pcie_after": self.pcie_after,
+            "features": self.features_list(),
+        }
+
+    def format_lines(self) -> list[str]:
+        lines = ["=== BEFORE / AFTER CAPABILITY SUMMARY ==="]
+        if self.sm_before is not None and self.sm_after is not None:
+            d_sm = self.sm_after - self.sm_before
+            d_cc = (self.cuda_cores_after or 0) - (self.cuda_cores_before or 0)
+            sign = "+" if d_sm >= 0 else ""
+            max_s = (
+                f", healthy max {self.sm_max_healthy} SMs / {self.cuda_cores_max_healthy:,} CUDA"
+                if self.sm_max_healthy is not None
+                else ""
+            )
+            lines.append(
+                f"  CUDA Cores / SMs : {self.cuda_cores_before:,} -> {self.cuda_cores_after:,} CUDA cores "
+                f"({sign}{d_cc:,}) | {self.sm_before} -> {self.sm_after} SMs ({sign}{d_sm}{max_s})"
+            )
+        if self.fbp_before is not None and self.fbp_after is not None:
+            d_fbp = self.fbp_after - self.fbp_before
+            sign_f = "+" if d_fbp >= 0 else ""
+            lines.append(
+                f"  Est. VRAM        : {self.vram_label()}"
+            )
+            lines.append(
+                f"  Memory Bus Width : {self.bus_width_before}-bit -> {self.bus_width_after}-bit "
+                f"({self.fbp_before} -> {self.fbp_after}/{TOTAL_FBP} FBPs, {sign_f}{d_fbp})"
+            )
+        lines.append(f"  PCIe Link Speed  : {self.pcie_before} -> {self.pcie_after}")
+        feat_parts = []
+        for f in self.features_list():
+            if f["changed"]:
+                feat_parts.append(f"{f['name']}: {f['before']} -> {f['after']}")
+            elif f["name"] in ("NVLink", "PCIe Device ID"):
+                feat_parts.append(f"{f['name']}: {f['after']}")
+        if feat_parts:
+            lines.append("  Features         : " + " | ".join(feat_parts))
+        return lines
 
 
 def snapshot_from_raw_state(
@@ -652,6 +867,220 @@ class UnlockConfig:
 
         return out
 
+    def before_after_summary(self) -> BeforeAfterSummary:
+        c = self.card
+        tgt_pci = f"10de:{self.a100_devid:04x}" if self.a100_devid is not None else c.pci_id
+        targeting_a100 = (
+            (self.a100_devid in A100_TARGET_DEVICE_IDS)
+            if self.a100_devid is not None
+            else (c.pci_id in ("10de:20f1", "10de:20b5", "10de:20b0", "10de:20b2"))
+        )
+        pcie_after = (
+            c.current_pcie_label()
+            if self.pcie_mode == "keep"
+            else (
+                "Gen3"
+                if self.pcie_mode == "gen3"
+                else ("Gen4" if self.pcie_mode == "gen4" else "Gen1/Gen2 (restricted)")
+            )
+        )
+        nvdec_cur = not c.media_engine_currently_disabled("nvdec")
+        nvjpg_cur = not c.media_engine_currently_disabled("nvjpg_ofa")
+        return BeforeAfterSummary(
+            pci_id_before=c.pci_id,
+            pci_id_after=tgt_pci,
+            sku_before=sku_display_name(c.pci_id),
+            sku_after=sku_display_name(tgt_pci),
+            sm_before=c.current_sm_count(),
+            sm_after=self.target_sm_count(),
+            sm_max_healthy=c.max_healthy_sm_count(),
+            gpc_before=c.current_gpc_count(),
+            gpc_after=self.target_gpc_count(),
+            fbp_before=c.current_fbp_count(),
+            fbp_after=self.target_fbp_count(),
+            fbp_max_healthy=c.max_healthy_fbp_count(),
+            a100_gb_per_fbp=c.a100_gb_per_fbp(),
+            targeting_a100_vbios=targeting_a100,
+            pcie_before=c.current_pcie_label(),
+            pcie_after=pcie_after,
+            nvlink_before=c.nvlink_currently_enabled(),
+            nvlink_after=self.nvlink_enabled,
+            sys_pipe_before=c.current_sys_pipe_count(),
+            sys_pipe_after=(
+                c.max_healthy_sys_pipe_count()
+                if self.sys_pipe_unlock
+                else c.current_sys_pipe_count()
+            ),
+            sys_pipe_max=c.max_healthy_sys_pipe_count(),
+            nvdec_before=nvdec_cur,
+            nvdec_after=(True if self.nvdec_unlock else nvdec_cur),
+            nvjpg_ofa_before=nvjpg_cur,
+            nvjpg_ofa_after=(True if self.nvjpg_ofa_unlock else nvjpg_cur),
+        )
+
+    def to_dict(self) -> dict:
+        """Return a complete JSON-serializable view of card silicon + current unlock config."""
+        c = self.card
+        gpcs = []
+        for g in range(TOTAL_GPC):
+            tpcs = []
+            for t in range(TPC_PER_GPC):
+                tpcs.append({
+                    "index": t,
+                    "defective": c.tpc_defective(g, t),
+                    "current": c.tpc_currently_enabled(g, t),
+                    "target": bool(self.gpc_enabled[g] and self.tpc_enabled[g][t]),
+                })
+            gpcs.append({
+                "index": g,
+                "defective": c.gpc_defective(g),
+                "current": c.gpc_currently_enabled(g),
+                "target": bool(self.gpc_enabled[g]),
+                "tpcs": tpcs,
+            })
+        fbps = []
+        for i in range(TOTAL_FBP):
+            fbps.append({
+                "index": i,
+                "stack": i // 2,
+                "slices": [2 * i, 2 * i + 1],
+                "defective": c.fbp_defective(i),
+                "current": c.fbp_currently_enabled(i),
+                "target": bool(self.fbp_enabled[i]),
+            })
+        media_info = {}
+        for which in ("nvdec", "nvjpg_ofa"):
+            cur_dis = c.media_engine_currently_disabled(which)
+            blockers = c.media_engine_blockers(which) if cur_dis else []
+            media_info[which] = {
+                "currently_disabled": cur_dis,
+                "selected": bool(getattr(self, f"{which}_unlock")),
+                "available": bool(cur_dis and not blockers),
+                "blockers": blockers,
+                "evidence": c.media_engine_evidence_line(which),
+            }
+        try:
+            items, issues = derive_ff_records(c, self)
+            derive_error = None
+        except BurnError as exc:
+            items, issues = [], []
+            derive_error = str(exc)
+        return {
+            "pci_id": c.pci_id,
+            "sku_name": sku_display_name(c.pci_id),
+            "next_free_row": c.next_free_row,
+            "free_row_count": c.free_row_count,
+            "all_healthy_compute": self.is_all_healthy_compute_unlocked(),
+            "all_healthy_memory": self.is_all_healthy_memory_unlocked(),
+            "gpcs": gpcs,
+            "fbps": fbps,
+            "pcie_mode": self.pcie_mode,
+            "pcie_current": c.current_pcie_label(),
+            "nvlink_enabled": self.nvlink_enabled,
+            "nvlink_current": c.nvlink_currently_enabled(),
+            "nvlink_defective": c.nvlink_all_defective(),
+            "a100_devid": f"0x{self.a100_devid:04x}" if self.a100_devid is not None else None,
+            "sys_pipe_unlock": self.sys_pipe_unlock,
+            "sys_pipe_unlockable": c.sys_pipe_unlockable_mask() != 0,
+            "sys_pipe_current": c.current_sys_pipe_count(),
+            "sys_pipe_max": c.max_healthy_sys_pipe_count(),
+            "media": media_info,
+            "summary": self.before_after_summary().to_dict(),
+            "summary_line": self.summary_line(),
+            "planned_records": [
+                {
+                    "row": it["row"],
+                    "chain": it["chain"],
+                    "block": it["block"],
+                    "old": f"0x{it['old']:04x}" if it.get("old") is not None else None,
+                    "new": f"0x{it['new']:04x}",
+                    "word": f"0x{it['word']:08x}",
+                    "fields": it["fields"],
+                    "kind": it.get("kind", "regular"),
+                    "note": it.get("note") or "",
+                }
+                for it in items
+            ],
+            "coherence_issues": [
+                {"rule_id": iss.rule_id, "severity": iss.severity, "message": iss.message}
+                for iss in issues
+            ],
+            "derive_error": derive_error,
+        }
+
+    def apply_patch(self, patch: dict) -> str:
+        """Apply a single structured UI mutation action and return a human-readable status message."""
+        action = str(patch.get("action", "")).strip()
+        if action == "toggle_all_compute":
+            if self.is_all_healthy_compute_unlocked():
+                self.reset_compute()
+                return f"Reset Compute to current card state ({self.target_sm_count()} SMs)."
+            self.unlock_all_healthy_compute()
+            return f"Unlocked all healthy Compute ({self.target_sm_count()} SMs / {self.target_sm_count() * CUDA_CORES_PER_SM:,} CUDA cores)."
+        if action == "unlock_all_compute":
+            self.unlock_all_healthy_compute()
+            return f"Unlocked all healthy Compute ({self.target_sm_count()} SMs)."
+        if action == "reset_compute":
+            self.reset_compute()
+            return f"Reset Compute to current card state ({self.target_sm_count()} SMs)."
+        if action == "toggle_all_memory":
+            if self.is_all_healthy_memory_unlocked():
+                self.reset_memory()
+                return f"Reset Memory to current card state ({self.target_fbp_count()}/{TOTAL_FBP} FBPs)."
+            self.unlock_all_healthy_memory()
+            return f"Unlocked all healthy Memory ({self.target_fbp_count()}/{TOTAL_FBP} FBPs, {self.card.bus_width_bits(self.target_fbp_count())}-bit)."
+        if action == "unlock_all_memory":
+            self.unlock_all_healthy_memory()
+            return f"Unlocked all healthy Memory ({self.target_fbp_count()}/{TOTAL_FBP} FBPs)."
+        if action == "reset_memory":
+            self.reset_memory()
+            return f"Reset Memory to current card state ({self.target_fbp_count()}/{TOTAL_FBP} FBPs)."
+        if action == "reset_all":
+            self.reset_all()
+            return "Reset all selections back to current card state."
+        if action == "set_gpc":
+            g = int(patch["gpc"])
+            en = bool(patch["enabled"])
+            self.set_gpc(g, en)
+            return f"GPC{g} {'enabled' if en else 'disabled'} ({self.target_sm_count()} SMs)."
+        if action == "set_tpc":
+            g = int(patch["gpc"])
+            t = int(patch["tpc"])
+            en = bool(patch["enabled"])
+            self.set_tpc(g, t, en)
+            return f"GPC{g}/TPC{t} {'enabled' if en else 'disabled'} ({self.target_sm_count()} SMs)."
+        if action == "set_fbp":
+            i = int(patch["fbp"])
+            en = bool(patch["enabled"])
+            self.set_fbp(i, en)
+            return f"FBP{i} {'enabled' if en else 'disabled'} ({self.target_fbp_count()}/{TOTAL_FBP} FBPs)."
+        if action == "set_pcie_mode":
+            mode = str(patch["mode"])
+            self.set_pcie_mode(mode)
+            return f"PCIe speed set to {self.target_pcie_label()}."
+        if action == "set_nvlink":
+            en = bool(patch["enabled"])
+            self.set_nvlink(en)
+            return f"NVLink set to {'ON' if en else 'OFF'}."
+        if action == "set_devid":
+            raw = patch.get("devid")
+            if raw in (None, "", "keep"):
+                self.set_a100_devid(None)
+                return f"PCIe Device ID reset to keep ({self.card.pci_id})."
+            tid = int(str(raw), 16) if isinstance(raw, str) and not str(raw).lower().startswith("0x") else int(str(raw), 0)
+            self.set_a100_devid(tid)
+            return f"PCIe Device ID set to 10de:{tid:04x} ({BURNABLE_TARGET_DEVICE_IDS[tid]})."
+        if action == "set_sys_pipe":
+            en = bool(patch["enabled"])
+            self.set_sys_pipe_unlock(en)
+            return f"MIG / SYS_PIPE unlock set to {'ON' if en else 'OFF'}."
+        if action == "set_media":
+            which = str(patch["which"])
+            en = bool(patch["enabled"])
+            self.set_media_engine_unlock(which, en)
+            return f"EXPERIMENTAL {which.upper()} unlock set to {'ON' if en else 'OFF'}."
+        raise BurnError(f"unknown configuration action {action!r}")
+
     def summary_line(self) -> str:
         cur_sm = self.card.current_sm_count()
         tgt_sm = self.target_sm_count()
@@ -660,10 +1089,18 @@ class UnlockConfig:
         delta_s = f"+{delta_sm}" if delta_sm > 0 else str(delta_sm)
         cur_fbp = self.card.current_fbp_count()
         tgt_fbp = self.target_fbp_count()
+        tgt_bus = self.card.bus_width_bits(tgt_fbp)
+        tgt_cmp_gb = self.card.est_vram_cmp_gb(tgt_fbp)
+        tgt_a100_gb = self.card.est_vram_a100_gb(tgt_fbp)
         nvl = "ON" if self.nvlink_enabled else "OFF"
+        vram_s = (
+            f"{tgt_a100_gb}GB A100"
+            if (self.a100_devid in A100_TARGET_DEVICE_IDS)
+            else f"{tgt_cmp_gb}GB CMP/{tgt_a100_gb}GB A100"
+        )
         parts = [
-            f"SMs: {cur_sm}->{tgt_sm} ({delta_s}, healthy max {max_sm})",
-            f"FBPs: {cur_fbp}->{tgt_fbp}/{TOTAL_FBP}",
+            f"SMs: {cur_sm}->{tgt_sm} ({delta_s}, {tgt_sm * CUDA_CORES_PER_SM:,} CUDA, max {max_sm})",
+            f"FBPs: {cur_fbp}->{tgt_fbp}/{TOTAL_FBP} ({tgt_bus}b, ~{vram_s})",
             f"PCIe: {self.target_pcie_label()}",
             f"NVLink: {nvl}",
         ]
@@ -966,4 +1403,197 @@ def build_plan_from_config(
             "configured_summary": config.summary_line(),
         },
         source_name="planner",
+    )
+
+
+def _pcie_label_from_blocks(blocks: dict[int, dict[int, int]], fields: dict[str, int]) -> str:
+    gen3_dis = (
+        fields.get("disable_gen3_speed_bit1", 0)
+        | fields.get("disable_gen3_speed_bit9", 0)
+        | fields.get("pcie_boot_gen23_dis", 0)
+        | fields.get("pcie_boot_gen3_dis", 0)
+    )
+    if gen3_dis:
+        return "Gen1/Gen2 (restricted)"
+    b47 = blocks.get(2, {}).get(47, 0)
+    b46 = blocks.get(2, {}).get(46, 0)
+    if (b47 & _PCIE_GEN4_B47_CLEAR) == 0 and (b46 & _PCIE_GEN4_B46_CLEAR) == 0:
+        return "Gen4"
+    return "Gen3"
+
+
+def _pcie_label_from_lnkcap2(val: int | None) -> str:
+    if val is None:
+        return "unknown"
+    speeds = val & 0xFE
+    if speeds & 0x10:
+        return "Gen4"
+    if speeds & 0x08:
+        return "Gen3"
+    return "Gen1/Gen2 (restricted)"
+
+
+def summarize_plan_before_after(plan: Plan) -> BeforeAfterSummary:
+    """Derive a structured Before/After capability summary directly from a loaded ``Plan``."""
+    before_blocks: dict[int, dict[int, int]] | None = None
+    after_blocks: dict[int, dict[int, int]] | None = None
+    before_fields: dict[str, int] | None = None
+    after_fields: dict[str, int] | None = None
+
+    if plan.baseline_ff_rows is not None:
+        before_blocks = replay_ff_rows(plan.baseline_ff_rows)
+        before_fields = decode_all_fields(before_blocks)
+        after_blocks = {c: dict(bm) for c, bm in before_blocks.items()}
+        for rec in plan.records:
+            try:
+                from .ffrecord import decode_ff
+
+                ff = decode_ff(rec.word)
+                after_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
+            except BurnError:
+                pass
+        after_fields = decode_all_fields(after_blocks)
+
+    tpc_keys = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
+    sm_before: int | None = None
+    sm_after: int | None = None
+    gpc_before: int | None = None
+    gpc_after: int | None = None
+    fbp_before: int | None = None
+    fbp_after: int | None = None
+
+    if before_fields is not None and after_fields is not None:
+        sm_before = compute_sm_count(
+            before_fields["gpc_disable"],
+            [before_fields[f"tpc_gpc{g}_disable"] for g in range(TOTAL_GPC)],
+        )
+        sm_after = compute_sm_count(
+            after_fields["gpc_disable"],
+            [after_fields[f"tpc_gpc{g}_disable"] for g in range(TOTAL_GPC)],
+        )
+        gpc_before = TOTAL_GPC - bin(before_fields["gpc_disable"] & 0xFF).count("1")
+        gpc_after = TOTAL_GPC - bin(after_fields["gpc_disable"] & 0xFF).count("1")
+        fbp_before = TOTAL_FBP - bin(before_fields["fbp_disable"] & 0xFFF).count("1")
+        fbp_after = TOTAL_FBP - bin(after_fields["fbp_disable"] & 0xFFF).count("1")
+    else:
+        if "GPC_DISABLE" in plan.expected_masks and all(k in plan.expected_masks for k in tpc_keys):
+            sm_before = compute_sm_count(
+                plan.expected_masks["GPC_DISABLE"], [plan.expected_masks[k] for k in tpc_keys]
+            )
+            gpc_before = TOTAL_GPC - bin(plan.expected_masks["GPC_DISABLE"] & 0xFF).count("1")
+        if "SM_COUNT" in plan.final_expected_cold:
+            sm_after = plan.final_expected_cold["SM_COUNT"]
+        else:
+            decl = [r.resulting_sm_count for r in plan.records if r.resulting_sm_count is not None]
+            sm_after = decl[-1] if decl else sm_before
+        if "GPC_DISABLE" in plan.final_expected_cold:
+            gpc_after = TOTAL_GPC - bin(plan.final_expected_cold["GPC_DISABLE"] & 0xFF).count("1")
+        else:
+            gpc_after = gpc_before
+        if "FBP_DISABLE" in plan.expected_masks:
+            fbp_before = TOTAL_FBP - bin(plan.expected_masks["FBP_DISABLE"] & 0xFFF).count("1")
+        if "FBP_DISABLE" in plan.final_expected_cold:
+            fbp_after = TOTAL_FBP - bin(plan.final_expected_cold["FBP_DISABLE"] & 0xFFF).count("1")
+        else:
+            fbp_after = fbp_before
+
+    sm_max: int | None = None
+    if "GPC_DISABLE" in plan.defect_masks and all(k in plan.defect_masks for k in tpc_keys):
+        sm_max = compute_sm_count(
+            plan.defect_masks["GPC_DISABLE"], [plan.defect_masks[k] for k in tpc_keys]
+        )
+    else:
+        sm_max = plan.base_sm_ceiling
+
+    fbp_max: int | None = None
+    if "FBP_DISABLE" in plan.defect_masks:
+        fbp_max = TOTAL_FBP - bin(plan.defect_masks["FBP_DISABLE"] & 0xFFF).count("1")
+
+    target_devid: int | None = None
+    for rec in plan.records:
+        if rec.kind == "devid":
+            info = decode_a100_devid_ff_word(rec.word)
+            if info is not None:
+                target_devid = info[1]
+    pci_after = f"10de:{target_devid:04x}" if target_devid is not None else plan.pci_id
+    targeting_a100 = (
+        (target_devid in A100_TARGET_DEVICE_IDS)
+        if target_devid is not None
+        else (plan.pci_id in ("10de:20f1", "10de:20b5", "10de:20b0", "10de:20b2"))
+    )
+
+    if before_blocks is not None and before_fields is not None and after_blocks is not None and after_fields is not None:
+        pcie_before = _pcie_label_from_blocks(before_blocks, before_fields)
+        pcie_after = _pcie_label_from_blocks(after_blocks, after_fields)
+    else:
+        pcie_recs = [r for r in plan.records if r.link_cap2_before is not None and r.link_cap2_after is not None]
+        if pcie_recs:
+            pcie_before = _pcie_label_from_lnkcap2(pcie_recs[0].link_cap2_before)
+            pcie_after = _pcie_label_from_lnkcap2(pcie_recs[-1].link_cap2_after)
+        elif "LnkCap2" in plan.final_expected_cold:
+            lbl = _pcie_label_from_lnkcap2(plan.final_expected_cold["LnkCap2"])
+            pcie_before = lbl
+            pcie_after = lbl
+        else:
+            pcie_before = "unchanged"
+            pcie_after = "unchanged"
+
+    nvlink_before = (before_fields["nvlink_disable"] & 0x7) != 0x7 if before_fields else None
+    nvlink_after = (after_fields["nvlink_disable"] & 0x7) != 0x7 if after_fields else None
+    sys_pipe_before = (
+        8 - bin(before_fields["sys_pipe_disable"] & 0xFF).count("1") if before_fields else None
+    )
+    sys_pipe_after = (
+        8 - bin(after_fields["sys_pipe_disable"] & 0xFF).count("1") if after_fields else None
+    )
+    sys_pipe_max = (
+        8 - bin(plan.defect_masks["SYS_PIPE_DISABLE"] & 0xFF).count("1")
+        if "SYS_PIPE_DISABLE" in plan.defect_masks
+        else None
+    )
+    nvdec_before = (before_fields.get("nvdec_disable", 0) == 0) if before_fields else None
+    nvdec_after = (after_fields.get("nvdec_disable", 0) == 0) if after_fields else None
+    nvjpg_before = (
+        (
+            before_fields.get("nvjpg_ofa_disable_bit146", 0) == 0
+            and before_fields.get("nvjpg_ofa_disable_bit371", 0) == 0
+        )
+        if before_fields
+        else None
+    )
+    nvjpg_after = (
+        (
+            after_fields.get("nvjpg_ofa_disable_bit146", 0) == 0
+            and after_fields.get("nvjpg_ofa_disable_bit371", 0) == 0
+        )
+        if after_fields
+        else None
+    )
+
+    return BeforeAfterSummary(
+        pci_id_before=plan.pci_id,
+        pci_id_after=pci_after,
+        sku_before=sku_display_name(plan.pci_id),
+        sku_after=sku_display_name(pci_after),
+        sm_before=sm_before,
+        sm_after=sm_after,
+        sm_max_healthy=sm_max,
+        gpc_before=gpc_before,
+        gpc_after=gpc_after,
+        fbp_before=fbp_before,
+        fbp_after=fbp_after,
+        fbp_max_healthy=fbp_max,
+        a100_gb_per_fbp=a100_gb_per_fbp_for_sku(plan.pci_id) or 4,
+        targeting_a100_vbios=targeting_a100,
+        pcie_before=pcie_before,
+        pcie_after=pcie_after,
+        nvlink_before=nvlink_before,
+        nvlink_after=nvlink_after,
+        sys_pipe_before=sys_pipe_before,
+        sys_pipe_after=sys_pipe_after,
+        sys_pipe_max=sys_pipe_max,
+        nvdec_before=nvdec_before,
+        nvdec_after=nvdec_after,
+        nvjpg_ofa_before=nvjpg_before,
+        nvjpg_ofa_after=nvjpg_after,
     )

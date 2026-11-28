@@ -56,6 +56,9 @@ from .mmio import resolve_register_address
 from .model import BurnError, Plan, Record, is_poison, require_private_file, sku_display_name, u32
 from .planner import UnlockConfig, build_plan_from_config, capture_card_snapshot
 from .sim_pcie import SimulatedGA100Adapter, sim_pcie_from_file
+from .tui import run_tui
+from .web import run_web_server
+from .workflow import DEFAULT_SESSION_PATH, WorkflowController, WorkspaceState
 
 
 def default_prompt_confirm(prompt: str, token: str) -> bool:
@@ -211,6 +214,91 @@ def _print_plan_summary(p: Plan, final_masks: dict[str, int], io: CommandIO) -> 
 # ---------------------------------------------------------------------------
 
 
+def _build_workflow_controller(
+    *,
+    target: TargetSpec | None = None,
+    plan_path: str | None = None,
+    journal_path: str | None = None,
+    receipt_path: str | None = None,
+    confirm_mode: str | None = None,
+    session_path: str | None = DEFAULT_SESSION_PATH,
+    overrides: Overrides | None = None,
+) -> WorkflowController:
+    ctl = WorkflowController(session_path=session_path)
+    if target is not None and target.has_target:
+        ctl.state.bdf = target.bdf
+        ctl.state.fake_path = target.fake
+        ctl.state.sim_pcie_path = target.sim_pcie
+        ctl.state.adapter_spec = target.adapter
+    if plan_path:
+        ctl.state.plan_path = plan_path
+    if journal_path:
+        ctl.state.journal_path = journal_path
+    if receipt_path:
+        ctl.state.receipt_path = receipt_path
+    if confirm_mode:
+        ctl.set_confirm_mode(confirm_mode)
+    if overrides is not None:
+        ctl.overrides = overrides
+    return ctl
+
+
+def execute_web(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    open_browser: bool = False,
+    target: TargetSpec | None = None,
+    plan_path: str | None = None,
+    journal_path: str | None = None,
+    receipt_path: str | None = None,
+    confirm_mode: str | None = None,
+    session_path: str | None = DEFAULT_SESSION_PATH,
+    overrides: Overrides | None = None,
+    io: CommandIO | None = None,
+) -> int:
+    io = io or CommandIO()
+    ctl = _build_workflow_controller(
+        target=target,
+        plan_path=plan_path,
+        journal_path=journal_path,
+        receipt_path=receipt_path,
+        confirm_mode=confirm_mode,
+        session_path=session_path,
+        overrides=overrides,
+    )
+    return run_web_server(
+        ctl,
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        show=io.show,
+    )
+
+
+def execute_tui(
+    *,
+    target: TargetSpec | None = None,
+    plan_path: str | None = None,
+    journal_path: str | None = None,
+    receipt_path: str | None = None,
+    confirm_mode: str | None = None,
+    use_curses: bool = True,
+    session_path: str | None = DEFAULT_SESSION_PATH,
+    overrides: Overrides | None = None,
+) -> int:
+    ctl = _build_workflow_controller(
+        target=target,
+        plan_path=plan_path,
+        journal_path=journal_path,
+        receipt_path=receipt_path,
+        confirm_mode=confirm_mode,
+        session_path=session_path,
+        overrides=overrides,
+    )
+    return run_tui(ctl, use_curses=use_curses)
+
+
 def execute_menu(session: MenuSession | None = None) -> int:
     return BurnMenu(session or MenuSession()).run()
 
@@ -265,6 +353,8 @@ def execute_configure(
     target: TargetSpec,
     out: str,
     unlock_sm_hbm: bool = False,
+    unlock_compute: bool = False,
+    unlock_memory: bool = False,
     pcie_mode: str | None = None,
     nvlink: bool | None = None,
     a100_devid: int | None = None,
@@ -306,6 +396,8 @@ def execute_configure(
 
     non_interactive = (
         unlock_sm_hbm
+        or unlock_compute
+        or unlock_memory
         or (pcie_mode is not None)
         or (nvlink is not None)
         or (a100_devid is not None)
@@ -315,6 +407,10 @@ def execute_configure(
         cfg = UnlockConfig.from_card(card)
         if unlock_sm_hbm:
             cfg.unlock_all_healthy_sm_hbm()
+        if unlock_compute:
+            cfg.unlock_all_healthy_compute()
+        if unlock_memory:
+            cfg.unlock_all_healthy_memory()
         if pcie_mode is not None:
             cfg.set_pcie_mode(pcie_mode)
         if nvlink is not None:
@@ -514,6 +610,7 @@ def execute_burn(
     max_records: int | None = None,
     sense: bool = False,
     execute: bool = False,
+    confirm_mode: str = "row",
     overrides: Overrides | None = None,
     io: CommandIO | None = None,
 ) -> int:
@@ -544,9 +641,10 @@ def execute_burn(
                 overrides=ov,
                 max_records=max_records,
                 dry_run=dry_run,
-                strict_confirm=not dry_run,
+                strict_confirm=(not dry_run) and (confirm_mode == "row"),
                 confirm_active_sense=True,
                 run_active_sense=run_sense,
+                confirm_mode=confirm_mode,
             )
     if dry_run:
         sense_note = (
@@ -571,6 +669,7 @@ def execute_simulate(
     dry_run: bool = False,
     save_fake: str | None = None,
     overwrite: bool = False,
+    confirm_mode: str = "row",
     overrides: Overrides | None = None,
     io: CommandIO | None = None,
 ) -> int:
@@ -598,6 +697,7 @@ def execute_simulate(
                 overrides=ov,
                 max_records=max_records,
                 dry_run=dry_run,
+                confirm_mode=confirm_mode,
             )
         if save_fake and not dry_run:
             _save_sim_snapshot(backend, save_fake, overwrite=overwrite)

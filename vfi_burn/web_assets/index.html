@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vfi_burn — CMP 170HX FF Fuse-Burn Safety Controller</title>
+  <meta name="description" content="Fail-closed GA100 / CMP 170HX Fuseless Fuse burn controller, unlock planner, Goldilocks monitor, and cold-boot verifier." />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="caution-strip">
+    <span><strong>WARNING: UNTESTED ON PHYSICAL HARDWARE — VERIFY EVERYTHING BY HAND.</strong> OTP fuse burns are physically irreversible.</span>
+    <span id="top-journal-meta" class="mono"></span>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <h1>vfi_burn</h1>
+      <span class="subtitle">CMP 170HX (8 GB / 10 GB) FF Fuse Controller</span>
+    </div>
+    <div class="status-strip">
+      <span class="chip" id="chip-target">Target: <strong>not selected</strong></span>
+      <span class="chip" id="chip-health">Card: <strong>--</strong></span>
+      <span class="chip" id="chip-plan">Plan: <strong>none</strong></span>
+      <button class="btn btn-sm" id="btn-arm-toggle" title="Toggle Live Execute mode">Mode: Read-Only</button>
+    </div>
+  </header>
+
+  <section class="advisor-bar" aria-label="Recommended next step">
+    <div class="advisor-text">
+      <div class="advisor-headline" id="advisor-headline">Loading workspace...</div>
+      <div class="advisor-detail" id="advisor-detail"></div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btn-advisor-go">Go to Next Step</button>
+  </section>
+
+  <nav class="stepper" role="tablist" aria-label="Burn workflow steps">
+    <button class="step-tab active" data-step="target" role="tab"><span class="step-dot"></span>1. Target &amp; Host</button>
+    <button class="step-tab" data-step="configure" role="tab"><span class="step-dot"></span>2. Configure &amp; Plan</button>
+    <button class="step-tab" data-step="preflight" role="tab"><span class="step-dot"></span>3. Glitch Watch &amp; Preflight</button>
+    <button class="step-tab" data-step="burn" role="tab"><span class="step-dot"></span>4. Burn Plan</button>
+    <button class="step-tab" data-step="cold_verify" role="tab"><span class="step-dot"></span>5. Cold-Boot Verify</button>
+    <button class="step-tab" data-step="tools" role="tab"><span class="step-dot"></span>Tools &amp; Overrides</button>
+  </nav>
+
+  <main class="main-wrap">
+    <!-- ============================================================ STEP 1: TARGET -->
+    <section class="step-view active" id="view-target">
+      <div class="step-help" id="help-target"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Detected PCI GPUs</h2>
+            <p class="panel-sub">Read-only sysfs scan with safe BAR0 shadow probe for detached CMP 170HX cards.</p>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-sm" id="btn-refresh-gpus">Rescan PCI Bus</button>
+            <button class="btn btn-sm" id="btn-detach-driver" disabled>Unload nvidia/nouveau &amp; Bind pci-stub</button>
+          </div>
+        </div>
+        <div id="driver-blocker-banner" style="margin-bottom: 12px; display: none;"></div>
+        <div style="overflow-x: auto;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>BDF</th>
+                <th>PCI ID / Card</th>
+                <th>Driver</th>
+                <th>Link</th>
+                <th>SMs / CUDA</th>
+                <th>FBPs / Bus / Est. RAM</th>
+                <th>State</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="gpu-table-body">
+              <tr><td colspan="8" style="color: var(--text-muted);">Scanning PCI bus...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="detach-log-wrap" style="margin-top: 12px; display: none;">
+          <div class="log-box" id="detach-log"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Offline Simulation &amp; Workspace Paths</h2>
+            <p class="panel-sub">Rehearse the full workflow on a mode-0600 snapshot without touching physical hardware.</p>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-sm" id="btn-pick-sim-pcie">Browse Sim-PCIe Snapshot...</button>
+            <button class="btn btn-sm" id="btn-pick-fake">Browse Fake Snapshot...</button>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px;">
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-secondary); margin-bottom:4px;">Audit Journal Path (mode 0600 JSONL)</label>
+            <div class="btn-group">
+              <input type="text" id="inp-journal-path" class="mono" style="flex:1;" />
+              <button class="btn btn-sm" id="btn-save-journal">Set</button>
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-secondary); margin-bottom:4px;">Cold-Verified Test Receipt (auto-attached in Step 5)</label>
+            <div class="btn-group">
+              <input type="text" id="inp-receipt-path" class="mono" style="flex:1;" placeholder="none" readonly />
+              <button class="btn btn-sm" id="btn-pick-receipt">Browse...</button>
+              <button class="btn btn-sm" id="btn-clear-receipt">Clear</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ STEP 2: CONFIGURE & PLAN -->
+    <section class="step-view" id="view-configure">
+      <div class="step-help" id="help-configure"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Before / After Capability Summary</h2>
+            <p class="panel-sub" id="cfg-card-subtitle">Read the selected card read-only to configure unlocks, or load a saved plan JSON.</p>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" id="btn-read-card-cfg">Read Card &amp; Configure</button>
+            <button class="btn btn-sm" id="btn-open-plan">Open Existing Plan...</button>
+          </div>
+        </div>
+        <div class="ba-grid" id="cfg-ba-grid">
+          <div class="ba-card"><div class="ba-label">CUDA Cores / SMs</div><div class="ba-value">--</div><div class="ba-sub">Read card or open a plan</div></div>
+          <div class="ba-card"><div class="ba-label">Est. VRAM</div><div class="ba-value">--</div><div class="ba-sub">1 GB/FBP (CMP) · 4/8 GB/FBP (A100)</div></div>
+          <div class="ba-card"><div class="ba-label">Memory Bus Width</div><div class="ba-value">--</div><div class="ba-sub">512-bit per FBP</div></div>
+          <div class="ba-card"><div class="ba-label">PCIe Version</div><div class="ba-value">--</div><div class="ba-sub">Gen1/2 · Gen3 · Gen4</div></div>
+          <div class="ba-card"><div class="ba-label">Features &amp; Identity</div><div class="ba-value">--</div><div class="ba-sub">NVLink · MIG · Media · DevID</div></div>
+        </div>
+      </div>
+
+      <div id="cfg-editor-wrap" style="display:none; flex-direction:column; gap:18px;">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Quick Enable-All Switches (Independent Compute &amp; Memory)</h2>
+              <p class="panel-sub">Toggle all healthy Compute or all healthy Memory independently, then fine-tune individual units below.</p>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-sm" id="btn-cfg-reset-all">Reset All to Card</button>
+            </div>
+          </div>
+          <div class="quick-toggles">
+            <div class="toggle-tile" id="tile-all-compute">
+              <div>
+                <div style="font-weight:600;">Unlock ALL Healthy Compute</div>
+                <div style="font-size:12px; color:var(--text-secondary);" id="tile-all-compute-sub">All non-defective GPC / TPC / PES</div>
+              </div>
+              <span class="toggle-check" id="chk-all-compute"></span>
+            </div>
+            <div class="toggle-tile" id="tile-all-memory">
+              <div>
+                <div style="font-weight:600;">Unlock ALL Healthy Memory / HBM</div>
+                <div style="font-size:12px; color:var(--text-secondary);" id="tile-all-memory-sub">All non-defective FBP / FBPA / FBIO / ROP_L2</div>
+              </div>
+              <span class="toggle-check" id="chk-all-memory"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="silicon-split">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Compute Silicon Map (8 GPCs × 8 TPCs)</h2>
+                <p class="panel-sub">Click a GPC header to toggle the whole GPC, or click any TPC tile (2 SMs / 128 CUDA cores each).</p>
+              </div>
+              <button class="btn btn-sm" id="btn-reset-compute">Reset Compute</button>
+            </div>
+            <div class="gpc-grid" id="gpc-grid"></div>
+            <div class="legend-row">
+              <span><span class="legend-swatch" style="background:rgba(16,185,129,0.45);"></span>Currently ON</span>
+              <span><span class="legend-swatch" style="background:rgba(59,130,246,0.65);"></span>Will Unlock</span>
+              <span><span class="legend-swatch" style="background:rgba(245,158,11,0.5);"></span>Will Lock</span>
+              <span><span class="legend-swatch" style="background:#0d1014; border:1px solid #394659;"></span>Disabled</span>
+              <span><span class="legend-swatch" style="background:#4a2025;"></span>Defective (Hard-Locked)</span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Memory / HBM2e Map (6 Stacks · 12 FBPs)</h2>
+                <p class="panel-sub" id="hbm-map-sub">Click any healthy FBP to toggle (+512-bit bus).</p>
+              </div>
+              <button class="btn btn-sm" id="btn-reset-memory">Reset Memory</button>
+            </div>
+            <div class="hbm-grid" id="hbm-grid"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">PCIe, Device ID &amp; Additional Features</h2>
+              <p class="panel-sub">Coherence rules and defect-mask hard refusals are enforced live.</p>
+            </div>
+          </div>
+          <div class="options-grid">
+            <div>
+              <div style="font-weight:600; font-size:13px; margin-bottom:8px;">PCIe Link Speed</div>
+              <div class="radio-stack" id="pcie-radio-stack"></div>
+            </div>
+            <div>
+              <div style="font-weight:600; font-size:13px; margin-bottom:8px;">PCIe Device ID (DEVIDA + DEVIDB)</div>
+              <div class="radio-stack" id="devid-radio-stack"></div>
+            </div>
+            <div>
+              <div style="font-weight:600; font-size:13px; margin-bottom:8px;">Subsystem Features</div>
+              <div class="radio-stack" id="features-stack"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Derived FF Records Preview &amp; Save Plan</h2>
+              <p class="panel-sub" id="cfg-ff-summary">No changes selected yet.</p>
+            </div>
+            <div class="btn-group">
+              <input type="text" id="inp-save-plan-path" class="mono" style="width:260px;" placeholder="private/plan.json" />
+              <button class="btn btn-primary btn-sm" id="btn-save-plan">Save Mode-0600 Plan</button>
+            </div>
+          </div>
+          <div id="cfg-coherence-box" style="margin-bottom:10px;"></div>
+          <div style="overflow-x:auto;">
+            <table class="data-table">
+              <thead>
+                <tr><th>Row</th><th>Word</th><th>Chain/Block</th><th>Before → After</th><th>Fields</th><th>Notes</th></tr>
+              </thead>
+              <tbody id="cfg-ff-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="loaded-plan-review-panel" style="display:none;">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Active Loaded Plan Review</h2>
+            <p class="panel-sub mono" id="loaded-plan-meta"></p>
+          </div>
+          <button class="btn btn-sm" id="btn-refresh-plan-review">Refresh Review</button>
+        </div>
+        <div class="log-box" id="loaded-plan-review-log"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ STEP 3: PREFLIGHT & GLITCH WATCH -->
+    <section class="step-view" id="view-preflight">
+      <div class="step-help" id="help-preflight"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Live Fuse-Controller Health &amp; Goldilocks Watch</h2>
+            <p class="panel-sub">Strictly read-only BAR0 reads. Stops automatically on any 0xBADxxxxx poison.</p>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-primary btn-sm" id="btn-toggle-watch">Start Live Watch (1.5s)</button>
+            <button class="btn btn-sm" id="btn-read-status-once">Read Status Now</button>
+            <button class="btn btn-sm" id="btn-run-dry-run">Run Passive Dry-Run</button>
+            <button class="btn btn-sm" id="btn-run-sense">Run Active Sense (SENSE_CTRL)</button>
+          </div>
+        </div>
+        <div id="preflight-banner" style="margin-bottom:12px;"></div>
+        <div class="reg-grid" id="preflight-regs"></div>
+        <div id="preflight-issues" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="panel" id="preflight-output-panel" style="display:none;">
+        <div class="panel-header">
+          <h2 class="panel-title" id="preflight-output-title">Inspection / Dry-Run Output</h2>
+        </div>
+        <div class="log-box" id="preflight-output-log"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ STEP 4: BURN PLAN -->
+    <section class="step-view" id="view-burn">
+      <div class="step-help" id="help-burn"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Burn Plan Controls</h2>
+            <p class="panel-sub" id="burn-card-state">Load a plan and target to inspect burn groups.</p>
+          </div>
+          <div class="btn-group">
+            <label style="font-size:12px; color:var(--text-secondary);">Confirm Cadence:</label>
+            <select id="sel-confirm-mode">
+              <option value="group">Group-by-Group (Recommended)</option>
+              <option value="plan">Plan Batch (1 test + 1 plan confirm)</option>
+              <option value="row">Row-by-Row (Legacy strict)</option>
+            </select>
+            <button class="btn btn-sm" id="btn-refresh-burn">Refresh</button>
+            <button class="btn btn-danger btn-sm" id="btn-start-burn">Start Burn Session</button>
+            <button class="btn btn-sm" id="btn-abort-burn" style="display:none;">Abort Pending</button>
+          </div>
+        </div>
+        <div id="burn-ba-strip" class="ba-grid" style="margin-bottom:14px;"></div>
+        <div id="burn-receipt-warn" style="margin-bottom:12px; display:none;"></div>
+        <div style="overflow-x:auto;">
+          <table class="data-table">
+            <thead>
+              <tr><th>Group</th><th>Row</th><th>Target</th><th>Word</th><th>Decoded Description</th><th>Status</th></tr>
+            </thead>
+            <tbody id="burn-records-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">Live Burn Session Log</h2>
+        </div>
+        <div class="log-box" id="burn-log">No active burn session.</div>
+      </div>
+    </section>
+
+    <!-- ============================================================ STEP 5: COLD VERIFY -->
+    <section class="step-view" id="view-cold_verify">
+      <div class="step-help" id="help-cold_verify"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">One-Step Cold-Boot Verification</h2>
+            <p class="panel-sub">Checks boot_id + controller reset state, captures snapshot, verifies shadows &amp; FF rows, and auto-attaches test receipt.</p>
+          </div>
+          <div class="btn-group">
+            <select id="sel-cold-stage">
+              <option value="">Auto-detect stage</option>
+              <option value="test">Test stage (no-op row + receipt)</option>
+              <option value="real">Real stage (full plan)</option>
+            </select>
+            <button class="btn btn-sm" id="btn-cold-preflight">Check Readiness</button>
+            <button class="btn btn-ok btn-sm" id="btn-cold-verify-live">Capture &amp; Verify Cold Boot</button>
+            <button class="btn btn-sm" id="btn-cold-verify-file">Verify Existing Snapshot...</button>
+          </div>
+        </div>
+        <div id="cold-preflight-box" style="margin-bottom:12px;"></div>
+        <div id="cold-result-banner" style="margin-bottom:12px; display:none;"></div>
+        <div id="cold-diff-wrap" style="display:none; overflow-x:auto;">
+          <table class="data-table">
+            <thead>
+              <tr><th>Field</th><th>Expected</th><th>Observed</th><th>Result</th></tr>
+            </thead>
+            <tbody id="cold-diff-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ TOOLS & OVERRIDES -->
+    <section class="step-view" id="view-tools">
+      <div class="step-help" id="help-tools"></div>
+
+      <div class="options-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">32-Bit FF Word Decoder (Offline)</h2>
+          </div>
+          <div class="btn-group" style="margin-bottom:10px;">
+            <input type="text" id="inp-decode-word" class="mono" placeholder="e.g. 0x0fe805c1" style="flex:1;" />
+            <button class="btn btn-primary btn-sm" id="btn-decode-word">Decode</button>
+          </div>
+          <div class="log-box" id="decode-output" style="max-height:180px;">Enter any 32-bit FF word to inspect chain, block, data, and overlapping option fields.</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Granular Manual Overrides</h2>
+              <p class="panel-sub">All OFF by default. Hard brick-prevention invariants are never overrideable.</p>
+            </div>
+            <button class="btn btn-sm" id="btn-reset-overrides">Reset All OFF</button>
+          </div>
+          <div id="overrides-list" style="display:flex; flex-direction:column; gap:6px; font-size:12.5px;"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Read-Only Register, FF Rows &amp; Experimental Inspector</h2>
+          </div>
+          <div class="btn-group">
+            <input type="text" id="inp-reg-target" class="mono" placeholder="FUSECTRL or 0x820000" style="width:180px;" />
+            <button class="btn btn-sm" id="btn-read-reg">Read Reg</button>
+            <input type="number" id="inp-row-start" value="222" min="0" max="511" style="width:78px;" />
+            <input type="number" id="inp-row-end" value="260" min="0" max="511" style="width:78px;" />
+            <button class="btn btn-sm" id="btn-read-rows">Read Rows</button>
+            <button class="btn btn-sm" id="btn-read-exp">Experimental Regs</button>
+          </div>
+        </div>
+        <div class="log-box" id="tools-inspect-log">Select an inspection action above.</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">Audit Journal Viewer</h2>
+          <button class="btn btn-sm" id="btn-refresh-journal">Refresh Journal</button>
+        </div>
+        <div class="log-box" id="journal-log">Click Refresh Journal to inspect recent events.</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============================================================ FILE BROWSER MODAL -->
+  <div class="modal-backdrop" id="modal-files">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="file-modal-title">Select File</h2>
+        <button class="btn btn-sm" id="btn-close-file-modal">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="btn-group" style="margin-bottom:10px; justify-content:space-between;">
+          <div class="mono" id="file-current-dir" style="font-size:12px; color:var(--text-secondary);"></div>
+          <div class="btn-group">
+            <select id="sel-file-filter">
+              <option value="all">All files</option>
+              <option value="plan">Plans</option>
+              <option value="cold_snapshot">Cold Snapshots</option>
+              <option value="test_receipt">Test Receipts</option>
+              <option value="fake_snapshot">Sim Snapshots</option>
+            </select>
+            <button class="btn btn-sm" id="btn-files-private">private/</button>
+            <button class="btn btn-sm" id="btn-files-cwd">Workspace</button>
+          </div>
+        </div>
+        <div class="file-browser-split">
+          <div class="file-list" id="file-list"></div>
+          <div class="file-preview" id="file-preview">
+            <div style="color:var(--text-muted);">Select a file on the left to inspect its metadata, permissions, and card match.</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-sm" id="btn-file-chmod" style="display:none; margin-right:auto;">Fix Permissions (chmod 600)</button>
+        <button class="btn btn-sm" id="btn-cancel-file-modal">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="btn-confirm-file-modal" disabled>Open Selected</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ CONFIRMATION MODAL -->
+  <div class="modal-backdrop" id="modal-confirm">
+    <div class="modal narrow">
+      <div class="modal-header">
+        <h2 id="confirm-modal-title">Confirmation Required</h2>
+      </div>
+      <div class="modal-body" style="display:flex; flex-direction:column; gap:12px;">
+        <div class="alert warn" id="confirm-modal-prompt"></div>
+        <div>
+          <label style="display:block; font-size:12px; color:var(--text-secondary); margin-bottom:4px;">
+            Type exact phrase: <strong class="mono" id="confirm-modal-expected" style="color:var(--text-primary);"></strong>
+          </label>
+          <input type="text" id="inp-confirm-phrase" class="mono" style="width:100%;" autocomplete="off" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-sm" id="btn-confirm-cancel">Cancel / Stop</button>
+        <button class="btn btn-danger btn-sm" id="btn-confirm-submit" disabled>Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

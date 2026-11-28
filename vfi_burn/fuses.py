@@ -20,11 +20,31 @@ from .model import is_poison
 TOTAL_GPC = 8
 TPC_PER_GPC = 8
 SM_PER_TPC = 2
+CUDA_CORES_PER_SM = 64
 PES_PER_GPC = 3
 TOTAL_FBP = 12
+BUS_BITS_PER_FBP = 512  # 2 x 256-bit FBPA HBM2e channels per FBP
+CMP_VBIOS_GB_PER_FBP = 1  # Stock CMP 170HX VBIOS exposes a 512 MiB window per FBPA (1 GB/FBP)
 TOTAL_FUSE_ROWS = 512
 DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
 FF_EMPTY_WORD = 0x00000000
+
+# Physical HBM2e capacity per FBP when unlocked under an A100 VBIOS:
+#   - 10de:20c2 (CMP 170HX 8 GB) & A100 80 GB carry 16 Gb (2 GiB) dies -> 8 GB/FBP (10 FBPs = 80 GB)
+#   - 10de:2082 (CMP 170HX 10 GB) & A100 40 GB carry 8 Gb (1 GiB) dies -> 4 GB/FBP (10 FBPs = 40 GB)
+A100_GB_PER_FBP_BY_SKU: dict[str, int] = {
+    "10de:20c2": 8,
+    "10de:20b5": 8,
+    "10de:20b2": 8,
+    "10de:2082": 4,
+    "10de:20f1": 4,
+    "10de:20b0": 4,
+}
+
+
+def a100_gb_per_fbp_for_sku(pci_id: str) -> int | None:
+    """Return physical HBM2e GB per FBP under an A100 VBIOS for a known GA100/CMP 170HX PCI ID."""
+    return A100_GB_PER_FBP_BY_SKU.get(str(pci_id).strip().lower())
 
 # Chain 2 blocks 37 and 38 carry PCIe device-ID fuses (DEVIDA/DEVIDB); denied by default
 # unless explicitly validated as an intentional A100 identity conversion (requires A100 VBIOS

@@ -1202,6 +1202,198 @@ def _has_split_poweroff_domains(
     return bool(committed_domains & remaining_domains)
 
 
+CONFIRM_MODES = ("row", "group", "plan")
+
+
+@dataclass(frozen=True)
+class ApprovalGroup:
+    """One consecutive functional approval group of planned FF records."""
+
+    key: str
+    title: str
+    token: str
+    start_index: int
+    end_index: int  # exclusive index into pending
+    start_row: int
+    records: tuple[Record, ...]
+    touches_pcie: bool = False
+    is_devid: bool = False
+    devid_target: int | None = None
+    has_media_change: bool = False
+    is_debugctrl: bool = False
+    is_reconfig: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "title": self.title,
+            "token": self.token,
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "start_row": self.start_row,
+            "end_row": self.start_row + len(self.records) - 1,
+            "count": len(self.records),
+            "touches_pcie": self.touches_pcie,
+            "is_devid": self.is_devid,
+            "devid_target": f"0x{self.devid_target:04x}" if self.devid_target is not None else None,
+            "has_media_change": self.has_media_change,
+            "records": [
+                {
+                    "index": self.start_index + i,
+                    "row": self.start_row + i,
+                    "name": r.name,
+                    "kind": r.kind,
+                    "target": r.target,
+                    "word": hex32(r.word),
+                    "decode": r.decode,
+                    "defect_sensitive": r.defect_sensitive,
+                }
+                for i, r in enumerate(self.records)
+            ],
+        }
+
+
+def build_approval_groups(
+    pending: list[Record],
+    start_row: int,
+    baseline_blocks: dict[int, dict[int, int]] | None = None,
+    *,
+    is_live: bool = False,
+) -> list[ApprovalGroup]:
+    """Partition ``pending`` into consecutive atomic approval groups for group-mode burning."""
+    walk = {c: dict(b) for c, b in baseline_blocks.items()} if baseline_blocks is not None else None
+    per_rec: list[dict] = []
+    for idx, rec in enumerate(pending):
+        old_b: int | None = None
+        if walk is not None:
+            try:
+                ff = decode_ff(rec.word)
+                old_b = walk.get(ff.chain, {}).get(ff.block)
+            except BurnError:
+                old_b = None
+        touches_pcie = (rec.kind == "pcie") or ff_word_touches_pcie(rec.word, old_b)
+        groups = classify_ff_functional_groups(rec.word, old_b)
+        eng_chg = ff_word_media_engine_change(rec.word, old_b)
+        has_media = eng_chg == "changed" or (eng_chg == "unknown" and is_live)
+        devid_info = decode_a100_devid_ff_word(rec.word) if rec.kind == "devid" else None
+        is_dbg = is_debugctrl_target(rec.target)
+        is_reconf = rec.kind == "reconfig"
+
+        if is_dbg:
+            gkey = f"debugctrl:{idx}"
+        elif is_reconf:
+            gkey = f"reconfig:{idx}"
+        elif rec.kind == "test":
+            gkey = "test"
+        elif rec.kind == "devid":
+            gkey = "devid"
+        elif touches_pcie:
+            gkey = "pcie"
+        elif groups and groups <= {"compute", "memory", "media"}:
+            # Floorsweep compute/memory records stay in one clean group (any shared media
+            # block still triggers the once-per-session experimental media warning).
+            gkey = "compute_memory"
+        elif groups and groups <= {"nvlink", "sys_pipe", "media"}:
+            gkey = "features"
+        else:
+            gkey = "other"
+
+        per_rec.append({
+            "idx": idx,
+            "rec": rec,
+            "gkey": gkey,
+            "groups": groups,
+            "touches_pcie": touches_pcie,
+            "has_media": has_media,
+            "devid_target": devid_info[1] if devid_info is not None else None,
+            "is_dbg": is_dbg,
+            "is_reconf": is_reconf,
+        })
+        if walk is not None:
+            try:
+                ff = decode_ff(rec.word)
+                walk.setdefault(ff.chain, {})[ff.block] = ff.data
+            except BurnError:
+                pass
+
+    out: list[ApprovalGroup] = []
+    i = 0
+    while i < len(per_rec):
+        gkey = per_rec[i]["gkey"]
+        j = i + 1
+        while j < len(per_rec) and per_rec[j]["gkey"] == gkey:
+            j += 1
+        chunk = per_rec[i:j]
+        recs = tuple(c["rec"] for c in chunk)
+        all_groups = set().union(*(c["groups"] for c in chunk))
+        touches_pcie = any(c["touches_pcie"] for c in chunk)
+        has_media = any(c["has_media"] for c in chunk)
+        is_devid = gkey == "devid"
+        dev_targets = [c["devid_target"] for c in chunk if c["devid_target"] is not None]
+        dev_target = dev_targets[0] if dev_targets else None
+        is_dbg = any(c["is_dbg"] for c in chunk)
+        is_reconf = any(c["is_reconf"] for c in chunk)
+
+        if gkey == "test":
+            title, token = "No-Op Test Row", "BURN TEST"
+        elif is_dbg:
+            title, token = "DEBUGCTRL (Manual)", "CONFIRM DEBUGCTRL"
+        elif is_reconf:
+            title, token = "RECONFIG Record", "REVIEW RECONFIG"
+        elif is_devid and dev_target is not None:
+            if dev_target in A100_TARGET_DEVICE_IDS:
+                title = f"A100 PCIe Device ID (0x{dev_target:04X})"
+                token = f"CONFIRM A100 DEVID 0x{dev_target:04X}"
+            else:
+                title = f"CMP 170HX PCIe Device ID Revert (0x{dev_target:04X})"
+                token = f"CONFIRM CMP DEVID 0x{dev_target:04X}"
+        elif gkey == "pcie":
+            title, token = "PCIe Link Speed", "BURN PCIE"
+        elif gkey == "compute_memory":
+            has_c = "compute" in all_groups
+            has_m = "memory" in all_groups
+            if has_c and has_m:
+                title, token = "Compute & Memory Floorsweep", "BURN COMPUTE+MEM"
+            elif has_c:
+                title, token = "Compute Floorsweep (GPC/TPC/PES)", "BURN COMPUTE"
+            elif has_m:
+                title, token = "Memory / HBM Floorsweep (FBP)", "BURN MEMORY"
+            else:
+                title, token = "Floorsweep / Media Records", "BURN GROUP"
+        elif gkey == "features":
+            parts = []
+            if "nvlink" in all_groups:
+                parts.append("NVLink")
+            if "sys_pipe" in all_groups:
+                parts.append("MIG/SYS_PIPE")
+            if "media" in all_groups:
+                parts.append("Media")
+            title = " + ".join(parts) or "Features"
+            token = "BURN FEATURES"
+        else:
+            title, token = "Additional FF Records", "BURN GROUP"
+
+        out.append(
+            ApprovalGroup(
+                key=gkey,
+                title=title,
+                token=token,
+                start_index=i,
+                end_index=j,
+                start_row=start_row + i,
+                records=recs,
+                touches_pcie=touches_pcie,
+                is_devid=is_devid,
+                devid_target=dev_target,
+                has_media_change=has_media,
+                is_debugctrl=is_dbg,
+                is_reconfig=is_reconf,
+            )
+        )
+        i = j
+    return out
+
+
 def process_records(
     plan: Plan,
     reader,
@@ -1221,16 +1413,33 @@ def process_records(
     run_active_sense: bool | None = None,
     manual_record_sha256: str | None = None,
     is_manual_single: bool = False,
+    confirm_mode: str = "row",
+    on_event: Callable[[dict], None] | None = None,
 ) -> int:
     """Execute one controlled burn (or simulation/dry-run) session.
 
     Never catches a failed write and continues. Pointer advances ONLY after
     mandatory read-back AND full post-write health/host gate pass.
+
+    ``confirm_mode`` controls human approval granularity (machine-side per-row
+    safety checks, read-back, and halt-on-error ALWAYS run on every record):
+      - ``"row"``  : per-record confirmation (legacy / strict CLI mode)
+      - ``"group"``: one confirmation per atomic functional group (recommended default)
+      - ``"plan"`` : one confirmation for the test row + one for all remaining rows
     """
     if stage not in ("test", "real", "all"):
         raise BurnError("stage must be 'test', 'real', or 'all'")
+    if confirm_mode not in CONFIRM_MODES:
+        raise BurnError(f"confirm_mode must be one of {', '.join(CONFIRM_MODES)}")
     if max_records is not None and (isinstance(max_records, bool) or max_records < 1):
         raise BurnError("max_records must be a positive integer")
+
+    def _emit(event_type: str, **payload) -> None:
+        if on_event is not None:
+            try:
+                on_event({"type": event_type, **payload})
+            except Exception:
+                pass
 
     ov = overrides or Overrides()
     is_live = not getattr(reader, "simulation", False)
@@ -1716,6 +1925,98 @@ def process_records(
         else initial_live_blocks
     )
 
+    approval_groups = build_approval_groups(
+        pending, pointer, working_blocks, is_live=is_live
+    )
+    group_by_idx: dict[int, ApprovalGroup] = {
+        i: g for g in approval_groups for i in range(g.start_index, g.end_index)
+    }
+    media_confirmed = False
+    devid_confirmed: set[int] = set()
+    plan_confirmed_token: str | None = None
+    group_confirmed_tokens: dict[int, str] = {}
+
+    _emit(
+        "session_start",
+        stage=stage,
+        confirm_mode=confirm_mode,
+        start_row=pointer,
+        total_pending=len(pending),
+        groups=[g.to_dict() for g in approval_groups],
+    )
+
+    def _handle_decline(idx_: int, row_: int, rec_: Record, reason_: str | None, err_msg: str) -> None:
+        journal.append(
+            event="declined",
+            row=row_,
+            record=rec_.name,
+            **({"reason": reason_} if reason_ else {}),
+        )
+        if written_records:
+            sanity_d = _run_poweroff_sanity(
+                plan, verified_rows, journal, show,
+                committed_records=already_committed + written_records,
+                remaining_records=pending[idx_:] + deferred_by_max + tail_after_stage,
+                baseline_blocks=sanity_baseline,
+                reason="operator_declined",
+            )
+            if sanity_d is not None:
+                _emit("poweroff_sanity", reason="operator_declined", sanity=sanity_d)
+        _emit("session_declined", row=row_, record=rec_.name, reason=reason_ or "declined")
+        raise BurnError(err_msg)
+
+    def _show_devid_banner(target_dev: int, which_label: str) -> tuple[str, str, str]:
+        dev_desc = BURNABLE_TARGET_DEVICE_IDS[target_dev]
+        is_a100_target = target_dev in A100_TARGET_DEVICE_IDS
+        if is_a100_target:
+            tok = f"CONFIRM A100 DEVID 0x{target_dev:04X}"
+            show("\n" + "!" * 76)
+            show(f"!!! CRITICAL WARNING — PERMANENT A100 PCIe DEVICE ID CONVERSION ({which_label})")
+            show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
+            show("!!!")
+            show("!!! 1. VBIOS REQUIRED AFTER COLD BOOT:")
+            show("!!!    Once fused, this card WILL NOT POST on its stock CMP 170HX VBIOS.")
+            show("!!!    Back up your stock CMP ROM (nvflash --save) BEFORE burning, and")
+            show("!!!    flash the matching A100 VBIOS immediately after cold power cycle.")
+            show("!!!")
+            show("!!! 2. 128 GB 64-BIT BAR1 MMIO WINDOW REQUIRED:")
+            show("!!!    Motherboard BIOS MUST have Above 4G Decoding ON, CSM OFF,")
+            show("!!!    Re-Size BAR ON, and MMIO High Size >= 128 GB. If POST fails,")
+            show("!!!    there is NO in-band recovery — you will need a CH341A SPI clip.")
+            show("!!!")
+            show("!!! 3. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
+            show("!" * 76)
+            return (
+                tok,
+                f"Type '{tok}' to confirm A100 VBIOS + 128 GB BAR1 readiness: ",
+                "A100 Device ID conversion not confirmed",
+            )
+        tok = f"CONFIRM CMP DEVID 0x{target_dev:04X}"
+        show("\n" + "!" * 76)
+        show(f"!!! WARNING — PERMANENT PCIe DEVICE ID REVERT TO CMP 170HX ({which_label})")
+        show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
+        show("!!!")
+        show("!!! 1. MATCHING CMP 170HX VBIOS REQUIRED AFTER COLD BOOT:")
+        show("!!!    If this card currently has an A100 VBIOS flashed, it WILL NOT POST")
+        show("!!!    on that A100 ROM once fused back to CMP 170HX — flash your backed-up")
+        show("!!!    CMP 170HX VBIOS (matching 8 GB / 10 GB) right after cold power cycle.")
+        show("!!!")
+        show("!!! 2. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
+        show("!" * 76)
+        return (
+            tok,
+            f"Type '{tok}' to confirm CMP 170HX VBIOS readiness: ",
+            "CMP 170HX Device ID revert not confirmed",
+        )
+
+    def _show_media_banner() -> None:
+        show("\n" + "!" * 76)
+        show("!!! EXPERIMENTAL — PERMANENT MEDIA ENGINE UNLOCK (NVDEC / NVJPG / OFA)")
+        show("!!! There is NO defect register for these engines: vfi_burn cannot prove the")
+        show("!!! units exist on this die. After cold boot STATUS_OPT_* should read 0; a unit")
+        show("!!! that stays non-zero is physically absent. Do NOT re-burn it.")
+        show("!" * 76)
+
     for idx, record in enumerate(pending):
         rec_old_block: int | None = None
         if working_blocks is not None:
@@ -1726,6 +2027,7 @@ def process_records(
                 rec_old_block = None
         rec_touches_pcie = (record.kind == "pcie") or ff_word_touches_pcie(record.word, rec_old_block)
         rec_groups = classify_ff_functional_groups(record.word, rec_old_block)
+        cur_group = group_by_idx[idx]
 
         reconcile(
             plan,
@@ -1767,6 +2069,7 @@ def process_records(
                     host=host_snap,
                     error=str(exc),
                 )
+                _emit("record_halted", index=idx, row=pointer, record=record.name, error=str(exc))
                 raise
 
         prev_domains = poweroff_domains_for_groups(prev_groups) if prev_groups is not None else set()
@@ -1808,23 +2111,7 @@ def process_records(
             f"current={hex32(previous)}"
         )
 
-        if is_debugctrl_target(record.target):
-            if not effective_debugctrl:
-                raise BurnError("DEBUGCTRL must never be included in an automatic plan")
-            for token in ("REVIEW DEBUGCTRL", "CONFIRM DEBUGCTRL"):
-                show("WARNING: DEBUGCTRL (0x00820060) is a sensitive controller register.")
-                if not _confirm_token(confirm, f"Type '{token}' separately: ", token):
-                    journal.append(event="declined", row=pointer, record=record.name, reason=token)
-                    if written_records:
-                        _run_poweroff_sanity(
-                            plan, verified_rows, journal, show,
-                            committed_records=already_committed + written_records,
-                            remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
-                            baseline_blocks=sanity_baseline,
-                            reason="operator_declined",
-                        )
-                    raise BurnError("DEBUGCTRL separately confirmed manual action declined")
-
+        # Machine-side LnkCap2 verification always runs on every PCIe record before programming.
         if rec_touches_pcie:
             observed_link = reader.field("LnkCap2")
             _poison("LnkCap2", observed_link)
@@ -1838,122 +2125,195 @@ def process_records(
                     f"before state ({hex32(record.link_cap2_before)})"
                 )
 
-        if record.kind == "devid":
-            devid_info = decode_a100_devid_ff_word(record.word)
-            if devid_info is None:
-                raise BurnError(
-                    f"{record.name}: REFUSED; invalid PCIe DEVID record word {hex32(record.word)}"
+        # DEBUGCTRL and RECONFIG are ALWAYS individually confirmed regardless of confirm_mode.
+        if is_debugctrl_target(record.target):
+            if not effective_debugctrl:
+                raise BurnError("DEBUGCTRL must never be included in an automatic plan")
+            for token in ("REVIEW DEBUGCTRL", "CONFIRM DEBUGCTRL"):
+                show("WARNING: DEBUGCTRL (0x00820060) is a sensitive controller register.")
+                if not _confirm_token(confirm, f"Type '{token}' separately: ", token):
+                    _handle_decline(
+                        idx, pointer, record, token,
+                        "DEBUGCTRL separately confirmed manual action declined",
+                    )
+
+        confirm_word: str
+        if confirm_mode == "group" and not cur_group.is_debugctrl and not cur_group.is_reconfig:
+            if idx == cur_group.start_index:
+                _emit("group_start", group=cur_group.to_dict())
+                end_row = pointer + len(cur_group.records) - 1
+                row_span = f"row {pointer}" if len(cur_group.records) == 1 else f"rows {pointer}..{end_row}"
+                show(f"\n=== GROUP: {cur_group.title} ({len(cur_group.records)} record(s), {row_span}) ===")
+                for off_g, rec_g in enumerate(cur_group.records):
+                    show(f"  row {pointer + off_g:3d}: {rec_g.target}={hex32(rec_g.word)}  ({rec_g.decode})")
+
+                if cur_group.has_media_change and not media_confirmed:
+                    _show_media_banner()
+                    tok_m = "REVIEW MEDIA ENGINES"
+                    if not _confirm_token(
+                        confirm,
+                        f"Type '{tok_m}' to acknowledge experimental media-engine unlock: ",
+                        tok_m,
+                    ):
+                        _handle_decline(
+                            idx, pointer, record, tok_m,
+                            "experimental media-engine record not confirmed",
+                        )
+                    media_confirmed = True
+                    journal.append(
+                        event="group_risk_confirmed",
+                        group=cur_group.key,
+                        token=tok_m,
+                        rows=[pointer + o for o in range(len(cur_group.records))],
+                    )
+
+                if cur_group.is_devid:
+                    if cur_group.devid_target is None:
+                        raise BurnError(
+                            f"{record.name}: REFUSED; invalid PCIe DEVID record word {hex32(record.word)}"
+                        )
+                    tok_d, prompt_d, decline_d = _show_devid_banner(
+                        cur_group.devid_target, "DEVIDA + DEVIDB"
+                    )
+                    if not _confirm_token(confirm, prompt_d, tok_d):
+                        _handle_decline(idx, pointer, record, tok_d, decline_d)
+                    confirm_word = tok_d
+                else:
+                    tok_g = cur_group.token
+                    prompt_g = (
+                        f"PERMANENT [{cur_group.title}, {row_span}]: "
+                        f"type '{tok_g}' to burn {len(cur_group.records)} row(s) (or Enter to stop): "
+                    )
+                    if not _confirm_token(confirm, prompt_g, tok_g):
+                        _handle_decline(idx, pointer, record, tok_g, "operator declined")
+                    confirm_word = tok_g
+
+                group_confirmed_tokens[cur_group.start_index] = confirm_word
+                journal.append(
+                    event="group_confirmed",
+                    group=cur_group.key,
+                    title=cur_group.title,
+                    confirmation=confirm_word,
+                    rows=[pointer + o for o in range(len(cur_group.records))],
                 )
-            which_dev, target_dev = devid_info
-            dev_desc = BURNABLE_TARGET_DEVICE_IDS[target_dev]
-            is_a100_target = target_dev in A100_TARGET_DEVICE_IDS
-            if is_a100_target:
-                token = f"CONFIRM A100 DEVID 0x{target_dev:04X}"
-                show("\n" + "!" * 76)
-                show(f"!!! CRITICAL WARNING — PERMANENT A100 PCIe DEVICE ID CONVERSION ({which_dev})")
-                show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
-                show("!!!")
-                show("!!! 1. VBIOS REQUIRED AFTER COLD BOOT:")
-                show("!!!    Once fused, this card WILL NOT POST on its stock CMP 170HX VBIOS.")
-                show("!!!    Back up your stock CMP ROM (nvflash --save) BEFORE burning, and")
-                show("!!!    flash the matching A100 VBIOS immediately after cold power cycle.")
-                show("!!!")
-                show("!!! 2. 128 GB 64-BIT BAR1 MMIO WINDOW REQUIRED:")
-                show("!!!    Motherboard BIOS MUST have Above 4G Decoding ON, CSM OFF,")
-                show("!!!    Re-Size BAR ON, and MMIO High Size >= 128 GB. If POST fails,")
-                show("!!!    there is NO in-band recovery — you will need a CH341A SPI clip.")
-                show("!!!")
-                show("!!! 3. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
-                show("!" * 76)
-                prompt_msg = f"Type '{token}' to confirm A100 VBIOS + 128 GB BAR1 readiness: "
-                decline_err = "A100 Device ID conversion not confirmed"
             else:
-                token = f"CONFIRM CMP DEVID 0x{target_dev:04X}"
-                show("\n" + "!" * 76)
-                show(f"!!! WARNING — PERMANENT PCIe DEVICE ID REVERT TO CMP 170HX ({which_dev})")
-                show(f"!!! Target identity : {plan.pci_id} -> 10de:{target_dev:04x} ({dev_desc})")
-                show("!!!")
-                show("!!! 1. MATCHING CMP 170HX VBIOS REQUIRED AFTER COLD BOOT:")
-                show("!!!    If this card currently has an A100 VBIOS flashed, it WILL NOT POST")
-                show("!!!    on that A100 ROM once fused back to CMP 170HX — flash your backed-up")
-                show("!!!    CMP 170HX VBIOS (matching 8 GB / 10 GB) right after cold power cycle.")
-                show("!!!")
-                show("!!! 2. BURN BOTH DEVIDA (c2/b37) AND DEVIDB (c2/b38) IN THE SAME SESSION.")
-                show("!" * 76)
-                prompt_msg = f"Type '{token}' to confirm CMP 170HX VBIOS readiness: "
-                decline_err = "CMP 170HX Device ID revert not confirmed"
-            if not _confirm_token(confirm, prompt_msg, token):
-                journal.append(event="declined", row=pointer, record=record.name, reason=token)
-                if written_records:
-                    _run_poweroff_sanity(
-                        plan, verified_rows, journal, show,
-                        committed_records=already_committed + written_records,
-                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
-                        baseline_blocks=sanity_baseline,
-                        reason="operator_declined",
-                    )
-                raise BurnError(decline_err)
+                confirm_word = group_confirmed_tokens[cur_group.start_index]
 
-        engine_change = ff_word_media_engine_change(record.word, rec_old_block)
-        if engine_change == "changed" or (engine_change == "unknown" and is_live):
-            token = "REVIEW MEDIA ENGINES"
-            show("\n" + "!" * 76)
-            show("!!! EXPERIMENTAL — PERMANENT MEDIA ENGINE UNLOCK (NVDEC / NVJPG / OFA)")
-            show("!!! There is NO defect register for these engines: vfi_burn cannot prove the")
-            show("!!! units exist on this die. After cold boot STATUS_OPT_* should read 0; a unit")
-            show("!!! that stays non-zero is physically absent. Do NOT re-burn it.")
-            show("!" * 76)
+        elif confirm_mode == "plan" and not cur_group.is_debugctrl and not cur_group.is_reconfig:
+            if record.kind == "test":
+                _emit("group_start", group=cur_group.to_dict())
+                tok_t = "BURN TEST"
+                if not _confirm_token(
+                    confirm,
+                    f"PERMANENT [No-Op Test Row {pointer}]: type '{tok_t}' to burn test row (or Enter to stop): ",
+                    tok_t,
+                ):
+                    _handle_decline(idx, pointer, record, tok_t, "operator declined")
+                confirm_word = tok_t
+            else:
+                if plan_confirmed_token is None:
+                    rem_groups = [
+                        g for g in approval_groups
+                        if g.start_index >= idx and not g.is_debugctrl and not g.is_reconfig
+                    ]
+                    rem_recs = [r for g in rem_groups for r in g.records]
+                    show(f"\n=== REMAINING PLAN ({len(rem_recs)} record(s) starting at row {pointer}) ===")
+                    for off_p, rec_p in enumerate(rem_recs):
+                        show(f"  row {pointer + off_p:3d}: {rec_p.target}={hex32(rec_p.word)}  ({rec_p.decode})")
+
+                    if any(g.has_media_change for g in rem_groups) and not media_confirmed:
+                        _show_media_banner()
+                        tok_m = "REVIEW MEDIA ENGINES"
+                        if not _confirm_token(
+                            confirm,
+                            f"Type '{tok_m}' to acknowledge experimental media-engine unlock: ",
+                            tok_m,
+                        ):
+                            _handle_decline(
+                                idx, pointer, record, tok_m,
+                                "experimental media-engine record not confirmed",
+                            )
+                        media_confirmed = True
+
+                    for g_d in rem_groups:
+                        if g_d.is_devid and g_d.devid_target is not None and g_d.devid_target not in devid_confirmed:
+                            tok_d, prompt_d, decline_d = _show_devid_banner(
+                                g_d.devid_target, "DEVIDA + DEVIDB"
+                            )
+                            if not _confirm_token(confirm, prompt_d, tok_d):
+                                _handle_decline(idx, pointer, record, tok_d, decline_d)
+                            devid_confirmed.add(g_d.devid_target)
+
+                    tok_p = f"BURN PLAN {plan.content_hash[:8]}"
+                    if not _confirm_token(
+                        confirm,
+                        f"PERMANENT: type '{tok_p}' to burn all {len(rem_recs)} remaining row(s) (or Enter to stop): ",
+                        tok_p,
+                    ):
+                        _handle_decline(idx, pointer, record, tok_p, "operator declined")
+                    plan_confirmed_token = tok_p
+                    journal.append(
+                        event="plan_batch_confirmed",
+                        confirmation=tok_p,
+                        count=len(rem_recs),
+                        start_row=pointer,
+                    )
+                confirm_word = plan_confirmed_token
+
+        else:
+            # Legacy per-row confirmation mode (also used for DEBUGCTRL and RECONFIG).
+            if record.kind == "devid":
+                devid_info = decode_a100_devid_ff_word(record.word)
+                if devid_info is None:
+                    raise BurnError(
+                        f"{record.name}: REFUSED; invalid PCIe DEVID record word {hex32(record.word)}"
+                    )
+                which_dev, target_dev = devid_info
+                tok_d, prompt_d, decline_d = _show_devid_banner(target_dev, which_dev)
+                if not _confirm_token(confirm, prompt_d, tok_d):
+                    _handle_decline(idx, pointer, record, tok_d, decline_d)
+
+            engine_change = ff_word_media_engine_change(record.word, rec_old_block)
+            if engine_change == "changed" or (engine_change == "unknown" and is_live):
+                tok_m = "REVIEW MEDIA ENGINES"
+                _show_media_banner()
+                if not _confirm_token(
+                    confirm,
+                    f"Type '{tok_m}' to burn experimental media-engine bits in row {pointer}: ",
+                    tok_m,
+                ):
+                    _handle_decline(
+                        idx, pointer, record, tok_m,
+                        "experimental media-engine record not confirmed",
+                    )
+
+            if rec_touches_pcie or record.kind == "reconfig":
+                review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()
+                tok_r = f"REVIEW {review_kind}"
+                if not _confirm_token(
+                    confirm,
+                    f"{tok_r}: externally verify current link/ceiling and type '{tok_r}': ",
+                    tok_r,
+                ):
+                    _handle_decline(idx, pointer, record, tok_r, "special record not confirmed")
+
+            confirm_word = f"YES {pointer} {hex32(record.word)}" if strict_confirm else "YES"
             if not _confirm_token(
                 confirm,
-                f"Type '{token}' to burn experimental media-engine bits in row {pointer}: ",
-                token,
+                f"PERMANENT: type '{confirm_word}' to burn row {pointer} (or Enter to stop): ",
+                confirm_word,
             ):
-                journal.append(event="declined", row=pointer, record=record.name, reason=token)
-                if written_records:
-                    _run_poweroff_sanity(
-                        plan, verified_rows, journal, show,
-                        committed_records=already_committed + written_records,
-                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
-                        baseline_blocks=sanity_baseline,
-                        reason="operator_declined",
-                    )
-                raise BurnError("experimental media-engine record not confirmed")
+                _handle_decline(idx, pointer, record, None, "operator declined")
 
-        if rec_touches_pcie or record.kind == "reconfig":
-            review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()
-            token = f"REVIEW {review_kind}"
-            if not _confirm_token(
-                confirm,
-                f"{token}: externally verify current link/ceiling and type '{token}': ",
-                token,
-            ):
-                journal.append(event="declined", row=pointer, record=record.name, reason=token)
-                if written_records:
-                    _run_poweroff_sanity(
-                        plan, verified_rows, journal, show,
-                        committed_records=already_committed + written_records,
-                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
-                        baseline_blocks=sanity_baseline,
-                        reason="operator_declined",
-                    )
-                raise BurnError("special record not confirmed")
-
-        confirm_word = f"YES {pointer} {hex32(record.word)}" if strict_confirm else "YES"
-        if not _confirm_token(
-            confirm,
-            f"PERMANENT: type '{confirm_word}' to burn row {pointer} (or Enter to stop): ",
-            confirm_word,
-        ):
-            journal.append(event="declined", row=pointer, record=record.name)
-            if written_records:
-                _run_poweroff_sanity(
-                    plan, verified_rows, journal, show,
-                    committed_records=already_committed + written_records,
-                    remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
-                    baseline_blocks=sanity_baseline,
-                    reason="operator_declined",
-                )
-            raise BurnError("operator declined")
+        _emit(
+            "record_start",
+            index=idx,
+            row=pointer,
+            record=record.name,
+            target=record.target,
+            word=hex32(record.word),
+            group=cur_group.key,
+        )
 
         # Instantaneous pre-trigger gate: closes the window while the human was reading/typing.
         try:
@@ -1972,55 +2332,73 @@ def process_records(
                 error=str(exc),
                 write_issued=False,
             )
+            _emit("record_halted", index=idx, row=pointer, record=record.name, error=str(exc), write_issued=False)
             raise BurnError(
                 f"ABORTED before write (card state changed during confirmation; NO write issued): {exc}"
             ) from exc
 
         # Irreversible section: Ctrl-C / SSH hang-up are held back until the outcome of
         # this record (verified, aborted pre-trigger, or HALT) is fsynced to the journal.
-        with deferred_signals():
-            journal.append(
-                event="attempt",
-                stage=stage,
-                plan_sha256=plan.content_hash,
-                manual_record_sha256=manual_record_sha256,
-                card=plan.pci_id,
-                row=pointer,
-                record=record.name,
-                target=record.target,
-                intended=hex32(record.word),
-                previous=hex32(previous),
-                confirmation=confirm_word,
-                boot_id=boot_id,
-                overrides=ov.active_names(),
-            )
-            readback, health, host_after = _write_verify_or_halt(
-                plan,
-                reader,
-                writer,
-                journal,
-                pointer=pointer,
-                record=record,
-                ov=ov,
-                manual_record_sha256=manual_record_sha256,
-            )
-            journal.append(
-                event="verified_readback_only",
-                row=pointer,
-                record=record.name,
-                target=record.target,
-                intended=hex32(record.word),
-                readback=hex32(readback),
-                result="MATCH",
-                full_post_write_gate=health.serializable(),
-                host_after=host_after.serializable(),
-                pointer_advanced=True,
-                cold_boot_verified=False,
-                boot_id=boot_id,
-                plan_sha256=plan.content_hash,
-                manual_record_sha256=manual_record_sha256,
-            )
+        try:
+            with deferred_signals():
+                journal.append(
+                    event="attempt",
+                    stage=stage,
+                    plan_sha256=plan.content_hash,
+                    manual_record_sha256=manual_record_sha256,
+                    card=plan.pci_id,
+                    row=pointer,
+                    record=record.name,
+                    target=record.target,
+                    intended=hex32(record.word),
+                    previous=hex32(previous),
+                    confirmation=confirm_word,
+                    confirm_mode=confirm_mode,
+                    boot_id=boot_id,
+                    overrides=ov.active_names(),
+                )
+                readback, health, host_after = _write_verify_or_halt(
+                    plan,
+                    reader,
+                    writer,
+                    journal,
+                    pointer=pointer,
+                    record=record,
+                    ov=ov,
+                    manual_record_sha256=manual_record_sha256,
+                )
+                journal.append(
+                    event="verified_readback_only",
+                    row=pointer,
+                    record=record.name,
+                    target=record.target,
+                    intended=hex32(record.word),
+                    readback=hex32(readback),
+                    result="MATCH",
+                    full_post_write_gate=health.serializable(),
+                    host_after=host_after.serializable(),
+                    pointer_advanced=True,
+                    cold_boot_verified=False,
+                    boot_id=boot_id,
+                    plan_sha256=plan.content_hash,
+                    manual_record_sha256=manual_record_sha256,
+                )
+        except BaseException as exc:
+            _emit("record_halted", index=idx, row=pointer, record=record.name, error=str(exc))
+            raise
+
         verified_rows[pointer] = readback
+        _emit(
+            "record_verified",
+            index=idx,
+            row=pointer,
+            record=record.name,
+            word=hex32(record.word),
+            readback=hex32(readback),
+            crc=hex32(health.crc),
+            fusectrl=hex32(health.fusectrl),
+            group=cur_group.key,
+        )
         pointer += 1  # The ONLY advance, after read-back AND healthy gate.
         written_records.append(record)
         prev_groups = rec_groups
@@ -2048,6 +2426,8 @@ def process_records(
                     baseline_blocks=sanity_baseline,
                     reason="paused_after_test",
                 )
+                if sanity is not None:
+                    _emit("poweroff_sanity", reason="paused_after_test", sanity=sanity)
                 if is_live and (sanity is None or not sanity["safe_to_power_off"]):
                     raise BurnError("test readback verified, but power-off safety is unsafe or unknown")
                 journal.append(
@@ -2057,10 +2437,16 @@ def process_records(
                     remaining_records=[r.name for r in pending[idx + 1 :]],
                     cold_boot_verified=False,
                 )
+                _emit(
+                    "test_paused",
+                    test_row=pointer - 1,
+                    next_pointer=pointer,
+                    remaining_count=len(pending) - (idx + 1),
+                )
                 show(
                     "Paused cleanly after test row. Power-cycle to cold-boot verify "
-                    "(menu [10] Verify Cold, or CLI: verify-cold --stage test --receipt-out <file>), "
-                    "then resume with menu [6] Burn Plan (or CLI: --stage real --receipt <file>)."
+                    "(Step 5 Cold Verify, or CLI: verify-cold --stage test --receipt-out <file>), "
+                    "then resume remaining records."
                 )
                 return pointer
             journal.append(
@@ -2078,6 +2464,8 @@ def process_records(
             baseline_blocks=sanity_baseline,
             reason="session_complete",
         )
+        if sanity is not None:
+            _emit("poweroff_sanity", reason="session_complete", sanity=sanity)
         if is_live and (sanity is None or not sanity["safe_to_power_off"]):
             raise BurnError("readback verified, but power-off safety is unsafe or unknown")
     journal.append(
@@ -2086,6 +2474,12 @@ def process_records(
         last_pointer=pointer,
         records_written=len(written_records),
         cold_boot_verified=False,
+    )
+    _emit(
+        "session_complete",
+        stage=stage,
+        last_pointer=pointer,
+        records_written=len(written_records),
     )
     return pointer
 

@@ -27,11 +27,14 @@ from .commands import (
     execute_plan_review,
     execute_simulate,
     execute_snapshot,
+    execute_tui,
     execute_verify_cold,
+    execute_web,
 )
-from .engine import Overrides
+from .engine import CONFIRM_MODES, Overrides
 from .menu import MenuSession
 from .model import BurnError
+from .workflow import DEFAULT_SESSION_PATH
 
 
 def _add_override_args(parser: argparse.ArgumentParser, *, allow_debugctrl: bool = False) -> None:
@@ -109,8 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="vfi_burn",
         description=(
-            "CMP 170HX 8 GB FF fuse-burn safety controller "
-            "(run with no subcommand or 'menu' for the interactive menu; passive dry-run by default)"
+            "CMP 170HX (8 GB / 10 GB) FF fuse-burn safety controller "
+            "(use 'web' for the Local Web UI, 'tui' for the full-screen curses TUI, "
+            "or 'manual'/'decode' for low-level diagnostics)"
         ),
     )
     sub = ap.add_subparsers(dest="cmd", required=False)
@@ -118,9 +122,47 @@ def build_parser() -> argparse.ArgumentParser:
     def add_plan(p: argparse.ArgumentParser) -> None:
         p.add_argument("--plan", required=True, help="private mode-0600 per-card plan JSON")
 
+    def add_workspace_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--plan", default=None, help="optional pre-loaded mode-0600 per-card plan JSON")
+        tg = p.add_mutually_exclusive_group(required=False)
+        tg.add_argument("--bdf", default=None, help="live CMP 170HX PCI BDF (e.g. 0000:05:00.0)")
+        tg.add_argument("--adapter", default=None, help="custom owner-supplied live module:factory")
+        tg.add_argument("--sim-pcie", default=None, help="mode-0600 JSON snapshot executed through simulated PCIe BAR0 + HAL")
+        tg.add_argument("--fake", default=None, help="synthetic mode-0600 JSON controller snapshot")
+        p.add_argument("--journal", default=None, help="private mode-0600 audit JSONL (default: private/session.jsonl)")
+        p.add_argument("--receipt", default=None, help="optional cold-verified test receipt path")
+        p.add_argument(
+            "--confirm-mode",
+            choices=CONFIRM_MODES,
+            default=None,
+            help="burn confirmation cadence: 'group' (default), 'plan', or 'row'",
+        )
+        p.add_argument(
+            "--session",
+            default=DEFAULT_SESSION_PATH,
+            help=f"workspace session state file (default: {DEFAULT_SESSION_PATH})",
+        )
+        _add_override_args(p, allow_debugctrl=True)
+
+    web_p = sub.add_parser(
+        "web",
+        help="launch the zero-dependency Local Web UI (interactive die map, file browser, live watch, group burn, one-step cold verify)",
+    )
+    web_p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1 loopback only)")
+    web_p.add_argument("--port", type=int, default=8765, help="TCP port (default: 8765; 0 for ephemeral)")
+    web_p.add_argument("--open", action="store_true", help="attempt to open the session URL in a local browser")
+    add_workspace_args(web_p)
+
+    tui_p = sub.add_parser(
+        "tui",
+        help="launch the full-screen stdlib curses TUI (two-pane file browser, menuconfig, live watch, group burn, one-step cold verify)",
+    )
+    tui_p.add_argument("--no-curses", action="store_true", help="fall back to plain numbered menu instead of curses TUI")
+    add_workspace_args(tui_p)
+
     menu_p = sub.add_parser(
         "menu",
-        help="high-level interactive menu interface (also launched when vfi_burn is run with no arguments)",
+        help="legacy numbered plain-text interactive menu",
     )
     menu_p.add_argument("--plan", default=None, help="optional pre-loaded mode-0600 per-card plan JSON")
     menu_g = menu_p.add_mutually_exclusive_group(required=False)
@@ -161,9 +203,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="output path for new mode-0600 vfi_burn plan JSON (default: private/plan.json)",
     )
     cfg_p.add_argument(
+        "--compute",
+        action="store_true",
+        help="non-interactive: unlock all non-defective Compute (GPC/TPC/PES)",
+    )
+    cfg_p.add_argument(
+        "--memory",
+        action="store_true",
+        help="non-interactive: unlock all non-defective Memory / HBM (FBP/FBPA/FBIO/ROP_L2)",
+    )
+    cfg_p.add_argument(
         "--sm-hbm",
         action="store_true",
-        help="non-interactive: unlock all non-defective Compute (GPC/TPC/PES) + Memory (FBP/FBPA/FBIO/ROP_L2)",
+        help="non-interactive: shorthand for --compute --memory",
     )
     cfg_p.add_argument(
         "--pcie",
@@ -273,6 +325,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="actually program FF fuses (without this flag, passive dry-run only)",
     )
+    burn_p.add_argument(
+        "--confirm-mode",
+        choices=CONFIRM_MODES,
+        default="group",
+        help="human confirmation cadence: 'group' (default), 'plan', or 'row' (legacy strict per-row)",
+    )
     _add_override_args(burn_p, allow_debugctrl=False)
 
     sim_p = sub.add_parser("simulate", help="exercise the exact write loop on FAKE or simulated PCIe data only")
@@ -287,6 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
     sim_p.add_argument("--dry-run", action="store_true", help="preview only; do not update fake rows")
     sim_p.add_argument("--save-fake", help="write updated fake snapshot to a mode-0600 file (refuses overwrite unless --overwrite)")
     sim_p.add_argument("--overwrite", action="store_true", help="atomically replace --save-fake if it already exists")
+    sim_p.add_argument(
+        "--confirm-mode",
+        choices=CONFIRM_MODES,
+        default="row",
+        help="human confirmation cadence: 'row' (default for CLI scripts), 'group', or 'plan'",
+    )
     _add_override_args(sim_p, allow_debugctrl=False)
 
     manual_p = sub.add_parser(
@@ -368,7 +432,34 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
     cmd = args.cmd
 
     if cmd is None:
-        return execute_menu(MenuSession())
+        return execute_tui(use_curses=True)
+
+    if cmd == "web":
+        return execute_web(
+            host=args.host,
+            port=args.port,
+            open_browser=bool(args.open),
+            target=_target_from_args(args),
+            plan_path=args.plan,
+            journal_path=args.journal,
+            receipt_path=args.receipt,
+            confirm_mode=args.confirm_mode,
+            session_path=args.session,
+            overrides=_overrides_from_args(args),
+            io=io,
+        )
+
+    if cmd == "tui":
+        return execute_tui(
+            target=_target_from_args(args),
+            plan_path=args.plan,
+            journal_path=args.journal,
+            receipt_path=args.receipt,
+            confirm_mode=args.confirm_mode,
+            use_curses=not bool(args.no_curses),
+            session_path=args.session,
+            overrides=_overrides_from_args(args),
+        )
 
     if cmd == "menu":
         return execute_menu(
@@ -392,6 +483,8 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             target=_target_from_args(args),
             out=args.out,
             unlock_sm_hbm=bool(args.sm_hbm),
+            unlock_compute=bool(args.compute),
+            unlock_memory=bool(args.memory),
             pcie_mode=args.pcie,
             nvlink=args.nvlink,
             a100_devid=int(args.a100_devid, 16) if args.a100_devid else None,
@@ -438,6 +531,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             max_records=args.max_records,
             sense=bool(args.sense),
             execute=bool(args.execute),
+            confirm_mode=args.confirm_mode,
             overrides=_overrides_from_args(args),
             io=io,
         )
@@ -453,6 +547,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             dry_run=bool(args.dry_run),
             save_fake=args.save_fake,
             overwrite=bool(args.overwrite),
+            confirm_mode=args.confirm_mode,
             overrides=_overrides_from_args(args),
             io=io,
         )

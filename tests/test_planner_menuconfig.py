@@ -509,11 +509,11 @@ class TestMenuconfigPlainUI(unittest.TestCase):
         # p (Preview) -> "" (continue)
         # s (Save)
         answers = iter([
-            "1",
+            "1", "3",
             "2", "8", "1", "b", "t10", "b",
-            "3", "3", "b",
-            "4", "2", "b",
-            "5",
+            "4", "3", "b",
+            "5", "2", "b",
+            "6",
             "p", "",
             "s",
         ])
@@ -625,12 +625,12 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
     def test_burn_menu_setup_a_configure_and_review(self):
         plan_path = self.work / "menu_plan.json"
         # Menu flow:
-        #   1 (Setup) -> a (Configure Unlocks) -> [menuconfig: 5 (NVLink ON), s (Save)]
+        #   1 (Setup) -> a (Configure Unlocks) -> [menuconfig: 6 (NVLink ON), s (Save)]
         #   -> output path -> 0 (Back to Main Menu) -> 2 (Review Plan) -> q (Quit)
         answers = iter([
             "1",
             "a",
-            "5", "s",
+            "6", "s",
             str(plan_path),
             "2",
             "q",
@@ -664,7 +664,7 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         #    invalid key 'z' re-prompts (doesn't discard work), then 'o' overwrites atomically.
         answers_overwrite = iter([
             "1", "a",
-            "1", "s",             # unlock all healthy SM/HBM -> different hash & more records
+            "1", "3", "s",        # unlock all healthy Compute + Memory -> different hash & more records
             str(plan_path),
             "z",                  # typo -> re-prompts
             "o",                  # overwrite!
@@ -693,7 +693,7 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         write_private_json(other_snap_path, other_snap)
         answers_new = iter([
             "1", "a",
-            "5", "s",
+            "6", "s",
             str(plan_path),
             "n", "",              # choose new path -> accept suggested plan_2082_2.json
             "q",
@@ -717,7 +717,7 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         # 3) Menu [1] -> [a] cancelling at collision prompt (Enter -> default 'c') preserves existing file
         answers_cancel = iter([
             "1", "a",
-            "5", "s",
+            "6", "s",
             str(plan_path),
             "",                   # cancel
             "0",                  # back from Setup
@@ -761,7 +761,7 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         self.assertEqual(Plan.load(plan_path).content_hash, orig_hash)
 
         # 5) CLI interactive execute_configure (no --overwrite) prompts on collision and allows overwrite
-        cli_answers = iter(["1", "s", "o"])
+        cli_answers = iter(["1", "3", "s", "o"])
         cli_shown: list[str] = []
         rc_int = execute_configure(
             target=TargetSpec(sim_pcie=str(self.cold_snap)),
@@ -862,10 +862,10 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         hard_keep, _ = ff_word_safety_audit(0x416B0942, 0x41E3, allow_a100_devid=True)
         self.assertEqual(hard_keep, [])
 
-        # 2. Interactive menuconfig flow: open PCIe Device ID submenu [6], pick 0x20F1 [2],
+        # 2. Interactive menuconfig flow: open PCIe Device ID submenu [7], pick 0x20F1 [2],
         #    go back [b], open Preview [p] (must handle old=None FPF cleanly), back [b], save [s]
         card = capture_card_snapshot(self.cold_adapter)
-        inputs = iter(["6", "2", "b", "p", "b", "s"])
+        inputs = iter(["7", "2", "b", "p", "b", "s"])
         shown: list[str] = []
         cfg = run_menuconfig(
             card,
@@ -983,9 +983,9 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         card_a100 = capture_card_snapshot(ad_a100)
         self.assertEqual(card_a100.pci_id, "10de:20f1")
 
-        # Open PCIe Device ID [6], pick CMP 170HX 10 GB [5], back [b], preview [p], back [b], save [s]
+        # Open PCIe Device ID [7], pick CMP 170HX 10 GB [5], back [b], preview [p], back [b], save [s]
         # (SXM4 IDs are no longer offered, so the CMP revert entries moved up two places)
-        rev_inputs = iter(["6", "5", "b", "p", "b", "s"])
+        rev_inputs = iter(["7", "5", "b", "p", "b", "s"])
         rev_shown: list[str] = []
         rev_cfg = run_menuconfig(
             card_a100,
