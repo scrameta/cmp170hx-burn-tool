@@ -260,16 +260,17 @@ class TestBurnMenu(unittest.TestCase):
         exp_magic = analyze_ff_block(2, 47, 0x0002, old_data=0x0000)
         self.assertTrue(any("EXPERIMENTAL" in w for w in exp_magic["warnings"]))
 
-        # Unmapped bit 371 in chain 1 block 23 (bit 3 within block 23: between nvlink 368..370 and sys_pipe 372..379)
-        unmapped = analyze_ff_block(1, 23, 0x0008, old_data=0x0000)
-        self.assertIn(371, unmapped["changed_unmapped_bits"])
+        # Unmapped bit 380 in chain 1 block 23 (bit 12 within block 23: above sys_pipe 372..379).
+        # (Bit 371 used to be the example; it is now the mapped NVJPG/OFA engine bit.)
+        unmapped = analyze_ff_block(1, 23, 0x1000, old_data=0x0000)
+        self.assertIn(380, unmapped["changed_unmapped_bits"])
         self.assertTrue(any("UNMAPPED" in w for w in unmapped["warnings"]))
 
         # 2. Build a realistic synthetic GA100 FF plan + fake snapshot and test Menu [2] Review Plan
         # Existing FF rows:
         #   row 222: chain 1 block 8 (gpc_disable bits 131..138 -> bits 3..10 in blk 8) = 0x0428 (gpc_disable=0x85)
         #   row 223: chain 2 block 47 (pcie_magic_gen4_dis bit 3) = 0x0008
-        #   row 224: chain 1 block 23 (nvlink 368..370 + unmapped 371 + sys_pipe 372..379) = 0x0ff7
+        #   row 224: chain 1 block 23 (nvlink 368..370 + engine 371 + sys_pipe 372..379) = 0x0ff7
         w_gpc_old = encode_ff(1, 8, 0x0428)
         w_pcie_old = encode_ff(2, 47, 0x0008)
         w_sys_old = encode_ff(1, 23, 0x0FF7)
@@ -277,7 +278,7 @@ class TestBurnMenu(unittest.TestCase):
         w_noop = encode_ff(1, 8, 0x0428)         # exact rewrite -> NO-OP
         w_gpc_new = encode_ff(1, 8, 0x0420)      # clears GPC0 disable bit (0x85 -> 0x84)
         w_pcie_new = encode_ff(2, 47, 0x0000)    # clears Gen4 disable bit only (well-understood)
-        w_sys_new = encode_ff(1, 23, 0x000F)     # clears sys_pipe_disable (experimental) + flips unmapped bit 371!
+        w_sys_new = encode_ff(1, 23, 0x1007)     # clears sys_pipe_disable (experimental) + flips unmapped bit 380!
         w_unknown = encode_ff(1, 99, 0x1234)     # unknown block not in GA100 option map
 
         plan_dict = {
@@ -327,7 +328,7 @@ class TestBurnMenu(unittest.TestCase):
                     "kind": "regular",
                     "target": "SYS_PIPE_DISABLE",
                     "word": f"0x{w_sys_new:08x}",
-                    "decode": "Enable sys_pipe (experimental) + bit 371",
+                    "decode": "Enable sys_pipe (experimental) + bit 380",
                     "defect_sensitive": False,
                     "expected_cold": {},
                 },
@@ -371,7 +372,7 @@ class TestBurnMenu(unittest.TestCase):
         self.assertIn("NO-OP (0 effective fuse bits changed", out)
         # Unknown / unmapped / experimental fuse audit checks
         self.assertIn("UNMAPPED / UNDOCUMENTED BITS CHANGING", out)
-        self.assertIn("371", out)
+        self.assertIn("380", out)
         self.assertIn("NV_FUSE_OPT_SYS_PIPE_DISABLE", out)
         self.assertIn("UNKNOWN FF BLOCK (chain=1, block=99", out)
         # Well-understood Gen4 bit should NOT trigger a warning

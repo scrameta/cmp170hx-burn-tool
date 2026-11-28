@@ -39,6 +39,7 @@ from .fuses import (
     FFCALC_KEY_TO_FIELD,
     FF_EMPTY_WORD,
     FUSES_BY_KEY,
+    MEDIA_ENGINE_EVIDENCE_REGS,
     OPTION_REGS,
     REG_CRC_STATUS,
     REG_CTRL_WR_SECURE,
@@ -1058,6 +1059,22 @@ def read_ga100_card_state(
             )
         shadow_masks[ff_key] = val
 
+    # EXPERIMENTAL media-engine evidence: OPT_*_DISABLE and STATUS_OPT_* pairs. A failed
+    # or poisoned read is recorded as None ("not read"), which the planner treats as
+    # "unlock not offered", never as zero.
+    engine_regs: dict[str, tuple[int, int] | None] = {}
+    for engine, (opt_addr, status_addr) in MEDIA_ENGINE_EVIDENCE_REGS.items():
+        try:
+            opt_val = backend.register(opt_addr)
+            status_val = backend.register(status_addr)
+        except Exception:
+            engine_regs[engine] = None
+            continue
+        if any(v == 0xFFFFFFFF or is_poison(v) for v in (opt_val, status_val)):
+            engine_regs[engine] = None
+        else:
+            engine_regs[engine] = (opt_val, status_val)
+
     lnkcap2 = 0x06
     try:
         lc = backend.field("LnkCap2")
@@ -1074,6 +1091,7 @@ def read_ga100_card_state(
         "iff_record": iff_record,
         "defect_masks": defect_masks,
         "shadow_masks": shadow_masks,
+        "engine_regs": engine_regs,
         "lnkcap2": lnkcap2,
     }
 

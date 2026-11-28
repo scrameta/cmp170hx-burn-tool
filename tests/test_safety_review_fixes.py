@@ -217,22 +217,23 @@ class TestP0_1_UnknownUnmappedAndDeviceID(SafetyReviewTestBase):
         self.assertEqual(mmio.program_calls, 0)
 
     def test_changed_unmapped_bit_in_known_block_refused_zero_program_calls(self):
-        # Row 224 has c1/b23=0x0FEF (unmapped bit 3 is 1). Flip bit 3 -> 0 (0x0FE0).
+        # Row 224 has c1/b23=0x0FEF. Set unmapped bit 12 (chain bit 380): 0x1FEF.
+        # (Bit 371 used to be the example; it is now the mapped NVJPG/OFA engine bit.)
         plan = self._make_plan([
             self._noop_rec(),
             {
                 "name": "FLIP_UNMAPPED",
                 "kind": "regular",
                 "target": "NVLINK_DISABLE",
-                "word": f"0x{encode_ff(1, 23, 0x0FE0):08x}",
-                "decode": "flips unmapped bit 371 in c1/b23",
+                "word": f"0x{encode_ff(1, 23, 0x1FEF):08x}",
+                "decode": "flips unmapped bit 380 in c1/b23",
                 "defect_sensitive": False,
             },
         ])
         mmio = self._live_mmio()
         ad = LiveMMIOAdapter(mmio)
         with Journal(self.journal_path) as j:
-            with self.assertRaisesRegex(BurnError, "unmapped/undocumented chain bits 371"):
+            with self.assertRaisesRegex(BurnError, "unmapped/undocumented chain bits 380"):
                 process_records(
                     plan, ad, ad, j, stage="all", confirm=lambda *_: True, show=lambda *_: None
                 )

@@ -18,6 +18,7 @@ from .ffrecord import (
     decode_ff,
     evaluate_poweroff_sanity,
     ff_word_defect_audit,
+    ff_word_media_engine_change,
     ff_word_safety_audit,
     ff_word_touches_pcie,
     fields_in_block,
@@ -1884,6 +1885,31 @@ def process_records(
                         reason="operator_declined",
                     )
                 raise BurnError(decline_err)
+
+        engine_change = ff_word_media_engine_change(record.word, rec_old_block)
+        if engine_change == "changed" or (engine_change == "unknown" and is_live):
+            token = "REVIEW MEDIA ENGINES"
+            show("\n" + "!" * 76)
+            show("!!! EXPERIMENTAL — PERMANENT MEDIA ENGINE UNLOCK (NVDEC / NVJPG / OFA)")
+            show("!!! There is NO defect register for these engines: vfi_burn cannot prove the")
+            show("!!! units exist on this die. After cold boot STATUS_OPT_* should read 0; a unit")
+            show("!!! that stays non-zero is physically absent. Do NOT re-burn it.")
+            show("!" * 76)
+            if not _confirm_token(
+                confirm,
+                f"Type '{token}' to burn experimental media-engine bits in row {pointer}: ",
+                token,
+            ):
+                journal.append(event="declined", row=pointer, record=record.name, reason=token)
+                if written_records:
+                    _run_poweroff_sanity(
+                        plan, verified_rows, journal, show,
+                        committed_records=already_committed + written_records,
+                        remaining_records=pending[idx:] + deferred_by_max + tail_after_stage,
+                        baseline_blocks=sanity_baseline,
+                        reason="operator_declined",
+                    )
+                raise BurnError("experimental media-engine record not confirmed")
 
         if rec_touches_pcie or record.kind == "reconfig":
             review_kind = "PCIE" if rec_touches_pcie else record.kind.upper()

@@ -46,6 +46,16 @@ CMP170HX_TARGET_DEVICE_IDS: dict[int, str] = {
     0x20C2: "CMP 170HX 8 GB (10de:20c2)",
     0x2082: "CMP 170HX 10 GB (10de:2082)",
 }
+# Media engines have no *_DEFECTIVE register. Each has an OPT_*_DISABLE shadow and a
+# STATUS_OPT_* readout; the planner requires both to be read and equal (ffcalc's
+# zero-defect evidence) before offering an unlock. Addresses from
+# sayhellotojungle/cmp170hx-ffcalc data/ga100-fuses.json: {engine: (opt, status)}.
+MEDIA_ENGINE_EVIDENCE_REGS: dict[str, tuple[int, int]] = {
+    "NVDEC": (0x00820378, 0x00820C24),
+    "NVJPG": (0x00820370, 0x00820C0C),
+    "OFA": (0x008202D8, 0x00820E34),
+}
+
 BURNABLE_TARGET_DEVICE_IDS: dict[int, str] = {
     **A100_TARGET_DEVICE_IDS,
     **CMP170HX_TARGET_DEVICE_IDS,
@@ -351,6 +361,55 @@ FUSE_CATALOG: tuple[FuseDefinition, ...] = tuple(
             fused_addr=0x008203A4,
             defect_addr=0x008203AC,
             aliases=("SYS_PIPE_DISABLE",),
+        ),
+        # --- Chain 1 media-engine floorsweep bits (EXPERIMENTAL) ---
+        # Positions from sayhellotojungle/cmp170hx-ffcalc (optionmap.py), which burns them
+        # by default since 8242bfe. There is NO *_DEFECTIVE register for these engines, so
+        # the genuine-defect audit cannot cover them; the planner instead requires
+        # STATUS_OPT == OPT_DISABLE evidence (MEDIA_ENGINE_EVIDENCE_REGS) before offering
+        # the unlock. That evidence is weaker than it looks: ffcalc's own a5c194c FBP
+        # measurement shows STATUS_OPT_* following OPT_DISABLE, not OPT | DEFECTIVE.
+        FuseDefinition(
+            key="nvdec_disable",
+            name="NV_FUSE_OPT_NVDEC_DISABLE",
+            fuse_type=FuseType.FF_OPTION,
+            category="engine",
+            functional_group="engine",
+            description=(
+                "EXPERIMENTAL: 5x NVDEC hardware video decoders (c1/b8 bits 11..15, shares the "
+                "block with FBPA_DISABLE[23:21] and GPC_DISABLE); no defect register exists"
+            ),
+            ff_location=FFLocation(chain=1, bit=139, width=5),
+            ff_overridable=True,
+            burnable=True,
+        ),
+        FuseDefinition(
+            key="nvjpg_ofa_disable_bit146",
+            name="NV_FUSE_OPT_NVJPG_DISABLE / NV_FUSE_OPT_OFA_DISABLE (bit 146)",
+            fuse_type=FuseType.FF_OPTION,
+            category="engine",
+            functional_group="engine",
+            description=(
+                "EXPERIMENTAL: one of the NVJPG0 / OFA0 disable bits (c1/b9 bit 2); which of the "
+                "pair is which was never separated, so it is only ever cleared with bit 371"
+            ),
+            ff_location=FFLocation(chain=1, bit=146, width=1),
+            ff_overridable=True,
+            burnable=True,
+        ),
+        FuseDefinition(
+            key="nvjpg_ofa_disable_bit371",
+            name="NV_FUSE_OPT_NVJPG_DISABLE / NV_FUSE_OPT_OFA_DISABLE (bit 371)",
+            fuse_type=FuseType.FF_OPTION,
+            category="engine",
+            functional_group="engine",
+            description=(
+                "EXPERIMENTAL: the other NVJPG0 / OFA0 disable bit (c1/b23 bit 3, shares the block "
+                "with NVLINK_DISABLE and SYS_PIPE_DISABLE); only ever cleared with bit 146"
+            ),
+            ff_location=FFLocation(chain=1, bit=371, width=1),
+            ff_overridable=True,
+            burnable=True,
         ),
         # --- Chain 2 identity (read-only, NEVER burnable) & PCIe speed/boot fuses ---
         FuseDefinition(
