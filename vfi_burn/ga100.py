@@ -12,6 +12,8 @@ NEVER struct.pack_into). DEBUGCTRL (0x00820060) is never written.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 import fcntl
 import mmap
 import os
@@ -19,12 +21,14 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
 import time
 
 from .ffrecord import (
     FF_ROW_MAX,
     FF_ROW_MIN,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_ff,
 )
 from .fuses import (
@@ -32,7 +36,9 @@ from .fuses import (
     DIE_ID_ROWS,
     EXPERIMENTAL_INSPECT_REGS,
     EXPERIMENTAL_REGS_BY_NAME,
+    FFCALC_KEY_TO_FIELD,
     FF_EMPTY_WORD,
+    FUSES_BY_KEY,
     OPTION_REGS,
     REG_CRC_STATUS,
     REG_CTRL_WR_SECURE,
@@ -54,6 +60,7 @@ from .fuses import (
     REG_RESENSE_DISABLE,
     REG_SBFE_SHADOW,
     REG_WDATA_WR_SECURE,
+    TOTAL_FBP,
     TOTAL_FUSE_ROWS,
     TOTAL_GPC,
     TPC_DEFECTIVE_REGS,
@@ -61,8 +68,14 @@ from .fuses import (
     decode_experimental_register,
 )
 from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, Health, Host, MMIOBus
-from .mmio import AlignedMMIO
-from .model import BurnError, PreTriggerRefusal, SKU_CMP170HX_8GB, is_poison
+from .mmio import AlignedMMIO, ReadOnlyMMIO
+from .model import (
+    BurnError,
+    PreTriggerRefusal,
+    SKU_CMP170HX_8GB,
+    SUPPORTED_CMP170HX_SKUS,
+    is_poison,
+)
 
 BAR0_MAP_SIZE = 0x01000000  # 16 MiB BAR0 window
 
@@ -447,6 +460,7 @@ class GA100FuseController(FuseControllerHAL):
         *,
         timeout_s: float = 10.0,
         pre_trigger_check=None,
+        allow_a100_devid: bool = False,
     ) -> int:
         """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions.
 
@@ -465,10 +479,11 @@ class GA100FuseController(FuseControllerHAL):
                 )
             ff = decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
             if (ff.chain, ff.block) in DEVICE_ID_DENIED_BLOCKS:
-                raise BurnError(
-                    f"REFUSED: FF word 0x{word:08x} targets read-only PCIe device-ID block "
-                    f"(chain {ff.chain} block {ff.block})"
-                )
+                if not (allow_a100_devid and decode_a100_devid_ff_word(word) is not None):
+                    raise BurnError(
+                        f"REFUSED: FF word 0x{word:08x} targets read-only PCIe device-ID block "
+                        f"(chain {ff.chain} block {ff.block})"
+                    )
             if is_poison(word):
                 raise BurnError(
                     f"REFUSED: payload 0x{word:08x} has 0xBADx block data: deliberately not burned "
@@ -647,7 +662,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         self._bdf_lock = BDFLock(self.bdf, lock_dir=lock_dir)
         try:
             # Verify PCI config memory decode is on before mapping BAR0.
-            cfg = self._read_pci_config()
+            try:
+                cfg = self._read_pci_config()
+            except PermissionError as exc:
+                raise BurnError(
+                    f"root privileges are required to read PCI config ({self._sysfs / 'config'}) — re-run with sudo"
+                ) from exc
             if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
                 raise BurnError("PCI config space reads 0xFFFFFFFF (link down); park/power-cycle card")
             cmd = struct.unpack_from("<H", cfg, 4)[0]
@@ -658,7 +678,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
                 )
 
             res0 = self._sysfs / "resource0"
-            self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
+            try:
+                self._fd = os.open(res0, os.O_RDWR | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
+            except PermissionError as exc:
+                raise BurnError(
+                    f"root privileges are required to access PCI BAR0 ({res0}) — re-run with sudo"
+                ) from exc
             self._mm = mmap.mmap(
                 self._fd, BAR0_MAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
             )
@@ -750,10 +775,12 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
-    def write_one_record(self, row: int, word: int) -> None:
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
         if not self.writable:
             raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
-        self.controller.program_row(row, word)
+        self.controller.program_row(row, word, allow_a100_devid=allow_a100_devid)
 
     def capture_cold_snapshot(
         self,
@@ -764,8 +791,10 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         """Capture a cold-boot snapshot dict compatible with `vfi_burn verify-cold`."""
         host = self.host()
         pci = self.pci_id()
-        if pci != SKU_CMP170HX_8GB:
-            raise BurnError(f"unexpected PCI ID {pci} (expected {SKU_CMP170HX_8GB})")
+        if pci not in SUPPORTED_CMP170HX_SKUS:
+            raise BurnError(
+                f"unexpected PCI ID {pci} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+            )
         die_rows = {str(r): f"0x{self.die_row(r):08x}" for r in DIE_ID_ROWS}
         fpf_rows: dict[str, str] = {}
         if read_rows:
@@ -815,3 +844,807 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
             "controller_state": controller_state,
             "experimental_registers": experimental_registers,
         }
+
+
+def read_ga100_card_state(
+    backend,
+    *,
+    label: str = "live GPU",
+) -> dict:
+    """Read full read-only card state (Die IDs 8..15, FF rows 222..486, all 16 defect masks,
+    fused option shadows, and optional PCIe LnkCap2) for the built-in unlock configurator.
+
+    Refuses to read defect/shadow masks when ``EFP != 1`` (unsensed pre-SENSE_CTRL glitch
+    window where option/defect shadows read 0) so genuine silicon defects are never missed.
+    Caller must already have verified ``check_host_readonly_safe(backend.host())``.
+    """
+    pci = backend.pci_id()
+    if pci not in SUPPORTED_CMP170HX_SKUS:
+        raise BurnError(
+            f"unexpected PCI ID {pci} at {label} (expected {' or '.join(SUPPORTED_CMP170HX_SKUS)})"
+        )
+
+    health = backend.health()
+    if health.fusectrl == 0xFFFFFFFF or is_poison(health.fusectrl):
+        raise BurnError(
+            f"{label}: FUSECTRL reads 0x{health.fusectrl:08x} (BAR0 inaccessible or poisoned)"
+        )
+    if not is_fusectrl_idle(health.fusectrl):
+        raise BurnError(
+            f"{label}: FUSECTRL is not IDLE (0x{health.fusectrl:08x}); refusing read"
+        )
+    if health.crc != 0x55:
+        raise BurnError(
+            f"{label}: CRC_STATUS=0x{health.crc:02x} (expected 0x55); cannot trust fuse reads"
+        )
+    if health.efp != 1:
+        raise BurnError(
+            f"{label} option/defect shadow registers are UNSENSED (EFP={health.efp}, DSOV={health.dsov}): "
+            "all OPT_*_DEFECTIVE registers read 0 until SENSE_CTRL runs, so genuine silicon defects "
+            "cannot be read yet. Either configure unlocks on a cold card (before glitching) or run "
+            "[4] Active Sense (SENSE_CTRL) first so EFP=1."
+        )
+
+    iff_record = 0
+    try:
+        raw_iff = backend.register(REG_IFF_RECORD)
+        if raw_iff == 0xFFFFFFFF or is_poison(raw_iff):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{raw_iff:08x} from IFF_RECORD (0x{REG_IFF_RECORD:08x})"
+            )
+        iff_record = raw_iff
+    except BurnError:
+        raise
+    except Exception:
+        iff_record = 0
+
+    ff_last_row = FF_ROW_MAX
+    iff_start = iff_record & 0xFFFF
+    if iff_record != 0 and FF_ROW_MIN < iff_start <= 512:
+        ff_last_row = min(FF_ROW_MAX, iff_start - 1)
+
+    die_rows = {r: backend.die_row(r) for r in DIE_ID_ROWS}
+    ff_rows = {r: backend.fuse_row(r) for r in range(FF_ROW_MIN, ff_last_row + 1)}
+
+    defect_masks: dict[str, int] = {}
+    for ff_key, vfi_name in FFCALC_KEY_TO_FIELD.items():
+        addr = FUSES_BY_KEY[ff_key].defect_addr
+        if addr is None:
+            continue
+        val = backend.register(addr)
+        if val == 0xFFFFFFFF or is_poison(val):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{val:08x} from defect register {vfi_name} (0x{addr:08x})"
+            )
+        defect_masks[vfi_name] = val
+
+    shadow_masks: dict[str, int] = {}
+    for ff_key in FFCALC_KEY_TO_FIELD.keys():
+        addr = FUSES_BY_KEY[ff_key].fused_addr
+        if addr is None:
+            continue
+        val = backend.register(addr)
+        if val == 0xFFFFFFFF or is_poison(val):
+            raise BurnError(
+                f"{label}: poisoned/dead read 0x{val:08x} from fused shadow {ff_key} (0x{addr:08x})"
+            )
+        shadow_masks[ff_key] = val
+
+    lnkcap2 = 0x06
+    try:
+        lc = backend.field("LnkCap2")
+        if not is_poison(lc) and lc != 0xFFFFFFFF:
+            lnkcap2 = lc
+    except Exception:
+        pass
+
+    return {
+        "pci_id": pci,
+        "die_rows": die_rows,
+        "ff_rows": ff_rows,
+        "ff_last_row": ff_last_row,
+        "iff_record": iff_record,
+        "defect_masks": defect_masks,
+        "shadow_masks": shadow_masks,
+        "lnkcap2": lnkcap2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Read-only PCI GPU discovery & interactive selector
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PCI_IDS_PATHS: tuple[str, ...] = (
+    "/usr/share/misc/pci.ids",
+    "/usr/share/hwdata/pci.ids",
+    "/usr/share/pci.ids",
+)
+
+_KNOWN_PCI_GPU_NAMES: dict[str, str] = {
+    "10de:20c2": "NVIDIA CMP 170HX 8GB (GA100)",
+    "10de:2082": "NVIDIA CMP 170HX 10GB (GA100)",
+    "10de:20b0": "NVIDIA A100 SXM4 40GB",
+    "10de:20b2": "NVIDIA A100 SXM4 80GB",
+    "10de:20b5": "NVIDIA A100 PCIe 80GB",
+    "10de:20b7": "NVIDIA A30 PCIe",
+    "10de:20f1": "NVIDIA A100 PCIe 40GB",
+    "10de:20f3": "NVIDIA A800 SXM4 80GB",
+    "10de:20f5": "NVIDIA A800 PCIe 80GB",
+    "10de:2204": "NVIDIA GeForce RTX 3090",
+    "10de:2206": "NVIDIA GeForce RTX 3080",
+    "10de:2684": "NVIDIA GeForce RTX 4090",
+    "10de:2330": "NVIDIA H100 SXM5 80GB",
+    "10de:2331": "NVIDIA H100 PCIe 80GB",
+    "8086:e20b": "Intel Arc B580 (Battlemage)",
+}
+
+
+@dataclass(frozen=True)
+class DiscoveredGPU:
+    """Read-only summary of one PCI display/3D GPU discovered in Linux sysfs."""
+
+    bdf: str
+    pci_id: str
+    subsystem_id: str | None
+    pci_class: str
+    name: str
+    driver: str
+    bar0_bytes: int | None
+    bar1_bytes: int | None
+    current_link_speed: str | None
+    current_link_width: str | None
+    max_link_speed: str | None
+    max_link_width: str | None
+    is_cmp170hx: bool
+    fuse_state: str | None = None
+    cur_sm: int | None = None
+    max_sm: int | None = None
+    cur_fbp: int | None = None
+    max_fbp: int | None = None
+
+
+def format_bytes_iec(size: int | None) -> str:
+    """Format a byte count as a compact IEC size string (e.g. '16 GiB', '256 MiB')."""
+    if size is None or size <= 0:
+        return "?"
+    for unit, div in (("TiB", 1 << 40), ("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if size >= div:
+            val = size / div
+            if val == int(val):
+                return f"{int(val)} {unit}"
+            return f"{val:.1f} {unit}"
+    return f"{size} B"
+
+
+def _read_sysfs_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _parse_hex_id(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        return f"{int(raw, 16):04x}"
+    except ValueError:
+        return None
+
+
+def _parse_bar_sizes(resource_text: str | None) -> tuple[int | None, int | None]:
+    """Return ``(bar0_bytes, bar1_bytes)`` from sysfs ``resource`` (0x0000..0x0000 -> None)."""
+    if not resource_text:
+        return None, None
+    lines = resource_text.splitlines()
+    sizes: list[int | None] = []
+    for idx in (0, 1):
+        if idx >= len(lines):
+            sizes.append(None)
+            continue
+        parts = lines[idx].split()
+        if len(parts) < 2:
+            sizes.append(None)
+            continue
+        try:
+            start = int(parts[0], 16)
+            end = int(parts[1], 16)
+        except ValueError:
+            sizes.append(None)
+            continue
+        sizes.append((end - start + 1) if end > start else None)
+    return sizes[0], sizes[1]
+
+
+def _lookup_pci_ids_names(
+    wanted: set[tuple[str, str]],
+    pci_ids_paths: Sequence[str | Path] | None = None,
+) -> dict[str, str]:
+    """Stream Linux ``pci.ids`` once to resolve device names for ``wanted`` ``(vendor, device)`` pairs."""
+    if not wanted:
+        return {}
+    paths = [Path(p) for p in (pci_ids_paths if pci_ids_paths is not None else _DEFAULT_PCI_IDS_PATHS)]
+    pci_ids = next((p for p in paths if p.is_file()), None)
+    if pci_ids is None:
+        return {}
+
+    wanted_vendors = {v for v, _ in wanted}
+    found: dict[str, str] = {}
+    cur_vendor: str | None = None
+    cur_vendor_name = ""
+    try:
+        with pci_ids.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("#") or line.startswith("C "):
+                    continue
+                if not line.startswith("\t"):
+                    if cur_vendor in wanted_vendors and all(
+                        f"{v}:{d}" in found for v, d in wanted if v == cur_vendor
+                    ):
+                        wanted_vendors.discard(cur_vendor)
+                        if not wanted_vendors:
+                            break
+                    parts = line.strip().split(None, 1)
+                    if len(parts) == 2 and len(parts[0]) == 4:
+                        cur_vendor = parts[0].lower()
+                        cur_vendor_name = parts[1].strip()
+                    else:
+                        cur_vendor = None
+                elif cur_vendor in wanted_vendors and line.startswith("\t") and not line.startswith("\t\t"):
+                    parts = line.strip().split(None, 1)
+                    if len(parts) == 2 and len(parts[0]) == 4:
+                        dev = parts[0].lower()
+                        if (cur_vendor, dev) in wanted:
+                            dev_name = parts[1].strip()
+                            if cur_vendor == "10de":
+                                prefix = "" if "nvidia" in dev_name.lower() else "NVIDIA "
+                            else:
+                                vword = cur_vendor_name.split()[0] if cur_vendor_name else ""
+                                prefix = f"{vword} " if (vword and vword.lower() not in dev_name.lower()) else ""
+                            found[f"{cur_vendor}:{dev}"] = f"{prefix}{dev_name}"
+    except OSError:
+        return found
+    return found
+
+
+def _loaded_gpu_driver_modules(proc_modules_path: Path = Path("/proc/modules")) -> set[str]:
+    found: set[str] = set()
+    try:
+        text = proc_modules_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return found
+    for line in text.splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("nvidia", "nouveau"):
+            found.add(parts[0])
+    return found
+
+
+def _probe_cmp170hx_bar0_readonly(
+    dev_dir: Path,
+    driver: str,
+    *,
+    proc_modules_path: Path = Path("/proc/modules"),
+) -> tuple[str | None, int | None, int | None, int | None, int | None]:
+    """Strictly O_RDONLY / PROT_READ BAR0 probe for a CMP 170HX (zero MMIO writes).
+
+    Returns ``(fuse_state, cur_sm, max_sm, cur_fbp, max_fbp)``. Never raises.
+    """
+    if driver in ("nvidia", "nouveau"):
+        return f"{driver} bound (skipping BAR0 probe)", None, None, None, None
+    loaded = _loaded_gpu_driver_modules(proc_modules_path)
+    if loaded:
+        mods = "/".join(sorted(loaded))
+        return f"{mods} module loaded (skipping BAR0 probe)", None, None, None, None
+
+    try:
+        with (dev_dir / "config").open("rb") as f:
+            cfg = f.read(8)
+        if len(cfg) < 6:
+            return "PCI config short read", None, None, None, None
+        if struct.unpack_from("<I", cfg, 0)[0] == 0xFFFFFFFF:
+            return "PCI link down (0xFFFFFFFF)", None, None, None, None
+        cmd = struct.unpack_from("<H", cfg, 4)[0]
+        if (cmd & 0x0002) == 0:
+            return "PCI memory decode OFF", None, None, None, None
+    except PermissionError:
+        return "run as root for SM/FBP/fuse readout", None, None, None, None
+    except OSError as exc:
+        return f"PCI config unreadable ({exc.strerror or exc})", None, None, None, None
+
+    res0 = dev_dir / "resource0"
+    fd: int | None = None
+    mm = None
+    try:
+        fd = os.open(res0, os.O_RDONLY | os.O_SYNC | getattr(os, "O_CLOEXEC", 0))
+        mm = mmap.mmap(fd, BAR0_MAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ)
+        ro = ReadOnlyMMIO(mm)
+
+        # Read FUSECTRL FIRST and halt immediately on dead/poisoned BAR0.
+        ctrl = ro.read32(REG_FUSECTRL)
+        if ctrl == 0xFFFFFFFF or is_poison(ctrl):
+            return f"BAR0 dead/poisoned (FUSECTRL=0x{ctrl:08x})", None, None, None, None
+
+        dsov = ro.read32(REG_DSOV_STATUS)
+        efp = ro.read32(REG_EFP_STATUS)
+        crc = ro.read32(REG_CRC_STATUS)
+        if any(v == 0xFFFFFFFF or is_poison(v) for v in (dsov, efp, crc)):
+            return "BAR0 poisoned during health probe", None, None, None, None
+
+        if dsov == 0 and efp == 0:
+            fuse_state = "GOLDILOCKS (unsensed, EFP=0)"
+        elif dsov == 0 and efp == 1:
+            fuse_state = "GOLDILOCKS (sensed, EFP=1)"
+        elif dsov != 0 and efp == 1:
+            fuse_state = "COLD (locked, EFP=1)"
+        else:
+            fuse_state = f"DSOV={dsov} EFP={efp} CRC=0x{crc:02x}"
+
+        if efp != 1 or crc != 0x55:
+            return fuse_state, None, None, None, None
+
+        gpc_cur = ro.read32(OPTION_REGS["GPC_DISABLE"])
+        tpc_cur = [ro.read32(OPTION_REGS[f"TPC_GPC{i}_DISABLE"]) for i in range(TOTAL_GPC)]
+        fbp_cur = ro.read32(OPTION_REGS["FBP_DISABLE"])
+
+        gpc_def = ro.read32(FUSES_BY_KEY["gpc_disable"].defect_addr)
+        tpc_def = [ro.read32(FUSES_BY_KEY[f"tpc_gpc{i}_disable"].defect_addr) for i in range(TOTAL_GPC)]
+        fbp_def = ro.read32(FUSES_BY_KEY["fbp_disable"].defect_addr)
+
+        all_vals = [gpc_cur, fbp_cur, gpc_def, fbp_def, *tpc_cur, *tpc_def]
+        if any(v == 0xFFFFFFFF or is_poison(v) for v in all_vals):
+            return fuse_state, None, None, None, None
+
+        cur_sm = compute_sm_count(gpc_cur, tpc_cur)
+        max_sm = compute_sm_count(gpc_def, tpc_def)
+        cur_fbp = sum(1 for i in range(TOTAL_FBP) if not ((fbp_cur >> i) & 1))
+        max_fbp = sum(1 for i in range(TOTAL_FBP) if not ((fbp_def >> i) & 1))
+        return fuse_state, cur_sm, max_sm, cur_fbp, max_fbp
+    except PermissionError:
+        return "run as root for SM/FBP/fuse readout", None, None, None, None
+    except OSError as exc:
+        return f"BAR0 unreadable ({exc.strerror or exc})", None, None, None, None
+    finally:
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def discover_pci_gpus(
+    *,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    probe_bar0: bool = True,
+    pci_ids_paths: Sequence[str | Path] | None = None,
+    proc_modules_path: Path = Path("/proc/modules"),
+) -> list[DiscoveredGPU]:
+    """Discover PCI display/3D GPUs from Linux sysfs (pure read-only).
+
+    Lists CMP 170HX 8 GB (``10de:20c2``) devices first, followed by other NVIDIA GPUs,
+    then any other PCI display controllers (``class 0x03xxxx``), each sorted by BDF.
+    For safe CMP 170HX cards (not bound to ``nvidia``/``nouveau``), optionally performs
+    a zero-write ``O_RDONLY`` BAR0 shadow probe for current/healthy SM & FBP counts and
+    COLD/GOLDILOCKS fuse state.
+    """
+    root = Path(sysfs_root)
+    if not root.is_dir():
+        return []
+
+    raw_entries: list[tuple[Path, str, str, str, str | None, str]] = []
+    wanted_names: set[tuple[str, str]] = set()
+    for dev_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not dev_dir.is_dir():
+            continue
+        cls_raw = _read_sysfs_text(dev_dir / "class") or ""
+        cls_low = cls_raw.lower()
+        if not cls_low.startswith("0x03"):
+            continue
+        vendor = _parse_hex_id(_read_sysfs_text(dev_dir / "vendor"))
+        device = _parse_hex_id(_read_sysfs_text(dev_dir / "device"))
+        if not vendor or not device:
+            continue
+        try:
+            bdf = normalize_bdf(dev_dir.name)
+        except BurnError:
+            continue
+        sub_v = _parse_hex_id(_read_sysfs_text(dev_dir / "subsystem_vendor"))
+        sub_d = _parse_hex_id(_read_sysfs_text(dev_dir / "subsystem_device"))
+        sub_id = f"{sub_v}:{sub_d}" if (sub_v and sub_d) else None
+        pci_id = f"{vendor}:{device}"
+        if pci_id not in _KNOWN_PCI_GPU_NAMES:
+            wanted_names.add((vendor, device))
+        raw_entries.append((dev_dir, bdf, pci_id, cls_low, sub_id, vendor))
+
+    resolved_names = _lookup_pci_ids_names(wanted_names, pci_ids_paths=pci_ids_paths)
+
+    gpus: list[DiscoveredGPU] = []
+    for dev_dir, bdf, pci_id, cls_low, sub_id, vendor in raw_entries:
+        drv_link = dev_dir / "driver"
+        driver = drv_link.resolve().name if drv_link.exists() else "unbound"
+        bar0_b, bar1_b = _parse_bar_sizes(_read_sysfs_text(dev_dir / "resource"))
+        cur_spd = _read_sysfs_text(dev_dir / "current_link_speed")
+        cur_wid = _read_sysfs_text(dev_dir / "current_link_width")
+        max_spd = _read_sysfs_text(dev_dir / "max_link_speed")
+        max_wid = _read_sysfs_text(dev_dir / "max_link_width")
+        is_cmp = pci_id in SUPPORTED_CMP170HX_SKUS
+        name = _KNOWN_PCI_GPU_NAMES.get(pci_id) or resolved_names.get(pci_id) or f"PCI GPU ({pci_id})"
+
+        fuse_state: str | None = None
+        cur_sm: int | None = None
+        max_sm: int | None = None
+        cur_fbp: int | None = None
+        max_fbp: int | None = None
+        if is_cmp and probe_bar0:
+            fuse_state, cur_sm, max_sm, cur_fbp, max_fbp = _probe_cmp170hx_bar0_readonly(
+                dev_dir, driver, proc_modules_path=proc_modules_path
+            )
+
+        gpus.append(
+            DiscoveredGPU(
+                bdf=bdf,
+                pci_id=pci_id,
+                subsystem_id=sub_id,
+                pci_class=cls_low,
+                name=name,
+                driver=driver,
+                bar0_bytes=bar0_b,
+                bar1_bytes=bar1_b,
+                current_link_speed=cur_spd,
+                current_link_width=cur_wid,
+                max_link_speed=max_spd,
+                max_link_width=max_wid,
+                is_cmp170hx=is_cmp,
+                fuse_state=fuse_state,
+                cur_sm=cur_sm,
+                max_sm=max_sm,
+                cur_fbp=cur_fbp,
+                max_fbp=max_fbp,
+            )
+        )
+
+    def _sort_key(g: DiscoveredGPU) -> tuple[int, str]:
+        if g.is_cmp170hx:
+            return (0, g.bdf)
+        if g.pci_id.startswith("10de:"):
+            return (1, g.bdf)
+        return (2, g.bdf)
+
+    gpus.sort(key=_sort_key)
+    return gpus
+
+
+def format_gpu_entry(gpu: DiscoveredGPU, *, index: int | None = None, current: bool = False) -> list[str]:
+    """Format a ``DiscoveredGPU`` as 2 scannable terminal lines (IDs + memory/link/driver/state)."""
+    prefix = f"  [{index:2d}]" if index is not None else "  "
+    cur_mark = "*" if current else " "
+    sub_str = f"  sub={gpu.subsystem_id}" if gpu.subsystem_id else ""
+    tag = "" if gpu.is_cmp170hx else "  [not CMP 170HX]"
+    line1 = f"{prefix}{cur_mark}{gpu.bdf}  {gpu.pci_id}  {gpu.name}{sub_str}{tag}"
+
+    details: list[str] = []
+    if gpu.bar1_bytes is not None:
+        details.append(f"BAR1={format_bytes_iec(gpu.bar1_bytes)}")
+    elif gpu.bar0_bytes is not None:
+        details.append(f"BAR0={format_bytes_iec(gpu.bar0_bytes)}")
+
+    if gpu.cur_fbp is not None and gpu.max_fbp is not None:
+        details.append(f"HBM/FBPs={gpu.cur_fbp}/{gpu.max_fbp}")
+    if gpu.cur_sm is not None and gpu.max_sm is not None:
+        details.append(f"SMs={gpu.cur_sm}/{gpu.max_sm}")
+
+    cur_spd = gpu.current_link_speed.removesuffix(" PCIe") if gpu.current_link_speed else None
+    max_spd = gpu.max_link_speed.removesuffix(" PCIe") if gpu.max_link_speed else None
+    if gpu.current_link_width and cur_spd:
+        link = f"PCIe x{gpu.current_link_width} @ {cur_spd}"
+        if max_spd and max_spd != cur_spd:
+            link += f" (LnkCap {max_spd})"
+        details.append(link)
+    elif gpu.max_link_width and max_spd:
+        details.append(f"PCIe LnkCap x{gpu.max_link_width} @ {max_spd}")
+
+    details.append(f"drv={gpu.driver}")
+    if gpu.fuse_state:
+        details.append(gpu.fuse_state)
+
+    indent = " " * (len(prefix) + 1)
+    line2 = f"{indent}" + " | ".join(details)
+    return [line1, line2]
+
+
+def prompt_select_gpu_bdf(
+    *,
+    current_bdf: str | None = None,
+    input_fn=input,
+    show=print,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    probe_bar0: bool = True,
+) -> str | None:
+    """Display detected PCI GPUs (IDs, BAR1 memory, SM/FBP counts, PCIe link, driver, fuse state)
+    and let the operator pick by number or type a BDF manually."""
+    gpus = discover_pci_gpus(sysfs_root=sysfs_root, probe_bar0=probe_bar0)
+    if gpus:
+        show("\nDetected PCI GPUs:")
+        for idx, gpu in enumerate(gpus, start=1):
+            is_cur = bool(current_bdf and gpu.bdf == current_bdf)
+            for line in format_gpu_entry(gpu, index=idx, current=is_cur):
+                show(line)
+        default_hint = f" [{current_bdf}]" if current_bdf else ""
+        prompt = f"Select GPU [1-{len(gpus)}] or enter PCI BDF manually{default_hint} (blank to cancel): "
+    else:
+        show("\nNo PCI GPUs detected in /sys/bus/pci/devices.")
+        default_hint = f" [{current_bdf}]" if current_bdf else ""
+        prompt = f"CMP 170HX PCI BDF (e.g. 0000:05:00.0){default_hint}: "
+
+    while True:
+        try:
+            raw = input_fn(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            return current_bdf
+        if gpus and raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(gpus):
+                picked = gpus[idx - 1]
+                if not picked.is_cmp170hx:
+                    show(
+                        f"REFUSED: [{idx}] {picked.bdf} is {picked.pci_id} ({picked.name}), "
+                        f"not a supported CMP 170HX ({' / '.join(SUPPORTED_CMP170HX_SKUS)})."
+                    )
+                    continue
+                return picked.bdf
+            show(f"Selection {idx} outside 1..{len(gpus)}.")
+            continue
+        return normalize_bdf(raw)
+
+
+# ---------------------------------------------------------------------------
+# Safe host driver unload / pci-stub bind / BAR0 memory-decode enable helper
+# ---------------------------------------------------------------------------
+
+_NVIDIA_UNLOAD_ORDER: tuple[str, ...] = (
+    "nvidia_drm",
+    "nvidia_modeset",
+    "nvidia_uvm",
+    "nvidia_peermem",
+    "nvidia",
+    "nouveau",
+)
+
+
+def _loaded_forbidden_modules(proc_modules_path: Path = Path("/proc/modules")) -> list[str]:
+    """Return loaded ``nvidia*`` / ``nouveau`` modules in safe reverse-dependency unload order."""
+    loaded: set[str] = set()
+    try:
+        text = proc_modules_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        if name == "nvidia" or name.startswith("nvidia_") or name == "nouveau":
+            loaded.add(name)
+    ordered = [m for m in _NVIDIA_UNLOAD_ORDER if m in loaded]
+    # Any additional nvidia_* modules not in the standard list come before core 'nvidia'.
+    extras = sorted(m for m in loaded if m not in ordered)
+    if extras:
+        if "nvidia" in ordered:
+            idx = ordered.index("nvidia")
+            ordered = ordered[:idx] + extras + ordered[idx:]
+        else:
+            ordered = extras + ordered
+    return ordered
+
+
+def inspect_gpu_driver_blockers(
+    bdf: str,
+    *,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    proc_modules_path: Path = Path("/proc/modules"),
+) -> tuple[str | None, list[str]]:
+    """Return ``(bound_driver, loaded_forbidden_modules)`` for ``bdf`` without opening BAR0."""
+    norm = normalize_bdf(bdf)
+    dev_dir = Path(sysfs_root) / norm
+    drv_link = dev_dir / "driver"
+    bound = drv_link.resolve().name if drv_link.exists() else None
+    loaded = _loaded_forbidden_modules(proc_modules_path)
+    return bound, loaded
+
+
+def find_nvidia_open_processes(proc_root: Path = Path("/proc")) -> list[tuple[int, str, str]]:
+    """Find processes holding open ``/dev/nvidia*`` handles via ``/proc/<pid>/fd`` (zero subprocesses)."""
+    holders: list[tuple[int, str, str]] = []
+    if not proc_root.is_dir():
+        return holders
+    seen: set[tuple[int, str]] = set()
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return holders
+    for pdir in entries:
+        if not pdir.name.isdigit():
+            continue
+        pid = int(pdir.name)
+        fd_dir = pdir / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        comm = _read_sysfs_text(pdir / "comm") or f"pid-{pid}"
+        for fd_link in fds:
+            try:
+                target = os.readlink(fd_link)
+            except OSError:
+                continue
+            if target.startswith("/dev/nvidia"):
+                key = (pid, target)
+                if key not in seen:
+                    seen.add(key)
+                    holders.append((pid, comm, target))
+    holders.sort(key=lambda item: (item[0], item[2]))
+    return holders
+
+
+def unload_gpu_drivers(
+    bdf: str,
+    *,
+    show=print,
+    runner=None,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    pci_bus_root: str | Path = "/sys/bus/pci",
+    proc_modules_path: Path = Path("/proc/modules"),
+    proc_root: Path = Path("/proc"),
+    check_root: bool = True,
+) -> None:
+    """Unload ``nvidia`` / ``nouveau`` kernel modules, bind ``bdf`` to ``pci-stub``, and
+    re-enable PCI memory decode (``COMMAND`` bit 1) so BAR0 is safely readable.
+
+    Never kills user processes automatically; if a module is in use, lists the exact PIDs
+    holding ``/dev/nvidia*`` so the operator can stop them cleanly.
+    """
+    norm = normalize_bdf(bdf)
+    if check_root and os.geteuid() != 0:
+        raise BurnError(
+            "root privileges are required to unload nvidia/nouveau drivers — re-run with sudo"
+        )
+
+    def _default_run(cmd: list[str]) -> tuple[int, str, str]:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    run = runner or _default_run
+
+    # 1. Unload loaded nvidia*/nouveau kernel modules in reverse-dependency order.
+    loaded = _loaded_forbidden_modules(proc_modules_path)
+    for mod in loaded:
+        show(f"  Running: modprobe -r {mod}")
+        rc, _out, err = run(["modprobe", "-r", mod])
+        if rc != 0:
+            holders = find_nvidia_open_processes(proc_root)
+            detail_lines = [f"failed to unload kernel module '{mod}' (exit {rc}): {err or 'in use'}"]
+            if holders:
+                detail_lines.append("Processes currently holding /dev/nvidia*:")
+                seen_comms: set[str] = set()
+                for pid, comm, dev in holders[:12]:
+                    detail_lines.append(f"  - pid {pid} ({comm}): {dev}")
+                    seen_comms.add(comm)
+                if "nvidia-persiste" in seen_comms or "nvidia-persistenced" in seen_comms:
+                    detail_lines.append("Hint: stop nvidia-persistenced first: sudo systemctl stop nvidia-persistenced")
+            else:
+                detail_lines.append(
+                    "Hint: stop any display manager / container / nvidia-persistenced using NVIDIA GPUs, then retry."
+                )
+            raise BurnError("\n".join(detail_lines))
+
+    still_loaded = _loaded_forbidden_modules(proc_modules_path)
+    if still_loaded:
+        raise BurnError(
+            f"nvidia/nouveau modules are still loaded after modprobe -r: {', '.join(still_loaded)}"
+        )
+
+    # 2. Ensure target BDF is unbound from any forbidden driver and bound to pci-stub (best effort).
+    dev_dir = Path(sysfs_root) / norm
+    if dev_dir.is_dir():
+        drv_link = dev_dir / "driver"
+        bound = drv_link.resolve().name if drv_link.exists() else None
+        if bound not in (None, "pci-stub"):
+            unbind_path = drv_link / "unbind"
+            if unbind_path.exists():
+                show(f"  Unbinding {norm} from {bound} ...")
+                unbind_path.write_text(f"{norm}\n", encoding="ascii")
+
+        # Try loading pci_stub and surgically binding only this BDF via driver_override + drivers_probe.
+        run(["modprobe", "pci_stub"])
+        bus_root = Path(pci_bus_root)
+        pci_stub_dir = bus_root / "drivers" / "pci-stub"
+        drv_override = dev_dir / "driver_override"
+        drivers_probe = bus_root / "drivers_probe"
+        if pci_stub_dir.is_dir() and drv_override.exists() and drivers_probe.exists():
+            try:
+                drv_override.write_text("pci-stub\n", encoding="ascii")
+                drivers_probe.write_text(f"{norm}\n", encoding="ascii")
+                show(f"  Bound {norm} to pci-stub.")
+            except OSError as exc:
+                show(f"  NOTE: could not bind {norm} to pci-stub ({exc}); leaving unbound.")
+
+        # 3. Unloading nvidia often clears PCI COMMAND bit 1 (Memory Space Enable); re-enable if off.
+        cfg_path = dev_dir / "config"
+        enable_path = dev_dir / "enable"
+        try:
+            with cfg_path.open("rb") as f:
+                cfg = f.read(6)
+            if len(cfg) >= 6:
+                cmd_val = struct.unpack_from("<H", cfg, 4)[0]
+                if (cmd_val & 0x0002) == 0 and enable_path.exists():
+                    show(f"  PCI memory decode is off (COMMAND=0x{cmd_val:04x}); enabling {norm} ...")
+                    enable_path.write_text("1\n", encoding="ascii")
+        except OSError:
+            pass
+
+
+def ensure_gpu_detached_interactive(
+    bdf: str,
+    *,
+    input_fn=input,
+    show=print,
+    sysfs_root: str | Path = "/sys/bus/pci/devices",
+    pci_bus_root: str | Path = "/sys/bus/pci",
+    proc_modules_path: Path = Path("/proc/modules"),
+    proc_root: Path = Path("/proc"),
+    runner=None,
+    check_root: bool = True,
+) -> bool:
+    """Check if ``nvidia``/``nouveau`` blocks safe BAR0 access on ``bdf`` and, if so, offer to
+    unload the driver cleanly after explicit operator confirmation.
+
+    Returns ``True`` when the host is clear to proceed, or ``False`` if the operator declined.
+    """
+    norm = normalize_bdf(bdf)
+    bound, loaded = inspect_gpu_driver_blockers(
+        norm, sysfs_root=sysfs_root, proc_modules_path=proc_modules_path
+    )
+    forbidden_bound = bound not in (None, "pci-stub")
+    if not forbidden_bound and not loaded:
+        return True
+
+    show(f"\nGPU {norm} cannot be accessed safely while nvidia/nouveau is active:")
+    if forbidden_bound:
+        show(f"  - Bound driver   : {bound}")
+    if loaded:
+        show(f"  - Loaded modules : {', '.join(loaded)}")
+    if check_root and os.geteuid() != 0:
+        raise BurnError(
+            "root privileges are required to unload nvidia/nouveau and access PCI BAR0 — re-run with sudo"
+        )
+
+    show("  NOTE: This unloads nvidia/nouveau for ALL NVIDIA GPUs on this host until reloaded or rebooted.")
+    try:
+        ans = input_fn(
+            f"Unload nvidia/nouveau now, bind {norm} to pci-stub, and enable BAR0 decode? [y/N]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans not in ("y", "yes"):
+        return False
+
+    unload_gpu_drivers(
+        norm,
+        show=show,
+        runner=runner,
+        sysfs_root=sysfs_root,
+        pci_bus_root=pci_bus_root,
+        proc_modules_path=proc_modules_path,
+        proc_root=proc_root,
+        check_root=check_root,
+    )
+    return True
+
+

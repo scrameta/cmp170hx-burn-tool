@@ -9,11 +9,11 @@ from vfi_burn.cli import main
 from vfi_burn.engine import check_plan
 from vfi_burn.ffrecord import (
     FF_ROW_MIN,
+    build_vfi_plan_from_records,
     compute_sm_count,
     decode_ff,
     encode_ff,
     fields_in_block,
-    import_ffcalc_plan,
     make_noop_test_record,
     replay_ff_rows,
     simulate_ff_write,
@@ -67,73 +67,55 @@ class TestFFRecord(unittest.TestCase):
         # 1 GPC disabled + 2 TPCs disabled on GPC 1 -> 112 - 4 = 108 SMs
         self.assertEqual(compute_sm_count(0x01, [0, 0x03, 0, 0, 0, 0, 0, 0]), 108)
 
-    def test_import_ffcalc_plan_and_cli_decode(self):
+    def test_build_vfi_plan_from_records_and_cli_decode(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
             work.chmod(0o700)
-            # Build minimal synthetic 512-row ffcalc dump + burn plan matching Kate's FBP example.
-            ff_rows = {str(i): f"0x{0x1000 + i:08x}" for i in range(8, 16)}
-            ff_rows[str(FF_ROW_MIN)] = f"0x{encode_ff(1, 7, 0x0123):08x}"
-            ff_rows[str(FF_ROW_MIN + 1)] = f"0x{encode_ff(1, 19, 0x4290):08x}"
-            for r in range(FF_ROW_MIN + 2, 487):
-                ff_rows[str(r)] = "0x00000000"
+            die_rows = {i: 0x1000 + i for i in range(8, 16)}
+            ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+            ff_rows[FF_ROW_MIN] = encode_ff(1, 7, 0x0123)
+            ff_rows[FF_ROW_MIN + 1] = encode_ff(1, 19, 0x4290)
 
-            dump = {
-                "sku": "8gb",
-                "uuid": "GPU-00000000-0000-0000-0000-000000000001",
-                "ff_rows": ff_rows,
-                "option_words": {
-                    "gpc_disable": "0x0",
-                    "gpc_defective": "0x0",
-                    "fbp_disable": "0x852",
-                    "fbp_defective": "0x840",
-                    "fbpa_disable": "0x2460",  # = replay of row 222 (c1/b7=0x0123)
-                    "fbpa_defective": "0x0",
-                    "rop_l2_disable": "0x0",
-                    "rop_l2_defective": "0x0",
+            plan_dict = build_vfi_plan_from_records(
+                ff_rows=ff_rows,
+                die_rows_int=die_rows,
+                expected_masks={
+                    "GPC_DISABLE": 0,
+                    "FBP_DISABLE": 0x852,
+                    "FBPA_DISABLE": 0x2460,
+                    "ROP_L2_DISABLE": 0,
                 },
-            }
-            burn_plan = {
-                "sku": "8gb",
-                "uuid": dump["uuid"],
-                "burn": [
+                defect_masks={
+                    "GPC_DISABLE": 0,
+                    "FBP_DISABLE": 0x840,
+                    "FBPA_DISABLE": 0,
+                    "ROP_L2_DISABLE": 0,
+                },
+                planned_items=[
                     {
-                        "row": FF_ROW_MIN + 2,
+                        "row": FF_ROW_MIN + 3,
                         "chain": 1,
                         "block": 19,
-                        "old": "0x4290",
-                        "new": "0x4200",
-                        "record": f"0x{encode_ff(1, 19, 0x4200):08x}",
+                        "old": 0x4290,
+                        "new": 0x4200,
+                        "word": encode_ff(1, 19, 0x4200),
                         "fields": ["fbp_disable"],
                     }
                 ],
-                "targets": {"fbp_disable": "0x840"},
-            }
-            dp = work / "dump.json"
-            bp = work / "burn.json"
+                prepend_noop_test=True,
+            )
             outp = work / "vfi_plan.json"
-            dp.write_text(json.dumps(dump))
-            bp.write_text(json.dumps(burn_plan))
-            dp.chmod(0o600)
-            bp.chmod(0o600)
+            outp.write_text(json.dumps(plan_dict))
+            outp.chmod(0o600)
 
-            out_buf, err_buf = io.StringIO(), io.StringIO()
-            with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                rc = main([
-                    "import-ffcalc",
-                    "--burn-plan", str(bp),
-                    "--dump", str(dp),
-                    "--out", str(outp),
-                    "--base-sm", "122",
-                    "--prepend-noop-test",
-                ])
-            self.assertEqual(rc, 0, err_buf.getvalue())
             loaded = Plan.load(outp)
             final_masks = check_plan(loaded)
             self.assertEqual(loaded.records[0].kind, "test")
             self.assertIn("NO-OP", loaded.records[0].decode)
             self.assertEqual(loaded.records[1].kind, "regular")
             self.assertEqual(final_masks["FBP_DISABLE"], 0x840)
+            # base_sm_ceiling auto-computed from defect_masks (all 8 GPCs healthy -> 128)
+            self.assertEqual(loaded.base_sm_ceiling, 128)
 
             # Verify decode CLI
             out2, err2 = io.StringIO(), io.StringIO()
@@ -143,32 +125,29 @@ class TestFFRecord(unittest.TestCase):
             self.assertIn("chain=1 block=23 data=0x0fe8", out2.getvalue())
             self.assertIn("nvlink_disable", out2.getvalue())
 
-    def test_import_ffcalc_refuses_defective_bit_clear(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp)
-            work.chmod(0o700)
-            ff_rows = {str(i): f"0x{0x1000 + i:08x}" for i in range(8, 16)}
-            ff_rows["222"] = f"0x{encode_ff(1, 19, 0x4290):08x}"
-            for r in range(223, 487):
-                ff_rows[str(r)] = "0x00000000"
-            dump = {
-                "sku": "8gb",
-                "ff_rows": ff_rows,
-                "option_words": {"fbp_disable": "0x852", "fbp_defective": "0x840"},
-            }
-            # Tries to clear FBP_DISABLE to 0x000 (clearing genuinely defective bits 0x840!).
-            burn_plan = {
-                "sku": "8gb",
-                "burn": [{
-                    "row": 223, "chain": 1, "block": 19, "old": "0x4290", "new": "0x0000",
-                    "record": f"0x{encode_ff(1, 19, 0x0000):08x}", "fields": ["fbp_disable"],
-                }],
-            }
-            dp, bp = work / "d.json", work / "b.json"
-            dp.write_text(json.dumps(dump)); dp.chmod(0o600)
-            bp.write_text(json.dumps(burn_plan)); bp.chmod(0o600)
-            with self.assertRaisesRegex(BurnError, "genuinely defective"):
-                import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
+    def test_build_plan_refuses_defective_bit_clear(self):
+        die_rows = {i: 0x1000 + i for i in range(8, 16)}
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+        ff_rows[222] = encode_ff(1, 19, 0x4290)
+        # Tries to clear FBP_DISABLE to 0x000 (clearing genuinely defective bits 0x840!).
+        with self.assertRaisesRegex(BurnError, "genuinely defective"):
+            build_vfi_plan_from_records(
+                ff_rows=ff_rows,
+                die_rows_int=die_rows,
+                expected_masks={"FBP_DISABLE": 0x852},
+                defect_masks={"FBP_DISABLE": 0x840},
+                planned_items=[
+                    {
+                        "row": 224,
+                        "chain": 1,
+                        "block": 19,
+                        "old": 0x4290,
+                        "new": 0x0000,
+                        "word": encode_ff(1, 19, 0x0000),
+                        "fields": ["fbp_disable"],
+                    }
+                ],
+            )
 
     def test_make_noop_test_record(self):
         rows = {222: encode_ff(1, 7, 0xABCD)}

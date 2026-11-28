@@ -32,6 +32,7 @@ from .ffrecord import (
     analyze_ff_block,
     classify_ff_functional_groups,
     compute_sm_count,
+    decode_a100_devid_ff_word,
     decode_all_fields,
     decode_ff,
     decode_present_fields,
@@ -39,6 +40,8 @@ from .ffrecord import (
 )
 from .fuse_rules import evaluate_fuse_combinations
 from .fuses import (
+    A100_TARGET_DEVICE_IDS,
+    BURNABLE_TARGET_DEVICE_IDS,
     EXPERIMENTAL_BY_ADDR as _EXP_BY_ADDR,
     EXPERIMENTAL_BY_NAME as _EXP_BY_NAME,
     EXPERIMENTAL_INSPECT_REGS,
@@ -52,7 +55,7 @@ from .fuses import (
 )
 from .ga100 import CMD_IDLE, CMD_PROGRAM, CMD_READ, CMD_SENSE_CTRL
 from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, is_poison, u32
+from .model import BurnError, Plan, Record, is_poison, sku_display_name, u32
 from .sim_pcie import PCIeTransaction, trace_hal_program_sequence
 
 
@@ -349,21 +352,47 @@ def format_plan_review(
     lines: list[str] = []
 
     # Optional read-only scan of current FF rows if a live or fake reader is attached.
+    # Always verify PCI SKU and Die ID (rows 8..15) first so we NEVER silently overlay
+    # Card A's plan onto Card B's live FF table.
     current_rows: dict[int, int] | None = None
     next_free_row: int | None = None
     slot_error: str | None = None
+    target_mismatch: list[str] = []
     if reader is not None:
         check_host_readonly_safe(reader.host())
         try:
-            rows: dict[int, int] = {}
-            for row_idx in range(plan.first_row, plan.last_row + 1):
-                val = reader.fuse_row(row_idx)  # raises on a fuse-unit error
-                rows[row_idx] = val
-            current_rows = rows
-            try:
-                next_free_row, _ = resolve_fpf_pointer(plan, rows, override_slot=override_slot)
-            except BurnError as exc:
-                slot_error = str(exc)
+            live_pci = reader.pci_id().strip().lower()
+            if live_pci != plan.pci_id:
+                target_mismatch.append(
+                    f"SKU MISMATCH: plan targets {plan.pci_id} ({sku_display_name(plan.pci_id)}), "
+                    f"but connected GPU is {live_pci} ({sku_display_name(live_pci)})"
+                )
+            else:
+                die_bad: list[str] = []
+                for idx, expected in sorted(plan.die_rows.items()):
+                    actual = reader.die_row(idx)
+                    if actual != expected:
+                        die_bad.append(f"row {idx}={hex32(actual)}!=plan({hex32(expected)})")
+                if die_bad:
+                    target_mismatch.append(
+                        "DIE ID MISMATCH: connected GPU is a DIFFERENT card of the same SKU ("
+                        + ", ".join(die_bad[:3])
+                        + (f", +{len(die_bad) - 3} more" if len(die_bad) > 3 else "")
+                        + ")"
+                    )
+
+            if not target_mismatch:
+                rows: dict[int, int] = {}
+                for row_idx in range(plan.first_row, plan.last_row + 1):
+                    val = reader.fuse_row(row_idx)  # raises on a fuse-unit error
+                    rows[row_idx] = val
+                current_rows = rows
+                try:
+                    next_free_row, _ = resolve_fpf_pointer(plan, rows, override_slot=override_slot)
+                except BurnError as exc:
+                    slot_error = str(exc)
+            else:
+                slot_error = "live FF scan skipped because connected GPU does not match this plan"
         except BurnError as exc:
             slot_error = str(exc)
 
@@ -373,10 +402,27 @@ def format_plan_review(
     n_real = n_total - n_test
 
     # ------------------------------------------------------------------ 1. Header
-    mode_tag = "WITH TARGET FF SCAN (read-only)" if current_rows is not None else "OFFLINE ONLY"
+    if target_mismatch:
+        lines.append("!" * 72)
+        lines.append("=== TARGET MISMATCH (WRONG CARD CONNECTED — BURN REFUSED) ===")
+        for reason in target_mismatch:
+            lines.append(f"  ERROR : {reason}")
+        lines.append(
+            "  ACTION: Live FF scan was SKIPPED so this GPU's rows are not mixed with the wrong plan."
+        )
+        lines.append(
+            "          Load the matching plan in [1] Setup -> [b], generate one with [a], or switch GPU in [c]."
+        )
+        lines.append("!" * 72)
+        lines.append("")
+        mode_tag = "OFFLINE — TARGET MISMATCH"
+    elif current_rows is not None:
+        mode_tag = "WITH TARGET FF SCAN (read-only)"
+    else:
+        mode_tag = "OFFLINE ONLY"
     lines.append(f"=== PLAN REVIEW & EXPECTED OUTCOME ({mode_tag}) ===")
     lines.append(f"  Plan SHA256  : {plan.content_hash}")
-    lines.append(f"  Target SKU   : {plan.pci_id} (CMP 170HX 8 GB)")
+    lines.append(f"  Target SKU   : {plan.pci_id} ({sku_display_name(plan.pci_id)})")
     lines.append(
         f"  SM Ceilings  : base={plan.base_sm_ceiling} | override={plan.override_sm_ceiling} | "
         f"reconfig_verified={plan.reconfig_semantics_verified}"
@@ -463,8 +509,24 @@ def format_plan_review(
             sim_blocks.setdefault(ff.chain, {})[ff.block] = ff.data
         record_analyses.append((idx, rec, analysis, None))
 
-        for w in analysis["warnings"]:
-            audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
+        devid_info = decode_a100_devid_ff_word(rec.word) if rec.kind == "devid" else None
+        if devid_info is not None:
+            which_dev, target_dev = devid_info
+            if target_dev in A100_TARGET_DEVICE_IDS:
+                audit_warnings.append(
+                    f"[{row_label} / {rec.name}] A100 IDENTITY CONVERSION ({which_dev} -> 0x{target_dev:04x} "
+                    f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]}): requires matching A100 VBIOS flash after cold boot "
+                    "AND motherboard 128 GB 64-bit BAR1 MMIO support (Above 4G, CSM OFF, ReBAR ON)"
+                )
+            else:
+                audit_warnings.append(
+                    f"[{row_label} / {rec.name}] CMP 170HX IDENTITY REVERT ({which_dev} -> 0x{target_dev:04x} "
+                    f"{BURNABLE_TARGET_DEVICE_IDS[target_dev]}): requires matching CMP 170HX VBIOS flash after cold boot "
+                    "if an A100 VBIOS is currently installed"
+                )
+        else:
+            for w in analysis["warnings"]:
+                audit_warnings.append(f"[{row_label} / {rec.name}] {w}")
         if rec.kind == "reconfig" and not plan.reconfig_semantics_verified:
             audit_warnings.append(
                 f"[{row_label} / {rec.name}] RECONFIG record semantics are NOT marked verified in plan"
@@ -540,7 +602,11 @@ def format_plan_review(
         pcie_keys = (
             "disable_gen3_speed_bit1",
             "disable_gen3_speed_bit9",
+            "pcie_magic_gen4_bit19",
+            "pcie_magic_gen4_bit22",
             "pcie_magic_gen4_dis",
+            "pcie_magic_gen4_bit26",
+            "pcie_magic_gen4_bit28",
             "pcie_boot_gen23_dis",
             "pcie_boot_gen3_dis",
         )
@@ -552,6 +618,7 @@ def format_plan_review(
             outcome_lines.append(f"  [-] PCIe Speed Flags : RESTRICTED (set {', '.join(pcie_dis)})")
 
         pcie_set = set(pcie_keys)
+        promoted_magic_d_mask = (1 << 19) | (1 << 22) | (1 << 25) | (1 << 26) | (1 << 28)
         for key in sorted(before_ff_fields):
             if key in pcie_set:
                 continue
@@ -559,8 +626,11 @@ def format_plan_review(
             if bv == av or key.upper() in reported_fields_upper:
                 continue
             if key == "magic_d":
-                # Only report if bits outside bit 25 (Gen4 flag) changed
-                if ((bv ^ av) & ~(1 << 25)) == 0:
+                # Only warn as EXPERIMENTAL if bits outside the 5 promoted Gen4 bits changed
+                if ((bv ^ av) & ~promoted_magic_d_mask) == 0:
+                    outcome_lines.append(
+                        f"  [+] PCIE_MAGIC_BITS_D: {hex32(bv)} -> {hex32(av)} (PCIe Gen4 unlock)"
+                    )
                     continue
                 outcome_lines.append(
                     f"  [!] PCIE_MAGIC_BITS_D: {hex32(bv)} -> {hex32(av)} (EXPERIMENTAL bits changed!)"
@@ -586,9 +656,25 @@ def format_plan_review(
                     f"  {tag} {key.upper():16} : {hex32(bv)} -> {hex32(av)} | {'; '.join(parts)}{caution}"
                 )
 
-    # 4d. Declared PCIe LnkCap2 / Reconfig / No-op Test summaries
+    # 4d. Declared PCIe LnkCap2 / A100 Device ID / Reconfig / No-op Test summaries
+    seen_devids: set[int] = set()
     for idx, rec, analysis, _ in record_analyses:
-        if rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
+        if rec.kind == "devid":
+            devid_info = decode_a100_devid_ff_word(rec.word)
+            if devid_info is not None:
+                _which, target_dev = devid_info
+                if target_dev not in seen_devids:
+                    seen_devids.add(target_dev)
+                    vbios_note = (
+                        "REQUIRES A100 VBIOS + 128 GB BAR1"
+                        if target_dev in A100_TARGET_DEVICE_IDS
+                        else "REVERT; REQUIRES CMP 170HX VBIOS"
+                    )
+                    outcome_lines.append(
+                        f"  [!] PCIe Device ID   : {plan.pci_id} -> 10de:{target_dev:04x} "
+                        f"({BURNABLE_TARGET_DEVICE_IDS[target_dev]}; DEVIDA+DEVIDB — {vbios_note})"
+                    )
+        elif rec.kind == "pcie" and rec.link_cap2_before is not None and rec.link_cap2_after is not None:
             outcome_lines.append(
                 f"  [+] PCIe Link Cap2   : {hex32(rec.link_cap2_before)} -> {hex32(rec.link_cap2_after)} ({rec.decode})"
             )

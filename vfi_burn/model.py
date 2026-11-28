@@ -7,6 +7,34 @@ import hashlib
 import json
 
 SKU_CMP170HX_8GB = "10de:20c2"
+SKU_CMP170HX_10GB = "10de:2082"
+SKU_A100_PCIE_40GB = "10de:20f1"
+SKU_A100_PCIE_80GB = "10de:20b5"
+SKU_A100_SXM4_40GB = "10de:20b0"
+SKU_A100_SXM4_80GB = "10de:20b2"
+SUPPORTED_CMP170HX_SKUS = (
+    SKU_CMP170HX_8GB,
+    SKU_CMP170HX_10GB,
+    SKU_A100_PCIE_40GB,
+    SKU_A100_PCIE_80GB,
+    SKU_A100_SXM4_40GB,
+    SKU_A100_SXM4_80GB,
+)
+SKU_DISPLAY_NAMES: dict[str, str] = {
+    SKU_CMP170HX_8GB: "CMP 170HX 8 GB",
+    SKU_CMP170HX_10GB: "CMP 170HX 10 GB",
+    SKU_A100_PCIE_40GB: "A100 PCIe 40 GB (GA100)",
+    SKU_A100_PCIE_80GB: "A100 PCIe 80 GB (GA100)",
+    SKU_A100_SXM4_40GB: "A100 SXM4 40 GB (GA100)",
+    SKU_A100_SXM4_80GB: "A100 SXM4 80 GB (GA100)",
+}
+
+
+def sku_display_name(pci_id: str) -> str:
+    """Return a human-readable model label for a supported GA100/CMP 170HX PCI ID."""
+    return SKU_DISPLAY_NAMES.get(pci_id.strip().lower(), f"PCI {pci_id}")
+
+
 DEBUGCTRL_ADDR = 0x00820060
 POISON_PREFIXES = (0xBADF0000, 0xBAD00000)  # most common; is_poison() matches all 0xBADxxxxx
 
@@ -115,8 +143,10 @@ class Record:
         if not isinstance(r, dict):
             raise BurnError("record must be a JSON object")
         kind = r.get("kind", "regular")
-        if kind not in ("test", "regular", "pcie", "reconfig"):
-            raise BurnError(f"unknown record kind {kind!r}; expected test, regular, pcie, or reconfig")
+        if kind not in ("test", "regular", "pcie", "reconfig", "devid"):
+            raise BurnError(
+                f"unknown record kind {kind!r}; expected test, regular, pcie, reconfig, or devid"
+            )
         defect_sensitive = r.get("defect_sensitive", False)
         if not isinstance(defect_sensitive, bool):
             raise BurnError("defect_sensitive must be a JSON boolean")
@@ -199,36 +229,18 @@ class Plan:
         if not isinstance(d, dict):
             raise BurnError("plan root must be a JSON object")
         if d.get("schema_version") != 1:
-            raw_recs = d.get("records")
-            raw_burn = d.get("burn")
-            if (
-                isinstance(raw_recs, list)
-                and raw_recs
-                and isinstance(raw_recs[0], dict)
-                and "encoded" in raw_recs[0]
-                and "row" in raw_recs[0]
-            ):
-                raise BurnError(
-                    "only schema_version=1 is understood — this looks like a ga100-ff-tools plan "
-                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ga100-ff-tools' "
-                    "or menu [1] Setup -> [h]"
-                )
-            if (
-                isinstance(raw_burn, list)
-                and raw_burn
-                and isinstance(raw_burn[0], dict)
-                and "record" in raw_burn[0]
-            ):
-                raise BurnError(
-                    "only schema_version=1 is understood — this looks like a cmp170hx-ffcalc burn plan "
-                    "(not a vfi_burn plan); import it first via 'python3 -m vfi_burn import-ffcalc' "
-                    "or menu [1] Setup -> [b]"
-                )
-            raise BurnError("only schema_version=1 is understood")
+            raise BurnError(
+                "only schema_version=1 is understood (use 'python3 -m vfi_burn configure' "
+                "or menu [1] Setup -> [a] to build a plan directly from your card)"
+            )
 
         card = _req(d, "card", "plan")
         fpf = _req(d, "fpf", "plan")
-        ceiling = _req(d, "ceiling", "plan")
+        ceiling = d.get("ceiling")
+        if ceiling is None:
+            ceiling = {"base_sm": 128}
+        elif not isinstance(ceiling, dict):
+            raise BurnError("plan.ceiling must be a JSON object")
         raw_records = _req(d, "records", "plan")
         if not isinstance(raw_records, list):
             raise BurnError("plan.records must be a JSON list")
@@ -249,8 +261,11 @@ class Plan:
             raise BurnError("must provide all eight cold die ID rows (8..15)")
 
         pci_id = str(_req(card, "pci_id", "card")).strip().lower()
-        if pci_id != SKU_CMP170HX_8GB:
-            raise BurnError(f"this implementation is exclusively for CMP 170HX 8 GB ({SKU_CMP170HX_8GB})")
+        if pci_id not in SUPPORTED_CMP170HX_SKUS:
+            raise BurnError(
+                f"unsupported PCI ID {pci_id!r}; expected CMP 170HX 8 GB ({SKU_CMP170HX_8GB}) "
+                f"or 10 GB ({SKU_CMP170HX_10GB})"
+            )
 
         first = u32(_req(fpf, "first_row", "fpf"), "fpf.first_row")
         last = u32(_req(fpf, "last_row", "fpf"), "fpf.last_row")

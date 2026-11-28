@@ -438,11 +438,11 @@ class TestLeanReads(unittest.TestCase):
         plan = self._make_plan([self._noop_rec(), self._fbp_rec()])
         ad = self._make_adapter()
 
-        # 1. format_plan_review: 1 pass (265 reads), not 3 passes (795).
+        # 1. format_plan_review: 8 die-ID identity reads + 1 pass (265 reads), not 3 passes (795).
         ad.bus.clear()
         lines = format_plan_review(plan, reader=ad)
         self.assertTrue(any("rows 226..227" in ln for ln in lines))
-        self.assertEqual(_count_cmd(ad, CMD_READ), FF_REGION_LEN)
+        self.assertEqual(_count_cmd(ad, CMD_READ), 8 + FF_REGION_LEN)
 
         # 2. ManualConsole preview (auto row), preview (explicit row), and scan: 1 pass each.
         with Journal(self.journal_path) as j:

@@ -6,7 +6,6 @@ journaling, and execution without touching ``argparse``.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -40,18 +39,19 @@ from .engine import (
     scan_slots,
     verify_cold_snapshot,
 )
-from .ffrecord import decode_ff, fields_in_block, import_ffcalc_plan, import_ga100_ff_tools_plan
+from .ffrecord import decode_ff, fields_in_block
 from .fuses import (
-    DIE_ID_ROWS,
     EXPERIMENTAL_BY_ADDR,
     EXPERIMENTAL_BY_NAME,
     decode_experimental_register,
 )
-from .ga100 import GA100LiveAdapter
+from .ga100 import GA100LiveAdapter, ensure_gpu_detached_interactive, prompt_select_gpu_bdf
 from .journal import Journal
 from .menu import BurnMenu, MenuSession
+from .menuconfig import run_menuconfig
 from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, SKU_CMP170HX_8GB, is_poison, require_private_file, u32
+from .model import BurnError, Plan, Record, is_poison, require_private_file, sku_display_name, u32
+from .planner import UnlockConfig, build_plan_from_config, capture_card_snapshot
 from .sim_pcie import SimulatedGA100Adapter, sim_pcie_from_file
 
 
@@ -82,12 +82,13 @@ class TargetSpec:
 
 @dataclass
 class CommandIO:
-    """Injectable I/O callbacks for command execution (stdout, stderr, confirmation, TTY)."""
+    """Injectable I/O callbacks for command execution (stdout, stderr, confirmation, input, TTY)."""
 
     show: Callable[[str], None] = print
     err: Callable[[str], None] = lambda msg: print(msg, file=sys.stderr)
     confirm: Callable[[str, str], bool] = default_prompt_confirm
     is_tty: Callable[[], bool] = lambda: sys.stdin.isatty()
+    input_fn: Callable[[str], str] = input
 
 
 @contextmanager
@@ -156,7 +157,7 @@ def _warn_if_unhealthy_readonly(plan: Plan, backend, io: CommandIO) -> None:
 
 def _print_plan_summary(p: Plan, final_masks: dict[str, int], io: CommandIO) -> None:
     io.show(f"OFFLINE PLAN REVIEW | SHA256: {p.content_hash}")
-    io.show(f"  SKU          : {p.pci_id} (CMP 170HX 8 GB)")
+    io.show(f"  SKU          : {p.pci_id} ({sku_display_name(p.pci_id)})")
     io.show(
         f"  FF Window    : rows {p.first_row}..{p.last_row} "
         f"({p.last_row - p.first_row + 1} slots) | empty_word={hex32(p.empty_word)}"
@@ -226,17 +227,7 @@ def execute_decode(word_raw: str, *, io: CommandIO | None = None) -> int:
     return 0
 
 
-def read_live_die_rows(bdf: str) -> dict[int, int]:
-    """Read Die ID rows 8..15 read-only from a live CMP 170HX GPU."""
-    with GA100LiveAdapter(bdf, writable=False) as backend:
-        check_host_readonly_safe(backend.host())
-        pci = backend.pci_id()
-        if pci != SKU_CMP170HX_8GB:
-            raise BurnError(f"unexpected PCI ID {pci} at {bdf} (expected {SKU_CMP170HX_8GB})")
-        return {r: backend.die_row(r) for r in DIE_ID_ROWS}
-
-
-def _check_imported_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
+def _check_generated_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
     final_masks = check_plan(loaded, allow_unmapped_ff=True)
     try:
         check_plan(loaded, allow_unmapped_ff=False)
@@ -248,70 +239,90 @@ def _check_imported_plan(loaded: Plan, io: CommandIO) -> dict[str, int]:
     return final_masks
 
 
-def execute_import_ffcalc(
+def execute_configure(
     *,
-    burn_plan: str,
-    dump: str,
+    target: TargetSpec,
     out: str,
-    base_sm: int,
-    override_sm: int | None = None,
-    prepend_noop_test: bool = True,
-    link_cap2_before: int = 0x06,
-    link_cap2_after: int = 0x1E,
+    unlock_sm_hbm: bool = False,
+    pcie_mode: str | None = None,
+    nvlink: bool | None = None,
+    a100_devid: int | None = None,
+    enable_mig_sys_pipe: bool = False,
+    use_curses: bool | None = None,
     io: CommandIO | None = None,
+    sysfs_root: str = "/sys/bus/pci/devices",
 ) -> int:
+    """Capture live/simulated card state read-only and build a mode-0600 vfi_burn plan
+    interactively (kernel menuconfig) or non-interactively via explicit unlock flags."""
     io = io or CommandIO()
-    plan_dict = import_ffcalc_plan(
-        burn_plan,
-        dump,
-        base_sm_ceiling=base_sm,
-        override_sm_ceiling=override_sm,
-        prepend_noop_test=prepend_noop_test,
-        link_cap2_before=link_cap2_before,
-        link_cap2_after=link_cap2_after,
+    if not target.has_target:
+        picked = prompt_select_gpu_bdf(
+            current_bdf=None,
+            input_fn=io.input_fn,
+            show=io.show,
+            sysfs_root=sysfs_root,
+        )
+        if not picked:
+            io.show("No GPU selected; cancelled.")
+            return 1
+        target = replace(target, bdf=picked)
+
+    if target.bdf and not target.is_simulated:
+        if not ensure_gpu_detached_interactive(
+            target.bdf,
+            input_fn=io.input_fn,
+            show=io.show,
+            sysfs_root=sysfs_root,
+        ):
+            io.show("Cancelled — nvidia/nouveau must be unloaded before reading BAR0.")
+            return 1
+
+    with open_target(target, writable=False) as backend:
+        check_host_readonly_safe(backend.host())
+        label = target.bdf or target.adapter or target.sim_pcie or target.fake or "GPU"
+        card = capture_card_snapshot(backend, label=label)
+
+    non_interactive = (
+        unlock_sm_hbm
+        or (pcie_mode is not None)
+        or (nvlink is not None)
+        or (a100_devid is not None)
+        or enable_mig_sys_pipe
     )
+    if non_interactive:
+        cfg = UnlockConfig.from_card(card)
+        if unlock_sm_hbm:
+            cfg.unlock_all_healthy_sm_hbm()
+        if pcie_mode is not None:
+            cfg.set_pcie_mode(pcie_mode)
+        if nvlink is not None:
+            cfg.set_nvlink(nvlink)
+        if a100_devid is not None:
+            cfg.set_a100_devid(a100_devid)
+        if enable_mig_sys_pipe:
+            cfg.set_sys_pipe_unlock(True)
+    else:
+        custom_io = (io.input_fn is not input) or (io.show is not print)
+        cfg = run_menuconfig(
+            card,
+            use_curses=False if (custom_io and use_curses is None) else use_curses,
+            input_fn=io.input_fn if custom_io else None,
+            show=io.show if custom_io else None,
+        )
+        if cfg is None:
+            io.show("Unlock configuration cancelled; no plan written.")
+            return 1
+
+    plan_dict = build_plan_from_config(card, cfg)
     write_private_json(out, plan_dict)
     loaded = Plan.load(out)
-    final_masks = _check_imported_plan(loaded, io)
-    io.show(f"Imported ffcalc plan to {out} (mode 0600):")
+    final_masks = _check_generated_plan(loaded, io)
+    io.show(f"Generated plan {out} (mode 0600) | {cfg.summary_line()}:")
     _print_plan_summary(loaded, final_masks, io)
-    return 0
-
-
-def execute_import_ga100_ff_tools(
-    *,
-    plans: Sequence[str],
-    dump: str,
-    defects: str,
-    out: str,
-    base_sm: int,
-    override_sm: int | None = None,
-    die_rows_from: str | None = None,
-    bdf: str | None = None,
-    prepend_noop_test: bool | None = None,
-    link_cap2_before: int = 0x06,
-    link_cap2_after: int = 0x1E,
-    io: CommandIO | None = None,
-) -> int:
-    io = io or CommandIO()
-    live_die = read_live_die_rows(bdf) if bdf else None
-    plan_dict = import_ga100_ff_tools_plan(
-        plans,
-        dump,
-        defects,
-        base_sm_ceiling=base_sm,
-        override_sm_ceiling=override_sm,
-        die_rows=live_die,
-        die_rows_path=die_rows_from,
-        prepend_noop_test=prepend_noop_test,
-        link_cap2_before=link_cap2_before,
-        link_cap2_after=link_cap2_after,
-    )
-    write_private_json(out, plan_dict)
-    loaded = Plan.load(out)
-    final_masks = _check_imported_plan(loaded, io)
-    io.show(f"Imported ga100-ff-tools plan to {out} (mode 0600):")
-    _print_plan_summary(loaded, final_masks, io)
+    if target.bdf:
+        io.show(f"Next: sudo python3 -m vfi_burn menu --bdf {target.bdf} --plan {out}")
+    elif target.fake:
+        io.show(f"Next: python3 -m vfi_burn menu --fake {target.fake} --plan {out}")
     return 0
 
 

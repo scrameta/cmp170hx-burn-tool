@@ -26,9 +26,27 @@ TOTAL_FUSE_ROWS = 512
 DIE_ID_ROWS: tuple[int, ...] = tuple(range(8, 16))
 FF_EMPTY_WORD = 0x00000000
 
-# Chain 2 blocks 37 and 38 carry read-only PCIe device-ID fuses (DEVIDA/DEVIDB) and no
-# burnable fields; unconditionally denied in both the engine and low-level fuse controller.
+# Chain 2 blocks 37 and 38 carry PCIe device-ID fuses (DEVIDA/DEVIDB); denied by default
+# unless explicitly validated as an intentional A100 identity conversion (requires A100 VBIOS
+# + 128 GB BAR1 confirmation).
 DEVICE_ID_DENIED_BLOCKS: frozenset[tuple[int, int]] = frozenset({(2, 37), (2, 38)})
+
+# Verified GA100 target PCI Device IDs for intentional DEVIDA (c2/b37) + DEVIDB (c2/b38)
+# conversion or revert (encoded in FF as ``device_id << 1`` with bit 0 == 0).
+A100_TARGET_DEVICE_IDS: dict[int, str] = {
+    0x20F1: "A100 PCIe 40 GB (10de:20f1)",
+    0x20B5: "A100 PCIe 80 GB (10de:20b5)",
+    0x20B0: "A100 SXM4 40 GB (10de:20b0)",
+    0x20B2: "A100 SXM4 80 GB (10de:20b2)",
+}
+CMP170HX_TARGET_DEVICE_IDS: dict[int, str] = {
+    0x20C2: "CMP 170HX 8 GB (10de:20c2)",
+    0x2082: "CMP 170HX 10 GB (10de:2082)",
+}
+BURNABLE_TARGET_DEVICE_IDS: dict[int, str] = {
+    **A100_TARGET_DEVICE_IDS,
+    **CMP170HX_TARGET_DEVICE_IDS,
+}
 
 # Core fuse-controller BAR0 registers (verified across GA100 references).
 REG_PMC_BOOT_0 = 0x00000000
@@ -384,13 +402,61 @@ FUSE_CATALOG: tuple[FuseDefinition, ...] = tuple(
             fused_addr=0x00820250,
         ),
         FuseDefinition(
+            key="pcie_magic_gen4_bit19",
+            name="NV_FUSE_OPT_PCIE_MAGIC_BITS_D[19]",
+            fuse_type=FuseType.FF_OPTION,
+            category="pcie",
+            functional_group="pcie",
+            description="PCIe Gen4 MAGIC_BITS_D bit 19 (cleared for A100 0x00200000)",
+            ff_location=FFLocation(chain=2, bit=46 * 16 + 13, width=1),
+            ff_overridable=True,
+            burnable=True,
+            fused_addr=0x00820520,
+        ),
+        FuseDefinition(
+            key="pcie_magic_gen4_bit22",
+            name="NV_FUSE_OPT_PCIE_MAGIC_BITS_D[22]",
+            fuse_type=FuseType.FF_OPTION,
+            category="pcie",
+            functional_group="pcie",
+            description="PCIe Gen4 MAGIC_BITS_D bit 22 (cleared for A100 0x00200000)",
+            ff_location=FFLocation(chain=2, bit=47 * 16 + 0, width=1),
+            ff_overridable=True,
+            burnable=True,
+            fused_addr=0x00820520,
+        ),
+        FuseDefinition(
             key="pcie_magic_gen4_dis",
             name="NV_FUSE_OPT_PCIE_MAGIC_BITS_D[25]",
             fuse_type=FuseType.FF_OPTION,
             category="pcie",
             functional_group="pcie",
-            description="Gen4 speed-disable flag",
+            description="Gen4 speed-disable flag (MAGIC_BITS_D bit 25)",
             ff_location=FFLocation(chain=2, bit=47 * 16 + 3, width=1),
+            ff_overridable=True,
+            burnable=True,
+            fused_addr=0x00820520,
+        ),
+        FuseDefinition(
+            key="pcie_magic_gen4_bit26",
+            name="NV_FUSE_OPT_PCIE_MAGIC_BITS_D[26]",
+            fuse_type=FuseType.FF_OPTION,
+            category="pcie",
+            functional_group="pcie",
+            description="PCIe Gen4 MAGIC_BITS_D bit 26 (cleared for A100 0x00200000)",
+            ff_location=FFLocation(chain=2, bit=47 * 16 + 4, width=1),
+            ff_overridable=True,
+            burnable=True,
+            fused_addr=0x00820520,
+        ),
+        FuseDefinition(
+            key="pcie_magic_gen4_bit28",
+            name="NV_FUSE_OPT_PCIE_MAGIC_BITS_D[28]",
+            fuse_type=FuseType.FF_OPTION,
+            category="pcie",
+            functional_group="pcie",
+            description="PCIe Gen4 MAGIC_BITS_D bit 28 (cleared for A100 0x00200000)",
+            ff_location=FFLocation(chain=2, bit=47 * 16 + 6, width=1),
             ff_overridable=True,
             burnable=True,
             fused_addr=0x00820520,
@@ -427,7 +493,7 @@ FUSE_CATALOG: tuple[FuseDefinition, ...] = tuple(
             fuse_type=FuseType.FF_OPTION,
             category="identity",
             functional_group="pcie",
-            description="whole MAGIC_BITS_D word (opt-in; A100 value 0x00200000 is experimental)",
+            description="whole MAGIC_BITS_D word (Gen4 bits 19/22/25/26/28 are standard; other bits remain opt-in)",
             ff_location=FFLocation(chain=2, bit=730, width=32),
             ff_overridable=True,
             burnable=True,

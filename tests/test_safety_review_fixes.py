@@ -26,7 +26,7 @@ from vfi_burn.ffrecord import (
     FF_ROW_MIN,
     encode_ff,
     ff_word_touches_pcie,
-    import_ffcalc_plan,
+    build_vfi_plan_from_records,
     replay_ff_rows,
 )
 from vfi_burn.ga100 import (
@@ -438,33 +438,26 @@ class TestP0_3_NoopTestProof(SafetyReviewTestBase):
                 )
         self.assertEqual(mmio.program_calls, 0)
 
-    def test_importer_defaults_to_noop_test_and_refuses_promoting_real_record(self):
-        rows = {str(i): f"0x{v:08x}" for i, v in DIE_ROWS.items()}
-        rows[str(FF_ROW_MIN)] = f"0x{encode_ff(1, 19, 0x4290):08x}"
-        for r in range(FF_ROW_MIN + 1, 487):
-            rows[str(r)] = "0x00000000"
-        dump_p = self._write_json("dump.json", {
-            "ff_rows": rows,
-            "option_words": {
-                "fbp_disable": 0x852,
-                "fbp_defective": 0x840,
-                "rop_l2_disable": 0,
-                "rop_l2_defective": 0,
-            },
-        })
-        burn_p = self._write_json("burn.json", {
-            "burn": [{
-                "row": 223,
-                "chain": 1,
-                "block": 19,
-                "old": "0x4290",
-                "new": "0x4200",
-                "record": f"0x{encode_ff(1, 19, 0x4200):08x}",
-                "fields": ["fbp_disable"],
-            }],
-        })
-        # Default import prepends a proved no-op test AND stores baseline_ff_rows + sha256!
-        plan_dict = import_ffcalc_plan(burn_p, dump_p, base_sm_ceiling=122)
+    def test_builder_defaults_to_noop_test_and_refuses_promoting_real_record(self):
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+        ff_rows[FF_ROW_MIN] = encode_ff(1, 19, 0x4290)
+        planned = [{
+            "row": 224,
+            "chain": 1,
+            "block": 19,
+            "old": 0x4290,
+            "new": 0x4200,
+            "word": encode_ff(1, 19, 0x4200),
+            "fields": ["fbp_disable"],
+        }]
+        # Default builder prepends a proved no-op test AND stores baseline_ff_rows + sha256!
+        plan_dict = build_vfi_plan_from_records(
+            ff_rows=ff_rows,
+            die_rows_int=dict(DIE_ROWS),
+            expected_masks={"FBP_DISABLE": 0x852, "ROP_L2_DISABLE": 0},
+            defect_masks={"FBP_DISABLE": 0x840, "ROP_L2_DISABLE": 0},
+            planned_items=planned,
+        )
         self.assertEqual(len(plan_dict["records"]), 2)
         self.assertEqual(plan_dict["records"][0]["kind"], "test")
         self.assertIn("NO-OP", plan_dict["records"][0]["decode"])
@@ -474,9 +467,16 @@ class TestP0_3_NoopTestProof(SafetyReviewTestBase):
             plan_dict["fpf"]["baseline_ff_sha256"],
             canonical_ff_prefix_sha256({222: encode_ff(1, 19, 0x4290)}),
         )
-        # Disabling prepend_noop_test when burn[0] changes bits MUST be refused!
+        # Disabling prepend_noop_test when record[0] changes bits MUST be refused!
         with self.assertRaisesRegex(BurnError, "is NOT a no-op"):
-            import_ffcalc_plan(burn_p, dump_p, base_sm_ceiling=122, prepend_noop_test=False)
+            build_vfi_plan_from_records(
+                ff_rows=ff_rows,
+                die_rows_int=dict(DIE_ROWS),
+                expected_masks={"FBP_DISABLE": 0x852, "ROP_L2_DISABLE": 0},
+                defect_masks={"FBP_DISABLE": 0x840, "ROP_L2_DISABLE": 0},
+                planned_items=planned,
+                prepend_noop_test=False,
+            )
 
 
 class TestP1_1_PoweroffSanityCheck(SafetyReviewTestBase):
@@ -1074,34 +1074,27 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                 )
         self.assertEqual(mmio.program_calls, 0)
 
-        # 3) import_ffcalc_plan() also refuses chain 2 block 39 when absent from dump FF prefix.
-        ff_rows = {str(i): f"0x{v:08x}" for i, v in DIE_ROWS.items()}
-        ff_rows["222"] = f"0x{encode_ff(1, 7, 0x0123):08x}"
-        for r in range(223, 487):
-            ff_rows[str(r)] = "0x00000000"
-        dp = self._write_json(
-            "dump_no_b39.json",
-            {"sku": "8gb", "ff_rows": ff_rows, "option_words": {}},
-        )
-        bp = self._write_json(
-            "burn_no_b39.json",
-            {
-                "sku": "8gb",
-                "burn": [
+        # 3) build_vfi_plan_from_records() also refuses chain 2 block 39 when absent from FF prefix.
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+        ff_rows[222] = encode_ff(1, 7, 0x0123)
+        with self.assertRaisesRegex(BurnError, "NV_FUSE_OPT_PCIE_DEVIDB.*no verified baseline block"):
+            build_vfi_plan_from_records(
+                ff_rows=ff_rows,
+                die_rows_int=dict(DIE_ROWS),
+                expected_masks={},
+                defect_masks={},
+                planned_items=[
                     {
-                        "row": 223,
+                        "row": 224,
                         "chain": 2,
                         "block": 39,
-                        "old": "0x0000",
-                        "new": "0x0580",
-                        "record": f"0x{gen3_word:08x}",
+                        "old": 0x0000,
+                        "new": 0x0580,
+                        "word": gen3_word,
                         "fields": ["disable_gen3_speed_bit1", "disable_gen3_speed_bit9"],
                     }
                 ],
-            },
-        )
-        with self.assertRaisesRegex(BurnError, "NV_FUSE_OPT_PCIE_DEVIDB.*no verified baseline block"):
-            import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
+            )
 
     def test_chain2_block46_magic_d_is_treated_as_pcie_and_enforces_lnkcap2_and_review(self):
         # Finding 3: ga100-ff-tools Gen4 record on chain 2 block 46 (0xA000 -> 0x8000, magic_d)
@@ -1150,7 +1143,43 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                 )
         self.assertEqual(mmio0.program_calls, 0)
 
-        # 2) With LnkCap2 declared, WITHOUT --override-unmapped-ff it is still refused (magic_d opt_in).
+        # 2) An UNPROMOTED magic_d bit on block 46 (0xA000 -> 0xA001, bit 0) WITHOUT
+        #    --override-unmapped-ff is still refused (magic_d opt_in).
+        b46_unpromoted = encode_ff(2, 46, 0xA001)
+        unpromoted_plan = self._make_plan(
+            [
+                self._noop_rec(),
+                {
+                    "name": "MAGIC_D_UNPROMOTED",
+                    "kind": "regular",
+                    "target": "MAGIC_D",
+                    "word": f"0x{b46_unpromoted:08x}",
+                    "decode": "chain 2 block 46 0xA000 -> 0xA001 (unpromoted bit)",
+                    "defect_sensitive": False,
+                    "link_cap2_before": "0x06",
+                    "link_cap2_after": "0x1e",
+                },
+            ],
+            baseline_rows=base_rows,
+            name="b46_unpromoted.json",
+        )
+        mmio_no_ov = self._live_mmio(base_rows)
+        ad_no_ov = LiveMMIOAdapter(mmio_no_ov)
+        with Journal(self.work / "j_b46_no_ov.jsonl") as j_no_ov:
+            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
+                process_records(
+                    unpromoted_plan,
+                    ad_no_ov,
+                    ad_no_ov,
+                    j_no_ov,
+                    stage="all",
+                    confirm=lambda *_: True,
+                    show=lambda *_: None,
+                )
+        self.assertEqual(mmio_no_ov.program_calls, 0)
+
+        # 3) Promoted Gen4 block 46 bit 19 (0xA000 -> 0x8000) needs NO override,
+        #    and wrong live LnkCap2 still refuses before burning block 46.
         with_lnk_plan = self._make_plan(
             [
                 self._noop_rec(),
@@ -1168,22 +1197,6 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
             baseline_rows=base_rows,
             name="b46_with_lnk.json",
         )
-        mmio_no_ov = self._live_mmio(base_rows)
-        ad_no_ov = LiveMMIOAdapter(mmio_no_ov)
-        with Journal(self.work / "j_b46_no_ov.jsonl") as j_no_ov:
-            with self.assertRaisesRegex(BurnError, "experimental opt-in field"):
-                process_records(
-                    with_lnk_plan,
-                    ad_no_ov,
-                    ad_no_ov,
-                    j_no_ov,
-                    stage="all",
-                    confirm=lambda *_: True,
-                    show=lambda *_: None,
-                )
-        self.assertEqual(mmio_no_ov.program_calls, 0)
-
-        # 3) With Overrides(unmapped_ff=True), wrong live LnkCap2 refuses before burning block 46.
         mmio1 = self._live_mmio(base_rows)
         ad1 = LiveMMIOAdapter(mmio1, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x02})
         with Journal(self.work / "j_b46_1.jsonl") as j1:
@@ -1194,13 +1207,12 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                     ad1,
                     j1,
                     stage="all",
-                    overrides=Overrides(unmapped_ff=True),
                     confirm=lambda *_: True,
                     show=lambda *_: None,
                 )
         self.assertEqual(mmio1.program_calls, 1)  # NOOP_TEST only; block 46 refused
 
-        # 4) Matching live LnkCap2 demands REVIEW PCIE confirmation token!
+        # 4) Matching live LnkCap2 still demands REVIEW PCIE confirmation token (no override needed)!
         mmio2 = self._live_mmio(base_rows)
         ad2 = LiveMMIOAdapter(mmio2, fields={"FBP_DISABLE": 0x852, "LnkCap2": 0x06})
         tokens: list[str] = []
@@ -1217,42 +1229,37 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
                     ad2,
                     j2,
                     stage="all",
-                    overrides=Overrides(unmapped_ff=True),
                     confirm=decline_review_pcie,
                     show=lambda *_: None,
                 )
         self.assertIn("REVIEW PCIE", tokens)
         self.assertEqual(mmio2.program_calls, 1)
 
-        # 5) import_ffcalc_plan classifies block 46 magic_d as kind="pcie" with LnkCap2 fields.
-        ff_rows = {str(i): f"0x{v:08x}" for i, v in DIE_ROWS.items()}
-        ff_rows["222"] = f"0x{encode_ff(1, 7, 0x0123):08x}"
-        ff_rows["223"] = f"0x{b46_old:08x}"
-        for r in range(224, 487):
-            ff_rows[str(r)] = "0x00000000"
-        dp = self._write_json("dump_b46.json", {"sku": "8gb", "ff_rows": ff_rows, "option_words": {}})
-        bp = self._write_json(
-            "burn_b46.json",
-            {
-                "sku": "8gb",
-                "burn": [
-                    {
-                        "row": 224,
-                        "chain": 2,
-                        "block": 46,
-                        "old": "0xa000",
-                        "new": "0x8000",
-                        "record": f"0x{b46_new:08x}",
-                        "fields": ["magic_d"],
-                    }
-                ],
-            },
+        # 5) build_vfi_plan_from_records classifies block 46 magic_d as kind="pcie" with LnkCap2 fields.
+        ff_rows = {r: 0 for r in range(FF_ROW_MIN, 487)}
+        ff_rows[222] = encode_ff(1, 7, 0x0123)
+        ff_rows[223] = b46_old
+        built = build_vfi_plan_from_records(
+            ff_rows=ff_rows,
+            die_rows_int=dict(DIE_ROWS),
+            expected_masks={},
+            defect_masks={},
+            planned_items=[
+                {
+                    "row": 225,
+                    "chain": 2,
+                    "block": 46,
+                    "old": 0xA000,
+                    "new": 0x8000,
+                    "word": b46_new,
+                    "fields": ["magic_d"],
+                }
+            ],
         )
-        imported = import_ffcalc_plan(bp, dp, base_sm_ceiling=122)
-        self.assertEqual(imported["records"][1]["kind"], "pcie")
-        self.assertIn("link_cap2_before", imported["records"][1])
-        self.assertIn("link_cap2_after", imported["records"][1])
-        self.assertEqual(imported["final_expected_cold"]["LnkCap2"], "0x1e")
+        self.assertEqual(built["records"][1]["kind"], "pcie")
+        self.assertIn("link_cap2_before", built["records"][1])
+        self.assertIn("link_cap2_after", built["records"][1])
+        self.assertEqual(built["final_expected_cold"]["LnkCap2"], "0x1e")
 
 
 if __name__ == "__main__":

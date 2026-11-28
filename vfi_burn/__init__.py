@@ -11,7 +11,7 @@ from .engine import (
     scan_fpf_rows,
     scan_slots,
 )
-from .ffrecord import FFRecord, decode_ff, encode_ff, import_ffcalc_plan, replay_ff_rows, simulate_ff_write
+from .ffrecord import FFRecord, build_vfi_plan_from_records, decode_ff, encode_ff, replay_ff_rows, simulate_ff_write
 from .fuse_rules import (
     COMBINATION_RULES,
     FUSE_GROUPS,
@@ -23,11 +23,23 @@ from .fuse_rules import (
     poweroff_domains_for_groups,
 )
 from .fuses import FFLocation, FUSE_CATALOG, FuseDefinition, FuseType
-from .ga100 import GA100FuseController, GA100LiveAdapter
+from .ga100 import (
+    DiscoveredGPU,
+    GA100FuseController,
+    GA100LiveAdapter,
+    discover_pci_gpus,
+    ensure_gpu_detached_interactive,
+    format_gpu_entry,
+    inspect_gpu_driver_blockers,
+    prompt_select_gpu_bdf,
+    unload_gpu_drivers,
+)
 from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, MMIOBus, MMIOReadBus
 from .menu import BurnMenu, MenuSession
+from .menuconfig import run_menuconfig
 from .mmio import AlignedMMIO, ReadOnlyMMIO
 from .model import BurnError, Plan, Record
+from .planner import CardSnapshot, UnlockConfig, build_plan_from_config, capture_card_snapshot, derive_ff_records
 from .sim_pcie import (
     PCIeTransaction,
     SimulatedGA100Adapter,
@@ -36,14 +48,16 @@ from .sim_pcie import (
     trace_hal_program_sequence,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "AlignedMMIO",
     "BurnError",
     "BurnMenu",
     "COMBINATION_RULES",
+    "CardSnapshot",
     "CombinationIssue",
+    "DiscoveredGPU",
     "FFLocation",
     "FFRecord",
     "FUSE_CATALOG",
@@ -73,19 +87,27 @@ __all__ = [
     "SimulatedGA100Adapter",
     "SimulatedGA100PCIe",
     "TracingMMIOBus",
+    "UnlockConfig",
+    "build_plan_from_config",
+    "build_vfi_plan_from_records",
+    "capture_card_snapshot",
     "check_health",
     "check_plan",
     "decode_ff",
+    "derive_ff_records",
+    "discover_pci_gpus",
     "encode_ff",
     "evaluate_fuse_combinations",
+    "format_gpu_entry",
     "has_verified_writer",
-    "import_ffcalc_plan",
     "poweroff_domain_for_group",
     "poweroff_domains_for_groups",
     "preflight",
     "process_records",
+    "prompt_select_gpu_bdf",
     "replay_ff_rows",
     "resolve_fpf_pointer",
+    "run_menuconfig",
     "scan_fpf_rows",
     "scan_slots",
     "simulate_ff_write",
