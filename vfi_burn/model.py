@@ -9,6 +9,17 @@ import json
 SKU_CMP170HX_8GB = "10de:20c2"
 SKU_CMP170HX_10GB = "10de:2082"
 SUPPORTED_CMP170HX_SKUS = (SKU_CMP170HX_8GB, SKU_CMP170HX_10GB)
+SKU_DISPLAY_NAMES: dict[str, str] = {
+    SKU_CMP170HX_8GB: "CMP 170HX 8 GB",
+    SKU_CMP170HX_10GB: "CMP 170HX 10 GB",
+}
+
+
+def sku_display_name(pci_id: str) -> str:
+    """Return a human-readable model label for a supported CMP 170HX PCI ID."""
+    return SKU_DISPLAY_NAMES.get(pci_id.strip().lower(), f"PCI {pci_id}")
+
+
 DEBUGCTRL_ADDR = 0x00820060
 POISON_PREFIXES = (0xBADF0000, 0xBAD00000)  # most common; is_poison() matches all 0xBADxxxxx
 

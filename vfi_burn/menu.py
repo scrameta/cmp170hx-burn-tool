@@ -42,7 +42,7 @@ from .engine import (
 from .ffrecord import decode_ff, fields_in_block
 from .ga100 import GA100LiveAdapter, ensure_gpu_detached_interactive, prompt_select_gpu_bdf
 from .menuconfig import run_menuconfig
-from .model import BurnError, Plan, require_private_file, u32
+from .model import BurnError, Plan, require_private_file, sku_display_name, u32
 from .planner import build_plan_from_config, capture_card_snapshot
 
 
@@ -182,22 +182,43 @@ class BurnMenu:
                 "supplied adapter does not have write capability armed (write_enabled=True / writer_verified=True)"
             )
 
+    def _bdf_sysfs_pci_id(self, bdf: str | None) -> str | None:
+        if not bdf:
+            return None
+        try:
+            dev_dir = Path(self._sysfs_root) / bdf
+            v = int((dev_dir / "vendor").read_text(encoding="utf-8").strip(), 0)
+            d = int((dev_dir / "device").read_text(encoding="utf-8").strip(), 0)
+            return f"{v:04x}:{d:04x}"
+        except (OSError, ValueError):
+            return None
+
     def _render_header(self) -> None:
         plan_info = self.s.plan_path or "not selected"
+        live_pci = self._bdf_sysfs_pci_id(self.s.bdf) if not self.s.fake_path else None
         if self.s.plan_path:
             try:
                 p = Plan.load(self.s.plan_path)
-                plan_info = f"{self.s.plan_path} ({len(p.records)} records, sha={p.content_hash[:12]})"
+                mismatch = ""
+                if live_pci and live_pci != p.pci_id:
+                    mismatch = f"  [!! SKU MISMATCH vs GPU {live_pci} !!]"
+                plan_info = (
+                    f"{self.s.plan_path} ({p.pci_id} {sku_display_name(p.pci_id)}, "
+                    f"{len(p.records)} records, sha={p.content_hash[:12]}){mismatch}"
+                )
             except Exception as exc:
                 plan_info = f"{self.s.plan_path} (INVALID: {exc})"
         ov_list = self.s.overrides.active_names()
         ov_str = ", ".join(ov_list) if ov_list else "none (strict defaults)"
         self.show("\n" + "=" * 72)
-        self.show("  vfi_burn — CMP 170HX 8 GB FF Fuse-Burn Safety Controller")
+        self.show("  vfi_burn — CMP 170HX (8 GB / 10 GB) FF Fuse-Burn Safety Controller")
         self.show("  WARNING: UNTESTED ON PHYSICAL HARDWARE — VERIFY EVERYTHING BY HAND")
         self.show("=" * 72)
         self.show(f"  Mode      : {self._mode_label()}")
-        self.show(f"  Target    : {self._target_label()}")
+        target_lbl = self._target_label()
+        if live_pci:
+            target_lbl += f" ({live_pci} {sku_display_name(live_pci)})"
+        self.show(f"  Target    : {target_lbl}")
         self.show(f"  Plan      : {plan_info}")
         self.show(f"  Journal   : {self.s.journal_path}" + (f" | Receipt: {self.s.receipt_path}" if self.s.receipt_path else ""))
         self.show(f"  Overrides : {ov_str}")
@@ -254,7 +275,28 @@ class BurnMenu:
             return
         fn()
 
-    def _configure_unlocks_interactive(self) -> None:
+    def _default_plan_path_for_card(self, card) -> str:
+        """Return a safe default save path that never silently overwrites a different card's plan."""
+        if self.s.plan_path:
+            try:
+                existing = Plan.load(self.s.plan_path)
+                if existing.pci_id == card.pci_id and existing.die_rows == card.die_rows:
+                    return self.s.plan_path
+            except Exception:
+                pass
+        dev_slug = card.pci_id.split(":")[-1].lower()
+        return f"private/plan_{dev_slug}.json"
+
+    def _warn_if_plan_sku_mismatches_bdf(self, p: Plan, bdf: str | None) -> None:
+        live_pci = self._bdf_sysfs_pci_id(bdf)
+        if live_pci and live_pci != p.pci_id:
+            self.show(
+                f"WARNING: loaded plan targets {p.pci_id} ({sku_display_name(p.pci_id)}), "
+                f"but selected GPU {bdf} is {live_pci} ({sku_display_name(live_pci)}). "
+                "Pick the matching plan or switch GPU before reviewing/burning."
+            )
+
+    def _configure_unlocks_interactive(self) -> bool:
         if not (self.s.bdf or self.s.fake_path or self.s.adapter_spec):
             bdf = prompt_select_gpu_bdf(
                 current_bdf=None,
@@ -264,7 +306,7 @@ class BurnMenu:
             )
             if not bdf:
                 self.show("No GPU selected; cancelled.")
-                return
+                return False
             self.s.bdf = bdf
             self.s.execute_live = False
 
@@ -276,7 +318,7 @@ class BurnMenu:
                 sysfs_root=self._sysfs_root,
             ):
                 self.show("Cancelled — nvidia/nouveau must be unloaded before reading BAR0.")
-                return
+                return False
 
         backend, owned = self._open_backend(writable=False)
         try:
@@ -293,21 +335,24 @@ class BurnMenu:
         )
         if cfg is None:
             self.show("Unlock configuration cancelled.")
-            return
+            return False
 
         plan_dict = build_plan_from_config(card, cfg)
-        out = self._ask("Save mode-0600 plan JSON path", self.s.plan_path or "private/plan.json")
+        out = self._ask("Save mode-0600 plan JSON path", self._default_plan_path_for_card(card))
         if not out:
             self.show("Plan not saved (no output path given).")
-            return
+            return False
         write_private_json(out, plan_dict)
         loaded = Plan.load(out)
         self._validate_plan_for_setup(loaded)
         self.s.plan_path = out
         self.show(
-            f"Saved & loaded {out} ({len(loaded.records)} records: 1 auto no-op test + "
-            f"{len(loaded.records) - 1} real; {cfg.summary_line()})."
+            f"Saved & loaded {out} ({loaded.pci_id} {sku_display_name(loaded.pci_id)}, "
+            f"{len(loaded.records)} records: 1 auto no-op test + "
+            f"{len(loaded.records) - 1} real; {cfg.summary_line()}). "
+            "Ready for [2] Review Plan, [3] Live Status, or [5] Dry-Run."
         )
+        return True
 
     # ------------------------------------------------------------------ [1] Setup
     def _menu_setup(self) -> None:
@@ -326,14 +371,20 @@ class BurnMenu:
             if sub in ("0", "", "b0", "back"):
                 return
             if sub == "a":
-                self._configure_unlocks_interactive()
+                if self._configure_unlocks_interactive():
+                    return
             elif sub == "b":
                 path = self._ask("Path to mode-0600 vfi_burn plan JSON", self.s.plan_path)
                 if path:
                     p = Plan.load(path)
                     self._validate_plan_for_setup(p)
                     self.s.plan_path = path
-                    self.show(f"Loaded valid plan ({len(p.records)} records, sha={p.content_hash[:12]}).")
+                    self.show(
+                        f"Loaded valid plan ({p.pci_id} {sku_display_name(p.pci_id)}, "
+                        f"{len(p.records)} records, sha={p.content_hash[:12]})."
+                    )
+                    if not self.s.fake_path:
+                        self._warn_if_plan_sku_mismatches_bdf(p, self.s.bdf)
             elif sub == "c":
                 bdf = prompt_select_gpu_bdf(
                     current_bdf=self.s.bdf,
@@ -350,6 +401,11 @@ class BurnMenu:
                     self._cached_fake = None
                     self.s.execute_live = False  # always reset to safe read-only on target change
                     self.show(f"Target set to live hardware {bdf} (Live Execute reset to OFF).")
+                    if self.s.plan_path:
+                        try:
+                            self._warn_if_plan_sku_mismatches_bdf(Plan.load(self.s.plan_path), bdf)
+                        except Exception:
+                            pass
             elif sub == "d":
                 fp = self._ask("Path to mode-0600 fake JSON snapshot", self.s.fake_path or "private/fake.json")
                 if fp:

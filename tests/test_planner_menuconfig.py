@@ -632,7 +632,6 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
             "a",
             "5", "s",
             str(plan_path),
-            "0",
             "2",
             "q",
         ])
@@ -649,6 +648,52 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         output = "\n".join(shown)
         self.assertIn("Saved & loaded", output)
         self.assertIn("NOOP_TEST", output)
+
+    def test_plan_review_flags_sku_and_die_mismatch_without_mixing_live_ff(self):
+        from vfi_burn.console import format_plan_review
+        from vfi_burn.sim_pcie import sim_pcie_from_file
+
+        # Build an 8 GB (10de:20c2) plan from self.cold_snap
+        plan_8gb_path = self.work / "plan_8gb.json"
+        card_8gb = capture_card_snapshot(self.cold_adapter)
+        cfg = UnlockConfig.from_card(card_8gb)
+        cfg.unlock_all_healthy_sm_hbm()
+        write_private_json(plan_8gb_path, build_plan_from_config(card_8gb, cfg))
+        plan_8gb = Plan.load(plan_8gb_path)
+
+        # Connect a 10 GB (10de:2082) target with different die rows & FF rows -> must NOT mix rows!
+        snap_10gb = json.loads(self.cold_snap.read_text(encoding="utf-8"))
+        snap_10gb["pci_id"] = "10de:2082"
+        snap_10gb["rows"]["8"] = "0x11111111"
+        snap_10gb_path = self.work / "sim_10gb.json"
+        write_private_json(snap_10gb_path, snap_10gb)
+        sim_10gb = sim_pcie_from_file(snap_10gb_path)
+
+        lines = format_plan_review(plan_8gb, reader=sim_10gb)
+        txt = "\n".join(lines)
+        self.assertIn("TARGET MISMATCH (WRONG CARD CONNECTED — BURN REFUSED)", txt)
+        self.assertIn("SKU MISMATCH", txt)
+        self.assertIn("CMP 170HX 10 GB", txt)
+        self.assertIn("OFFLINE — TARGET MISMATCH", txt)
+
+        # Same SKU (10de:20c2) but DIFFERENT Die ID -> must also refuse live FF overlay!
+        snap_other_8gb = json.loads(self.cold_snap.read_text(encoding="utf-8"))
+        snap_other_8gb["rows"]["8"] = "0x22222222"
+        snap_other_path = self.work / "sim_other_8gb.json"
+        write_private_json(snap_other_path, snap_other_8gb)
+        sim_other_8gb = sim_pcie_from_file(snap_other_path)
+
+        lines2 = format_plan_review(plan_8gb, reader=sim_other_8gb)
+        txt2 = "\n".join(lines2)
+        self.assertIn("TARGET MISMATCH (WRONG CARD CONNECTED — BURN REFUSED)", txt2)
+        self.assertIn("DIE ID MISMATCH", txt2)
+        self.assertIn("OFFLINE — TARGET MISMATCH", txt2)
+
+        # Default save path for a 10 GB card must NOT clobber an active 8 GB plan path
+        card_10gb = capture_card_snapshot(sim_10gb)
+        menu = BurnMenu(MenuSession(plan_path=str(plan_8gb_path)))
+        self.assertEqual(menu._default_plan_path_for_card(card_10gb), "private/plan_2082.json")
+        self.assertEqual(menu._default_plan_path_for_card(card_8gb), str(plan_8gb_path))
 
 
 class TestPCIGPUDiscoveryAndPicker(unittest.TestCase):

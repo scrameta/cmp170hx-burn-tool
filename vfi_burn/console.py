@@ -52,7 +52,7 @@ from .fuses import (
 )
 from .ga100 import CMD_IDLE, CMD_PROGRAM, CMD_READ, CMD_SENSE_CTRL
 from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, is_poison, u32
+from .model import BurnError, Plan, Record, is_poison, sku_display_name, u32
 from .sim_pcie import PCIeTransaction, trace_hal_program_sequence
 
 
@@ -349,21 +349,47 @@ def format_plan_review(
     lines: list[str] = []
 
     # Optional read-only scan of current FF rows if a live or fake reader is attached.
+    # Always verify PCI SKU and Die ID (rows 8..15) first so we NEVER silently overlay
+    # Card A's plan onto Card B's live FF table.
     current_rows: dict[int, int] | None = None
     next_free_row: int | None = None
     slot_error: str | None = None
+    target_mismatch: list[str] = []
     if reader is not None:
         check_host_readonly_safe(reader.host())
         try:
-            rows: dict[int, int] = {}
-            for row_idx in range(plan.first_row, plan.last_row + 1):
-                val = reader.fuse_row(row_idx)  # raises on a fuse-unit error
-                rows[row_idx] = val
-            current_rows = rows
-            try:
-                next_free_row, _ = resolve_fpf_pointer(plan, rows, override_slot=override_slot)
-            except BurnError as exc:
-                slot_error = str(exc)
+            live_pci = reader.pci_id().strip().lower()
+            if live_pci != plan.pci_id:
+                target_mismatch.append(
+                    f"SKU MISMATCH: plan targets {plan.pci_id} ({sku_display_name(plan.pci_id)}), "
+                    f"but connected GPU is {live_pci} ({sku_display_name(live_pci)})"
+                )
+            else:
+                die_bad: list[str] = []
+                for idx, expected in sorted(plan.die_rows.items()):
+                    actual = reader.die_row(idx)
+                    if actual != expected:
+                        die_bad.append(f"row {idx}={hex32(actual)}!=plan({hex32(expected)})")
+                if die_bad:
+                    target_mismatch.append(
+                        "DIE ID MISMATCH: connected GPU is a DIFFERENT card of the same SKU ("
+                        + ", ".join(die_bad[:3])
+                        + (f", +{len(die_bad) - 3} more" if len(die_bad) > 3 else "")
+                        + ")"
+                    )
+
+            if not target_mismatch:
+                rows: dict[int, int] = {}
+                for row_idx in range(plan.first_row, plan.last_row + 1):
+                    val = reader.fuse_row(row_idx)  # raises on a fuse-unit error
+                    rows[row_idx] = val
+                current_rows = rows
+                try:
+                    next_free_row, _ = resolve_fpf_pointer(plan, rows, override_slot=override_slot)
+                except BurnError as exc:
+                    slot_error = str(exc)
+            else:
+                slot_error = "live FF scan skipped because connected GPU does not match this plan"
         except BurnError as exc:
             slot_error = str(exc)
 
@@ -373,10 +399,27 @@ def format_plan_review(
     n_real = n_total - n_test
 
     # ------------------------------------------------------------------ 1. Header
-    mode_tag = "WITH TARGET FF SCAN (read-only)" if current_rows is not None else "OFFLINE ONLY"
+    if target_mismatch:
+        lines.append("!" * 72)
+        lines.append("=== TARGET MISMATCH (WRONG CARD CONNECTED — BURN REFUSED) ===")
+        for reason in target_mismatch:
+            lines.append(f"  ERROR : {reason}")
+        lines.append(
+            "  ACTION: Live FF scan was SKIPPED so this GPU's rows are not mixed with the wrong plan."
+        )
+        lines.append(
+            "          Load the matching plan in [1] Setup -> [b], generate one with [a], or switch GPU in [c]."
+        )
+        lines.append("!" * 72)
+        lines.append("")
+        mode_tag = "OFFLINE — TARGET MISMATCH"
+    elif current_rows is not None:
+        mode_tag = "WITH TARGET FF SCAN (read-only)"
+    else:
+        mode_tag = "OFFLINE ONLY"
     lines.append(f"=== PLAN REVIEW & EXPECTED OUTCOME ({mode_tag}) ===")
     lines.append(f"  Plan SHA256  : {plan.content_hash}")
-    lines.append(f"  Target SKU   : {plan.pci_id} (CMP 170HX 8 GB)")
+    lines.append(f"  Target SKU   : {plan.pci_id} ({sku_display_name(plan.pci_id)})")
     lines.append(
         f"  SM Ceilings  : base={plan.base_sm_ceiling} | override={plan.override_sm_ceiling} | "
         f"reconfig_verified={plan.reconfig_semantics_verified}"

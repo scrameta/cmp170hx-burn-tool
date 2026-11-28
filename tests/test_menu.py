@@ -244,7 +244,7 @@ class TestBurnMenu(unittest.TestCase):
                 with redirect_stdout(out), redirect_stderr(err):
                     rc = main(argv)
             self.assertEqual(rc, 0, err.getvalue())
-            self.assertIn("vfi_burn — CMP 170HX 8 GB FF Fuse-Burn Safety Controller", out.getvalue())
+            self.assertIn("vfi_burn — CMP 170HX (8 GB / 10 GB) FF Fuse-Burn Safety Controller", out.getvalue())
             self.assertIn("Exiting vfi_burn menu.", out.getvalue())
 
     def test_plan_review_outcome_unknown_fuses_and_ff_row_capacity(self):

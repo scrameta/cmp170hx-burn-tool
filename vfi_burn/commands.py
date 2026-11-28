@@ -50,7 +50,7 @@ from .journal import Journal
 from .menu import BurnMenu, MenuSession
 from .menuconfig import run_menuconfig
 from .mmio import resolve_register_address
-from .model import BurnError, Plan, Record, is_poison, require_private_file, u32
+from .model import BurnError, Plan, Record, is_poison, require_private_file, sku_display_name, u32
 from .planner import UnlockConfig, build_plan_from_config, capture_card_snapshot
 from .sim_pcie import SimulatedGA100Adapter, sim_pcie_from_file
 
@@ -157,7 +157,7 @@ def _warn_if_unhealthy_readonly(plan: Plan, backend, io: CommandIO) -> None:
 
 def _print_plan_summary(p: Plan, final_masks: dict[str, int], io: CommandIO) -> None:
     io.show(f"OFFLINE PLAN REVIEW | SHA256: {p.content_hash}")
-    io.show(f"  SKU          : {p.pci_id} (CMP 170HX 8 GB)")
+    io.show(f"  SKU          : {p.pci_id} ({sku_display_name(p.pci_id)})")
     io.show(
         f"  FF Window    : rows {p.first_row}..{p.last_row} "
         f"({p.last_row - p.first_row + 1} slots) | empty_word={hex32(p.empty_word)}"
@@ -307,6 +307,10 @@ def execute_configure(
     final_masks = _check_generated_plan(loaded, io)
     io.show(f"Generated plan {out} (mode 0600) | {cfg.summary_line()}:")
     _print_plan_summary(loaded, final_masks, io)
+    if target.bdf:
+        io.show(f"Next: sudo python3 -m vfi_burn menu --bdf {target.bdf} --plan {out}")
+    elif target.fake:
+        io.show(f"Next: python3 -m vfi_burn menu --fake {target.fake} --plan {out}")
     return 0
 
 
