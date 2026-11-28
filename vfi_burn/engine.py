@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Callable
 import json
@@ -31,6 +32,7 @@ from .model import (
     Plan,
     PreTriggerRefusal,
     Record,
+    UnsafePreTriggerRefusal,
     is_debugctrl_target,
     is_poison,
     require_private_file,
@@ -784,6 +786,40 @@ class PlanProgress:
     detail: str = ""
 
 
+def _refuse_unresolved_attempt(journal: Journal) -> None:
+    """Fail closed on an incomplete or uncertain prior write in this journal."""
+    pending: dict | None = None
+    for line in journal.path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise BurnError("malformed burn journal; cannot prove prior write outcome") from exc
+        if not isinstance(item, dict):
+            raise BurnError("malformed burn journal entry")
+        event = item.get("event")
+        if event == "HALT_UNVERIFIED":
+            raise BurnError("journal contains HALT_UNVERIFIED; investigate before any further burn")
+        if event == "attempt":
+            if pending is not None:
+                raise BurnError("journal contains unresolved prior burn attempt")
+            pending = item
+        elif event in ("aborted_pre_trigger", "verified_readback_only") and pending is not None:
+            if item.get("row") != pending.get("row") or item.get("record") != pending.get("record"):
+                raise BurnError("journal burn outcome does not match prior attempt")
+            if event == "verified_readback_only" and (
+                item.get("plan_sha256") != pending.get("plan_sha256")
+                or item.get("readback") != pending.get("intended")
+            ):
+                raise BurnError("journal readback does not match prior attempt")
+            if event == "aborted_pre_trigger" and item.get("write_issued") is not False:
+                raise BurnError("journal pre-trigger refusal lacks no-write evidence")
+            pending = None
+    if pending is not None:
+        raise BurnError("journal contains unresolved prior burn attempt; investigate before any further burn")
+
+
 def _journal_test_row(plan: Plan, journal_path: str | Path | None) -> int | None:
     if not journal_path:
         return None
@@ -994,12 +1030,20 @@ def _write_verify_or_halt(
     host_after: Host | None = None
     try:
         if record.kind == "devid":
-            try:
-                writer.write_one_record(pointer, record.word, allow_a100_devid=True)
-            except TypeError:
-                writer.write_one_record(pointer, record.word)
+            writer.write_one_record(pointer, record.word, allow_a100_devid=True)
         else:
             writer.write_one_record(pointer, record.word)
+    except UnsafePreTriggerRefusal as exc:
+        journal.append(
+            event="HALT_UNVERIFIED",
+            row=pointer,
+            record=record.name,
+            error=str(exc),
+            write_issued=False,
+            pointer_advanced=False,
+            manual_record_sha256=manual_record_sha256,
+        )
+        raise BurnError(f"HALT: unsafe controller cleanup; NO program command issued: {exc}") from exc
     except PreTriggerRefusal as exc:
         # The writer guarantees CMD_PROGRAM was never issued: nothing can have burned.
         journal.append(
@@ -1024,7 +1068,7 @@ def _write_verify_or_halt(
                 f"row {pointer} READBACK MISMATCH: {hex32(readback)} != {hex32(record.word)}"
             )
         health = reader.health()
-        check_health(health, plan)
+        check_health(health, plan, require_efp_one=True)
         host_after = reader.host()
         check_host(host_after)
         # Extra slot check: no pointer advance before every post-write gate passes.
@@ -1056,22 +1100,10 @@ def _journal_halt(
     health: Health | None = None,
     host_after: Host | None = None,
 ) -> None:
-    # Failure may be partial. Never re-issue the programming operation.
-    if health is None:
-        try:
-            health = reader.health()
-        except Exception:
-            pass
-    if host_after is None:
-        try:
-            host_after = reader.host()
-        except Exception:
-            pass
-    if readback is None:
-        try:
-            readback = reader.fuse_row(pointer)
-        except Exception:
-            pass
+    # Failure may be partial, and the controller may be poisoned or busy.
+    # Do NOT perform more MMIO merely to fill diagnostic fields. Log only
+    # observations already obtained before the failure.
+    del reader
     journal.append(
         event="HALT_UNVERIFIED",
         row=pointer,
@@ -1107,7 +1139,8 @@ def _run_poweroff_sanity(
             baseline_blocks=baseline_blocks,
         )
     except Exception as exc:
-        show(f"\nNOTE: Pre-power-off fuse sanity check skipped ({exc}).")
+        show(f"\nWARNING: Power-off safety UNKNOWN ({exc}).")
+        journal.append(event="poweroff_sanity_failed", reason=reason, error=str(exc))
         return None
     for line in sanity["lines"]:
         show(line)
@@ -1187,6 +1220,15 @@ def process_records(
     ov = overrides or Overrides()
     is_live = not getattr(reader, "simulation", False)
     strict_ff = is_live or (plan.baseline_ff_rows is not None)
+    if not dry_run and is_live:
+        _refuse_unresolved_attempt(journal)
+        # Validate the device-ID writer signature before any irreversible work;
+        # never try a second call on TypeError.
+        if any(r.kind == "devid" for r in plan.records):
+            try:
+                inspect.signature(writer.write_one_record).bind(0, 0, allow_a100_devid=True)
+            except (TypeError, ValueError) as exc:
+                raise BurnError("writer does not support explicit device-ID authorization") from exc
     effective_debugctrl = allow_manual_debugctrl or ov.allow_manual_debugctrl
     use_active_sense = (
         (not ov.skip_active_sense)
@@ -1291,8 +1333,41 @@ def process_records(
         )
         raise
 
+    # Native adapter verifies complete live defect masks and physical bounds.
+    # Other adapters retain responsibility for equivalent hardware checks.
+    validate_baseline = getattr(reader, "validate_burn_baseline", None)
+    writer_validate = (
+        getattr(writer, "validate_burn_baseline", None)
+        if (writer is not reader and not dry_run)
+        else None
+    )
+    if is_live and (not dry_run or use_active_sense):
+        for fn in (validate_baseline, writer_validate):
+            if fn is None:
+                continue
+            try:
+                fn(plan)
+            except Exception as exc:
+                h_snap, host_snap = _capture_snapshot(reader)
+                journal.append(
+                    event="preflight_failed",
+                    stage=stage,
+                    plan_sha256=plan.content_hash,
+                    phase="native_baseline",
+                    active_sense=use_active_sense,
+                    health=h_snap,
+                    host=host_snap,
+                    error=str(exc),
+                )
+                raise
+
     try:
-        pointer, nearby, live_rows = scan_fpf_rows(plan, reader, override_slot=ov.slot)
+        pointer, nearby, live_rows = scan_fpf_rows(
+            plan,
+            reader,
+            override_slot=ov.slot,
+            passes=2 if is_live and not dry_run else 1,
+        )
     except Exception as exc:
         h_snap, host_snap = _capture_snapshot(reader)
         journal.append(
@@ -1497,6 +1572,8 @@ def process_records(
     if max_records is not None:
         deferred_by_max = pending[max_records:]
         pending = pending[:max_records]
+    if pending and pointer + len(pending) - 1 > plan.last_row:
+        raise BurnError("pending records do not fit in the remaining FF region")
 
     # Build verified block image from live_rows when enforcing exact FF before/after proofs.
     working_blocks: dict[int, dict[int, int]] | None = None
@@ -1528,6 +1605,55 @@ def process_records(
         overrides=ov.active_names(),
         manual_record_sha256=manual_record_sha256,
     )
+
+    # Preview every prefix before the first permanent write on the native live path.
+    # Unsafe intermediate rows are summarized concisely; an unsafe requested end state
+    # is a hard veto before any fuse is programmed. (Model check, not a boot guarantee.)
+    has_native_validation = (validate_baseline is not None) or (writer_validate is not None)
+    if is_live and not dry_run and has_native_validation and strict_ff and pending:
+        preview_rows = dict(live_rows)
+        preview_baseline = (
+            replay_ff_rows(plan.baseline_ff_rows)
+            if plan.baseline_ff_rows is not None
+            else initial_live_blocks
+        )
+        unsafe_mid_rows: list[int] = []
+        mid_groups: set[str] = set()
+        mid_errors: list[str] = []
+        for offset, rec in enumerate(pending):
+            row_idx = pointer + offset
+            preview_rows[row_idx] = rec.word
+            remaining = pending[offset + 1 :] + deferred_by_max + tail_after_stage
+            sanity = evaluate_poweroff_sanity(
+                preview_rows,
+                plan,
+                committed_records=already_committed + pending[: offset + 1],
+                remaining_records=remaining,
+                baseline_blocks=preview_baseline,
+            )
+            if not sanity["safe_to_power_off"]:
+                if offset == len(pending) - 1:
+                    show(f"WARNING: requested end row {row_idx} is not a clean power-off boundary")
+                    for issue in sanity["errors"] + sanity["warnings"]:
+                        show(f"  {issue}")
+                    raise BurnError("requested burn would end at an unsafe power-off boundary")
+                unsafe_mid_rows.append(row_idx)
+                mid_groups.update(sanity["split_groups"])
+                for err in sanity["errors"]:
+                    mid_errors.append(f"row {row_idx}: {err}")
+        if unsafe_mid_rows:
+            span = (
+                f"row {unsafe_mid_rows[0]}"
+                if len(unsafe_mid_rows) == 1
+                else f"rows {unsafe_mid_rows[0]}..{unsafe_mid_rows[-1]}"
+            )
+            grp_note = f" ({', '.join(sorted(mid_groups))})" if mid_groups else ""
+            show(
+                f"NOTE: intermediate {span} are inside an atomic group{grp_note} — "
+                "do not power off mid-burn until the group completes."
+            )
+            for err in mid_errors:
+                show(f"  WARNING: {err}")
 
     if dry_run:
         dry_assumed = assumed.copy()
@@ -1875,13 +2001,15 @@ def process_records(
                 "(or press Enter to stop and cold-boot verify first): ",
                 "CONTINUE SAME WINDOW",
             ):
-                _run_poweroff_sanity(
+                sanity = _run_poweroff_sanity(
                     plan, verified_rows, journal, show,
                     committed_records=already_committed + written_records,
                     remaining_records=pending[idx + 1 :] + deferred_by_max + tail_after_stage,
                     baseline_blocks=sanity_baseline,
                     reason="paused_after_test",
                 )
+                if is_live and (sanity is None or not sanity["safe_to_power_off"]):
+                    raise BurnError("test readback verified, but power-off safety is unsafe or unknown")
                 journal.append(
                     event="stage_all_paused_after_test",
                     test_row=pointer - 1,
@@ -1902,6 +2030,16 @@ def process_records(
                 cold_boot_verified=False,
             )
 
+    if written_records:
+        sanity = _run_poweroff_sanity(
+            plan, verified_rows, journal, show,
+            committed_records=already_committed + written_records,
+            remaining_records=deferred_by_max + tail_after_stage,
+            baseline_blocks=sanity_baseline,
+            reason="session_complete",
+        )
+        if is_live and (sanity is None or not sanity["safe_to_power_off"]):
+            raise BurnError("readback verified, but power-off safety is unsafe or unknown")
     journal.append(
         event="session_complete_readback_only",
         stage=stage,
@@ -1909,14 +2047,6 @@ def process_records(
         records_written=len(written_records),
         cold_boot_verified=False,
     )
-    if written_records:
-        _run_poweroff_sanity(
-            plan, verified_rows, journal, show,
-            committed_records=already_committed + written_records,
-            remaining_records=deferred_by_max + tail_after_stage,
-            baseline_blocks=sanity_baseline,
-            reason="session_complete",
-        )
     return pointer
 
 

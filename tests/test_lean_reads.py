@@ -296,13 +296,13 @@ class TestLeanReads(unittest.TestCase):
                 )
         self.assertEqual(_count_cmd(ad, CMD_PROGRAM), 1)
 
-    def test_inter_record_halts_when_fpf_region_fills_mid_session(self):
-        # Plan fits 2 records in [222..227], but operator overrides slot to 227 (the last row):
-        # record 0 succeeds at 227, then pointer advances to 228 > last_row and halts before record 1.
+    def test_refuses_before_burning_when_pending_records_exceed_fpf_region(self):
+        # Plan has 2 records, but operator overrides slot to 227 (the last row):
+        # up-front capacity check refuses BEFORE burning record 0 (0 CMD_PROGRAM calls).
         plan = self._make_plan([self._noop_rec(), self._fbp_rec()], last_row=227)
         ad = self._make_adapter()
         with Journal(self.journal_path) as j:
-            with self.assertRaisesRegex(BurnError, "FPF region full"):
+            with self.assertRaisesRegex(BurnError, "do not fit in the remaining FF region"):
                 process_records(
                     plan, ad, ad, j,
                     stage="all",
@@ -310,12 +310,7 @@ class TestLeanReads(unittest.TestCase):
                     confirm=lambda *_: True,
                     show=lambda *_: None,
                 )
-        self.assertEqual(_count_cmd(ad, CMD_PROGRAM), 1)
-        preflight_fails = [
-            e for e in self._logged()
-            if e["event"] == "preflight_failed" and e["phase"] == "before_record:UNLOCK_FBP"
-        ]
-        self.assertEqual(len(preflight_fails), 1)
+        self.assertEqual(_count_cmd(ad, CMD_PROGRAM), 0)
 
     # ------------------------------------------------------------------
     # Power-off sanity check computed from baseline + verified writes (0 reads)

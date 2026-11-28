@@ -511,16 +511,17 @@ class TestP1_1_PoweroffSanityCheck(SafetyReviewTestBase):
         shown: list[str] = []
         with Journal(self.journal_path) as j:
             # max_records=2 burns NOOP_TEST + MEM_FBP, leaving MEM_FBPA pending!
-            process_records(
-                plan,
-                ad,
-                ad,
-                j,
-                stage="all",
-                max_records=2,
-                confirm=lambda *_: True,
-                show=shown.append,
-            )
+            with self.assertRaisesRegex(BurnError, "power-off safety"):
+                process_records(
+                    plan,
+                    ad,
+                    ad,
+                    j,
+                    stage="all",
+                    max_records=2,
+                    confirm=lambda *_: True,
+                    show=shown.append,
+                )
         out = "\n".join(shown)
         self.assertIn("PARTIAL 'MEMORY' FUNCTIONAL GROUP BURNED", out)
         self.assertIn("DO NOT POWER OFF YET", out)
@@ -908,16 +909,17 @@ class TestArchReviewSafetyFixes(SafetyReviewTestBase):
         ad1 = LiveMMIOAdapter(mmio1, fields=live_fields)
         shown1: list[str] = []
         with Journal(self.journal_path) as j:
-            process_records(
-                plan,
-                ad1,
-                ad1,
-                j,
-                stage="all",
-                max_records=2,
-                confirm=lambda *_: True,
-                show=shown1.append,
-            )
+            with self.assertRaisesRegex(BurnError, "power-off safety"):
+                process_records(
+                    plan,
+                    ad1,
+                    ad1,
+                    j,
+                    stage="all",
+                    max_records=2,
+                    confirm=lambda *_: True,
+                    show=shown1.append,
+                )
         out1 = "\n".join(shown1)
         self.assertIn("DO NOT POWER OFF YET", out1)
         self.assertNotIn("SAFE TO POWER OFF", out1)

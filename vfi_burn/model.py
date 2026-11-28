@@ -57,6 +57,10 @@ class PreTriggerRefusal(BurnError):
     """
 
 
+class UnsafePreTriggerRefusal(PreTriggerRefusal):
+    """No programming command issued, but volatile controller cleanup failed."""
+
+
 def is_poison(value: int) -> bool:
     """Return True if a 32-bit word carries a GPU PRI-error / fuse-unit error prefix.
 

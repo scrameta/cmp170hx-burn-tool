@@ -164,5 +164,7 @@ class FuseWriter(ABC):
     writer_verified: bool = False
 
     @abstractmethod
-    def write_one_record(self, row: int, word: int) -> None:
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
         """Program one 32-bit FF word into ``row``."""

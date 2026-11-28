@@ -38,7 +38,7 @@ from .interfaces import FuseControllerHAL, FuseReader, FuseWriter, MMIOBus, MMIO
 from .menu import BurnMenu, MenuSession
 from .menuconfig import run_menuconfig
 from .mmio import AlignedMMIO, ReadOnlyMMIO
-from .model import BurnError, Plan, Record
+from .model import BurnError, Plan, PreTriggerRefusal, Record, UnsafePreTriggerRefusal
 from .planner import CardSnapshot, UnlockConfig, build_plan_from_config, capture_card_snapshot, derive_ff_records
 from .sim_pcie import (
     PCIeTransaction,
@@ -82,12 +82,14 @@ __all__ = [
     "Overrides",
     "PCIeTransaction",
     "Plan",
+    "PreTriggerRefusal",
     "ReadOnlyMMIO",
     "Record",
     "SimulatedGA100Adapter",
     "SimulatedGA100PCIe",
     "TracingMMIOBus",
     "UnlockConfig",
+    "UnsafePreTriggerRefusal",
     "build_plan_from_config",
     "build_vfi_plan_from_records",
     "capture_card_snapshot",
