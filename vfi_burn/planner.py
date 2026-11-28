@@ -33,6 +33,7 @@ from .fuses import (
     FF_EMPTY_WORD,
     FIELDS_BY_KEY,
     FUSES_BY_KEY,
+    MEDIA_ENGINE_EVIDENCE_REGS,
     PES_PER_GPC,
     SM_PER_TPC,
     TOTAL_FBP,
@@ -66,6 +67,9 @@ class CardSnapshot:
     lnkcap2: int = 0x06
     ff_last_row: int = FF_ROW_MAX
     iff_record: int = 0
+    # EXPERIMENTAL media-engine evidence {"NVDEC"|"NVJPG"|"OFA": (OPT, STATUS) or None}.
+    # None (the whole dict) means the readout did not include these registers.
+    engine_regs: dict[str, tuple[int, int] | None] | None = None
 
     @property
     def free_row_count(self) -> int:
@@ -102,6 +106,83 @@ class CardSnapshot:
 
     def max_healthy_sys_pipe_count(self) -> int:
         return 8 - bin(self.sys_pipe_defective_mask()).count("1")
+
+    # ------------------------------------------------------------------ EXPERIMENTAL media engines
+    def media_engine_blockers(self, which: str) -> list[str]:
+        """Reasons the EXPERIMENTAL ``which`` ("nvdec" | "nvjpg_ofa") unlock cannot be offered.
+
+        These engines have no *_DEFECTIVE register, so nothing can prove a unit is
+        physically present. The minimum evidence required here (ffcalc's rule) is that
+        OPT_*_DISABLE and STATUS_OPT_* were both read and are equal, that OPT agrees with
+        the FF replay, and that every FF block involved is already in the FF prefix.
+        """
+        if which == "nvdec":
+            engines, keys, blocks = ("NVDEC",), ("nvdec_disable",), (8,)
+        elif which == "nvjpg_ofa":
+            engines = ("NVJPG", "OFA")
+            keys = ("nvjpg_ofa_disable_bit146", "nvjpg_ofa_disable_bit371")
+            blocks = (9, 23)
+        else:
+            raise BurnError(f"unknown media engine group {which!r}")
+        reasons: list[str] = []
+        regs = self.engine_regs or {}
+        readings: dict[str, tuple[int, int]] = {}
+        for eng in engines:
+            pair = regs.get(eng)
+            if pair is None:
+                opt_a, st_a = MEDIA_ENGINE_EVIDENCE_REGS[eng]
+                reasons.append(
+                    f"{eng} OPT/STATUS (0x{opt_a:06x}/0x{st_a:06x}) not read; no evidence the unit exists"
+                )
+                continue
+            opt, status = pair
+            readings[eng] = pair
+            if opt != status:
+                reasons.append(
+                    f"STATUS_OPT_{eng}=0x{status:x} != OPT_{eng}_DISABLE=0x{opt:x} "
+                    "(unit(s) reported absent or defective)"
+                )
+        for blk in blocks:
+            if blk not in self.current_blocks.get(1, {}):
+                reasons.append(
+                    f"c1/b{blk} is absent from this card's FF prefix (neighbouring bits unknown)"
+                )
+        if reasons:
+            return reasons
+        if which == "nvdec":
+            if (readings["NVDEC"][0] & 0x1F) != self.current_fields["nvdec_disable"]:
+                reasons.append(
+                    f"OPT_NVDEC_DISABLE=0x{readings['NVDEC'][0]:x} disagrees with FF replay "
+                    f"0x{self.current_fields['nvdec_disable']:x}"
+                )
+        else:
+            opt_bits = sorted((readings["NVJPG"][0] & 1, readings["OFA"][0] & 1))
+            ff_bits = sorted(self.current_fields[k] & 1 for k in keys)
+            if opt_bits != ff_bits:
+                reasons.append(
+                    f"OPT_NVJPG/OFA_DISABLE {opt_bits} disagree with FF bits 146/371 {ff_bits}"
+                )
+        return reasons
+
+    def media_engine_currently_disabled(self, which: str) -> bool:
+        if which == "nvdec":
+            return self.current_fields.get("nvdec_disable", 0) != 0
+        if which == "nvjpg_ofa":
+            return any(
+                self.current_fields.get(k, 0)
+                for k in ("nvjpg_ofa_disable_bit146", "nvjpg_ofa_disable_bit371")
+            )
+        raise BurnError(f"unknown media engine group {which!r}")
+
+    def media_engine_evidence_line(self, which: str) -> str:
+        engines = ("NVDEC",) if which == "nvdec" else ("NVJPG", "OFA")
+        parts = []
+        for eng in engines:
+            pair = (self.engine_regs or {}).get(eng)
+            parts.append(
+                f"{eng} OPT/STATUS=" + ("not read" if pair is None else f"0x{pair[0]:x}/0x{pair[1]:x}")
+            )
+        return ", ".join(parts)
 
     def gpc_currently_enabled(self, gpc: int) -> bool:
         return not bool((self.current_fields["gpc_disable"] >> gpc) & 1)
@@ -161,6 +242,7 @@ def snapshot_from_raw_state(
     lnkcap2: int = 0x06,
     ff_last_row: int | None = None,
     iff_record: int = 0,
+    engine_regs: dict[str, tuple[int, int] | None] | None = None,
 ) -> CardSnapshot:
     """Validate raw card readout dicts and construct a ``CardSnapshot``."""
     pci = str(pci_id).strip().lower()
@@ -245,6 +327,14 @@ def snapshot_from_raw_state(
         lnkcap2=int(lnkcap2) & 0xFFFFFFFF,
         ff_last_row=eff_last_row,
         iff_record=int(iff_record) & 0xFFFFFFFF,
+        engine_regs=(
+            None
+            if engine_regs is None
+            else {
+                k: (None if v is None else (int(v[0]) & 0xFFFFFFFF, int(v[1]) & 0xFFFFFFFF))
+                for k, v in engine_regs.items()
+            }
+        ),
     )
 
 
@@ -262,6 +352,7 @@ def capture_card_snapshot(backend, *, label: str = "GPU") -> CardSnapshot:
             lnkcap2=state["lnkcap2"],
             ff_last_row=state.get("ff_last_row"),
             iff_record=state.get("iff_record", 0),
+            engine_regs=state.get("engine_regs"),
         )
     except BurnError:
         # Let genuine hardware/unsensed/poison errors propagate immediately.
@@ -282,6 +373,8 @@ class UnlockConfig:
     nvlink_enabled: bool = False
     a100_devid: int | None = None  # None = keep current, or key in A100_TARGET_DEVICE_IDS
     sys_pipe_unlock: bool = False  # EXPERIMENTAL: clear non-defective SYS_PIPE_DISABLE bits (MIG)
+    nvdec_unlock: bool = False  # EXPERIMENTAL: clear NVDEC_DISABLE (c1/b8 bits 11..15)
+    nvjpg_ofa_unlock: bool = False  # EXPERIMENTAL: clear NVJPG/OFA pair (c1 bits 146 + 371)
 
     def __post_init__(self) -> None:
         if not self.gpc_enabled:
@@ -308,6 +401,8 @@ class UnlockConfig:
         self.nvlink_enabled = self.card.nvlink_currently_enabled()
         self.a100_devid = None
         self.sys_pipe_unlock = False
+        self.nvdec_unlock = False
+        self.nvjpg_ofa_unlock = False
 
     # ------------------------------------------------------------------ Compute mutators
     def set_gpc(self, gpc: int, enabled: bool) -> None:
@@ -412,6 +507,18 @@ class UnlockConfig:
                 f"unsupported target Device ID 0x{target_devid:04x}; supported: {supported}{extra}"
             )
         self.a100_devid = target_devid
+
+    def set_media_engine_unlock(self, which: str, enabled: bool) -> None:
+        """EXPERIMENTAL: select clearing the NVDEC or the NVJPG/OFA disable bits."""
+        if which not in ("nvdec", "nvjpg_ofa"):
+            raise BurnError(f"unknown media engine group {which!r}")
+        if enabled:
+            if not self.card.media_engine_currently_disabled(which):
+                raise BurnError(f"{which.upper()} is already enabled on this card")
+            blockers = self.card.media_engine_blockers(which)
+            if blockers:
+                raise BurnError(f"{which.upper()} unlock not offered: " + "; ".join(blockers))
+        setattr(self, f"{which}_unlock", bool(enabled))
 
     def set_sys_pipe_unlock(self, enabled: bool) -> None:
         if enabled and self.card.sys_pipe_unlockable_mask() == 0:
@@ -555,6 +662,9 @@ class UnlockConfig:
             parts.append(f"DevID: 0x{self.a100_devid:04x} [{tag}]")
         if self.sys_pipe_unlock:
             parts.append(f"MIG/SYS_PIPE: {self.card.current_sys_pipe_count()}->{self.card.max_healthy_sys_pipe_count()}/8")
+        media = [n for n, on in (("NVDEC", self.nvdec_unlock), ("NVJPG+OFA", self.nvjpg_ofa_unlock)) if on]
+        if media:
+            parts.append(f"Media (EXPERIMENTAL): {'+'.join(media)}")
         return " | ".join(parts)
 
 
@@ -625,8 +735,33 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
                 desired_masks[key],
             )
 
-    # 2. Apply PCIe speed/boot changes (chain 2 blocks 39, 49, and optionally 47, 46 for Gen4).
+    # 1b. EXPERIMENTAL media engines (no defect register; evidence re-checked here so a
+    #     config built before the card state changed cannot slip through).
     pcie_notes: dict[tuple[int, int], str] = {}
+    engine_selection = (
+        ("nvdec", config.nvdec_unlock, ("nvdec_disable",), "NVDEC x5"),
+        (
+            "nvjpg_ofa",
+            config.nvjpg_ofa_unlock,
+            ("nvjpg_ofa_disable_bit146", "nvjpg_ofa_disable_bit371"),
+            "NVJPG0 + OFA0 pair",
+        ),
+    )
+    for which, wanted, keys, label in engine_selection:
+        if not wanted:
+            continue
+        blockers = card.media_engine_blockers(which)
+        if blockers:
+            raise BurnError(f"REFUSED: {label} unlock: " + "; ".join(blockers))
+        for key in keys:
+            if card.current_fields[key] != 0:
+                _apply_field_to_blocks(card.current_blocks, desired_blocks, key, card.current_fields[key], 0)
+            blk = FIELDS_BY_KEY[key].bit // 16
+            prev = pcie_notes.get((1, blk))
+            tag = f"EXPERIMENTAL media engine: {label}"
+            pcie_notes[(1, blk)] = tag if prev is None else f"{prev}; {tag}"
+
+    # 2. Apply PCIe speed/boot changes (chain 2 blocks 39, 49, and optionally 47, 46 for Gen4).
     if config.pcie_mode in ("gen3", "gen4", "lock_gen12"):
         for req_blk in (39, 49):
             if req_blk not in card.current_blocks.get(2, {}):

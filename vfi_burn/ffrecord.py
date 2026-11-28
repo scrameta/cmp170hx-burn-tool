@@ -247,7 +247,7 @@ def analyze_ff_block(
                     warnings.append(
                         f"EXPERIMENTAL / POORLY UNDERSTOOD FIELD CHANGING: {f.name} — {f.note}"
                     )
-                elif f.category in ("mig", "nvlink"):
+                elif f.category in ("mig", "nvlink", "engine"):
                     warnings.append(
                         f"CAUTION / PARTIALLY UNDERSTOOD FIELD CHANGING: {f.name} — {f.note}"
                     )
@@ -268,7 +268,7 @@ def analyze_ff_block(
                     warnings.append(f"OVERLAPS READ-ONLY FIELD: {f.name} ({f.note})")
                 elif f.opt_in:
                     warnings.append(f"OVERLAPS EXPERIMENTAL FIELD: {f.name} — {f.note}")
-                elif f.category in ("mig", "nvlink"):
+                elif f.category in ("mig", "nvlink", "engine"):
                     warnings.append(f"OVERLAPS CAUTION FIELD: {f.name} — {f.note}")
 
     return {
@@ -547,6 +547,28 @@ def verify_noop_test_record(word: int, existing_blocks: dict[int, dict[int, int]
             f"test record c{rec.chain}/b{rec.block} is NOT a no-op: "
             f"effective block would change 0x{current:04x} -> 0x{rec.data:04x} (diff=0x{diff:04x})"
         )
+
+
+def ff_word_media_engine_change(word: int, old_block: int | None = None) -> str | None:
+    """Classify a word's effect on the EXPERIMENTAL media-engine disable bits.
+
+    Returns ``"changed"`` when ``old_block`` is known and an engine bit changes,
+    ``"unknown"`` when ``old_block`` is unknown and the word leaves any engine bit in
+    its block at 0 (enabled), and ``None`` when engine bits are untouched / not present.
+    """
+    try:
+        rec = decode_ff(word)
+    except BurnError:
+        return None
+    mask = 0
+    for f in fields_in_block(rec.chain, rec.block):
+        if FIELD_FUNCTIONAL_GROUP.get(f.key, f.category) == "engine":
+            mask |= _field_local_mask(f, rec.block)
+    if not mask:
+        return None
+    if old_block is not None:
+        return "changed" if (old_block ^ rec.data) & mask else None
+    return "unknown" if (rec.data & mask) != mask else None
 
 
 def classify_ff_functional_groups(word: int, old_block: int | None = None) -> set[str]:

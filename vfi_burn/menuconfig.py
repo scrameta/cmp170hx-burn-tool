@@ -67,6 +67,21 @@ def _compute_preview_lines(card: CardSnapshot, config: UnlockConfig) -> list[str
                     "",
                 ]
             )
+    if config.nvdec_unlock or config.nvjpg_ofa_unlock:
+        lines.extend(
+            [
+                "!!! EXPERIMENTAL — MEDIA ENGINE UNLOCK SELECTED !!!",
+                "!!! - No defect register exists for NVDEC / NVJPG / OFA: vfi_burn cannot prove",
+                "!!!   the units are present. Evidence used: " + "; ".join(
+                    card.media_engine_evidence_line(w)
+                    for w, on in (("nvdec", config.nvdec_unlock), ("nvjpg_ofa", config.nvjpg_ofa_unlock))
+                    if on
+                ),
+                "!!! - After cold boot, check STATUS_OPT_* reads 0 and the engines enumerate;",
+                "!!!   a unit that stays non-zero is physically absent: do NOT re-burn.",
+                "",
+            ]
+        )
     try:
         items, issues = derive_ff_records(card, config)
     except BurnError as exc:
@@ -196,7 +211,7 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 label=f"{nvl_tag} Enable NVLink ({nvl_note}; needs U11 bridge mod + FW bypass)",
                 help_text=(
                     "Clears non-defective bits of OPT_NVLINK_DISABLE in chain 1 block 23 while "
-                    "preserving OPT_SYS_PIPE_DISABLE and unmapped bit 371."
+                    "preserving OPT_SYS_PIPE_DISABLE and the NVJPG/OFA bit 371."
                 ),
                 on_toggle=_toggle_nvlink,
                 on_enter=_toggle_nvlink,
@@ -249,6 +264,25 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                     )
                 ),
                 locked=(card.sys_pipe_unlockable_mask() == 0),
+            ),
+            _MenuEntry(
+                label=(
+                    "    [EXPERIMENTAL] Media engines (NVDEC / NVJPG / OFA): "
+                    + (
+                        "+".join(
+                            n
+                            for n, on in (("NVDEC", config.nvdec_unlock), ("NVJPG+OFA", config.nvjpg_ofa_unlock))
+                            if on
+                        )
+                        or "keep"
+                    )
+                    + "  --->"
+                ),
+                help_text=(
+                    "EXPERIMENTAL: unlock the media engines fused off on CMP 170HX. Cheapest when "
+                    "burned together with compute/NVLink changes (shared c1/b8 and c1/b23 records)."
+                ),
+                submenu="media",
             ),
             _MenuEntry(
                 label=f"    Preview Exact FF Records ({ff_summary})  --->",
@@ -506,6 +540,52 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 )
             )
         return "PCIe Device ID — A100 / CMP 170HX (WARNING: must match flashed VBIOS)", entries
+
+    if screen == "media":
+        entries = []
+        for which, label, blocks in (
+            ("nvdec", "NVDEC x5 hardware video decoders", "c1/b8 bits 11..15"),
+            ("nvjpg_ofa", "NVJPG0 + OFA0 (cleared together: c1 bits 146 + 371)", "c1/b9 + c1/b23"),
+        ):
+            selected = getattr(config, f"{which}_unlock")
+            evidence = card.media_engine_evidence_line(which)
+            if not card.media_engine_currently_disabled(which):
+                tag, state, locked = "[X]", "already enabled", True
+            else:
+                blockers = card.media_engine_blockers(which)
+                if blockers:
+                    tag, state, locked = "[X]", "NOT OFFERED: " + blockers[0], True
+                else:
+                    tag, state, locked = ("[*]" if selected else "[ ]"), evidence, False
+
+            def _toggle(which: str = which, locked: bool = locked) -> str:
+                if locked:
+                    reasons = card.media_engine_blockers(which) or ["already enabled on this card"]
+                    return f"{which.upper()} unlock not available: " + "; ".join(reasons)
+                now = not getattr(config, f"{which}_unlock")
+                config.set_media_engine_unlock(which, now)
+                return (
+                    f"EXPERIMENTAL {which.upper()} unlock set to {'ON' if now else 'OFF'} "
+                    "(burn will ask for 'REVIEW MEDIA ENGINES')."
+                )
+
+            entries.append(
+                _MenuEntry(
+                    label=f"{tag} [EXPERIMENTAL] {label} ({blocks}) — {state}",
+                    help_text=(
+                        f"EXPERIMENTAL: clears the {label} disable bits. There is NO defect register "
+                        "for media engines, so vfi_burn cannot prove the units exist on this die. "
+                        "Offered only when OPT_*_DISABLE == STATUS_OPT_* (ffcalc's evidence rule), "
+                        "OPT matches the FF replay, and every block is already in the FF prefix. "
+                        "Caveat: ffcalc's own FBP measurement shows STATUS_OPT_* following OPT_DISABLE, "
+                        f"so that equality is weak evidence. Readings: {evidence}."
+                    ),
+                    on_toggle=_toggle,
+                    on_enter=_toggle,
+                    locked=locked,
+                )
+            )
+        return "EXPERIMENTAL Media Engines (NVDEC / NVJPG / OFA)", entries
 
     if screen == "preview":
         preview_lines = _compute_preview_lines(card, config)

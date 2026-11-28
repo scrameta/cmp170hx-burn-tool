@@ -71,6 +71,13 @@ FUSE_GROUPS: tuple[FuseGroup, ...] = (
         atomic_poweroff=True,
         poweroff_domain="mig",
     ),
+    FuseGroup(
+        name="engine",
+        description="EXPERIMENTAL media-engine floorsweep bits (NVDEC c1/b8, NVJPG/OFA pair c1/b9 + c1/b23)",
+        member_keys=_keys_for_group("engine"),
+        atomic_poweroff=True,
+        poweroff_domain="engine",
+    ),
 )
 
 FUSE_GROUPS_BY_NAME: dict[str, FuseGroup] = {g.name: g for g in FUSE_GROUPS}

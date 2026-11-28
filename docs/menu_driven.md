@@ -42,7 +42,7 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 
 | Option | Action |
 |---|---|
-| `[1]` | Setup / Configure Unlocks from Card (`[a]` kernel `menuconfig` TUI — unlock/lock GPCs, TPCs, FBPs, PCIe Gen3/Gen4, NVLink) / load saved plan (`[b]`) / target & mode |
+| `[1]` | Setup / Configure Unlocks from Card (`[a]` kernel `menuconfig` TUI — unlock/lock GPCs, TPCs, FBPs, PCIe Gen3/Gen4, NVLink, experimental MIG/SYS_PIPE and media engines) / load saved plan (`[b]`) / target & mode |
 | `[2]` | Review Plan & Expected Outcome (FF rows taken/remaining, enabled/disabled breakdown, unknown/experimental fuse audit) |
 | `[3]` | Live Status & Passive Inspection |
 | `[4]` | Active Sense (`SENSE_CTRL`) |
@@ -53,6 +53,23 @@ The menu wraps every CLI workflow with the exact same safety gates, `fsync`ed JS
 | `[9]` | Offline FF Word Decoder |
 | `[10]` | Cold-Boot Snapshot & Verify |
 | `[11]` | Experimental Registers (read-only: ECC, SM speed select, SKU, readouts) |
+
+### Experimental: media engines (NVDEC / NVJPG / OFA)
+
+The `menuconfig` root has an **`[EXPERIMENTAL] Media engines`** submenu with two toggles:
+
+- **NVDEC x5** — clears `NVDEC_DISABLE` (chain 1 bits 139..143, block 8, shared with `FBPA_DISABLE[23:21]` and `GPC_DISABLE`).
+- **NVJPG0 + OFA0** — clears chain 1 bits 146 (block 9) and 371 (block 23, shared with `NVLINK_DISABLE` / `SYS_PIPE_DISABLE`) **together**: which bit is NVJPG and which is OFA was never separated.
+
+Positions follow `sayhellotojungle/cmp170hx-ffcalc`. These engines have **no `*_DEFECTIVE` register**, so the genuine-defect audit cannot cover them. A toggle is only offered when:
+
+1. `OPT_*_DISABLE` and `STATUS_OPT_*` were both read (`0x820378/0x820C24`, `0x820370/0x820C0C`, `0x8202D8/0x820E34`) and are equal (ffcalc's zero-defect evidence rule),
+2. `OPT_*_DISABLE` agrees with the FF replay, and
+3. every block involved is already in the card's FF prefix.
+
+That evidence is weak: ffcalc's own FBP measurement (a5c194c) shows `STATUS_OPT_*` simply following `OPT_DISABLE`. Each burn record that changes engine bits needs a separate typed `REVIEW MEDIA ENGINES` confirmation. After the cold boot, check that `STATUS_OPT_*` reads 0 and the engines enumerate; a unit that stays non-zero is physically absent, so don't re-burn it.
+
+Row cost: if you select the engines in the same plan as compute/NVLink changes, they mostly share records that are being rewritten anyway (about +1 row, for block 9). Adding them after those records are burned costs up to 3 rows and another glitch window.
 
 ---
 
