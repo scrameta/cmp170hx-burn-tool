@@ -24,6 +24,7 @@ from .ffrecord import (
 )
 from .fuse_rules import CombinationIssue, evaluate_fuse_combinations
 from .fuses import (
+    A100_SXM4_DEVICE_IDS,
     A100_TARGET_DEVICE_IDS,
     BURNABLE_TARGET_DEVICE_IDS,
     DEVICE_ID_DENIED_BLOCKS,
@@ -172,7 +173,7 @@ def snapshot_from_raw_state(
         raise BurnError(f"missing Die ID rows {missing_die}")
 
     eff_last_row = FF_ROW_MAX if ff_last_row is None else int(ff_last_row)
-    iff_start = int(iff_record) & 0xFFFF
+    iff_start = int(iff_record) & 0x1FF  # 9-bit start row field (factory 0x01FB01E8 -> 488)
     if ff_last_row is None and iff_record != 0 and FF_ROW_MIN < iff_start <= 512:
         eff_last_row = min(FF_ROW_MAX, iff_start - 1)
     if not (FF_ROW_MIN < eff_last_row <= FF_ROW_MAX):
@@ -217,7 +218,7 @@ def snapshot_from_raw_state(
             if ff_key in FFCALC_KEY_TO_FIELD and ff_key in decoded and sh_val != decoded[ff_key]:
                 iff_hint = (
                     f" — note: this card has persistent IFF records (IFF_RECORD=0x{iff_record:08x}, "
-                    f"rows {iff_start}..{(iff_record >> 16) & 0xFFFF}) which can override fuse shadows "
+                    f"rows {iff_start}..{(iff_record >> 16) & 0x1FF}) which can override fuse shadows "
                     "at boot after FF replay"
                     if iff_record and iff_start <= FF_ROW_MAX
                     else " (was the card modified without a cold boot, or is the FF-only model invalid here?)"
@@ -399,10 +400,16 @@ class UnlockConfig:
         self.nvlink_enabled = bool(enabled)
 
     def set_a100_devid(self, target_devid: int | None) -> None:
-        if target_devid is not None and target_devid not in BURNABLE_TARGET_DEVICE_IDS:
-            supported = ", ".join(f"0x{d:04x}" for d in sorted(BURNABLE_TARGET_DEVICE_IDS))
+        offered = {d: n for d, n in BURNABLE_TARGET_DEVICE_IDS.items() if d not in A100_SXM4_DEVICE_IDS}
+        if target_devid is not None and target_devid not in offered:
+            supported = ", ".join(f"0x{d:04x}" for d in sorted(offered))
+            extra = (
+                " (A100 SXM4 IDs are not offered: the CMP 170HX is a PCIe board)"
+                if target_devid in A100_SXM4_DEVICE_IDS
+                else ""
+            )
             raise BurnError(
-                f"unsupported target Device ID 0x{target_devid:04x}; supported: {supported}"
+                f"unsupported target Device ID 0x{target_devid:04x}; supported: {supported}{extra}"
             )
         self.a100_devid = target_devid
 
@@ -716,11 +723,19 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
         )
 
     # 4. Optional PCIe Device ID conversion / revert (paired DEVIDA c2/b37 + DEVIDB c2/b38).
-    #    Encoded as ``target_devid << 1`` (bit 0 = 0). Always emitted as an atomic pair.
+    #    Encoded as ``target_devid << 1``. c2/b37 bit 0 (chain-2 bit 592) is not part of
+    #    DEVIDA: it is preserved from the FF prefix when c2/b37 is present there, else
+    #    written as 0 (the community-observed value). Always emitted as an atomic pair.
     if config.a100_devid is not None:
         target_dev = config.a100_devid
-        devida_word, devidb_word = encode_a100_devid_ff_words(target_dev)
-        block_data = (target_dev << 1) & 0xFFFF
+        if target_dev in A100_SXM4_DEVICE_IDS:
+            raise BurnError(
+                f"REFUSED: 10de:{target_dev:04x} is an A100 SXM4 ID; the CMP 170HX is a PCIe board "
+                "and has no matching VBIOS for it (use 0x20F1 or 0x20B5)"
+            )
+        old_b37 = card.current_blocks.get(2, {}).get(37)
+        b37_bit0 = (old_b37 & 1) if old_b37 is not None else 0
+        devida_word, devidb_word = encode_a100_devid_ff_words(target_dev, b37_bit0=b37_bit0)
         dev_desc = BURNABLE_TARGET_DEVICE_IDS[target_dev]
         vbios_note = (
             "REQUIRES A100 VBIOS + 128 GB BAR1"
@@ -736,21 +751,25 @@ def derive_ff_records(card: CardSnapshot, config: UnlockConfig) -> tuple[list[di
             if hard or over:
                 raise BurnError(f"c2/b{blk}: REFUSED; " + "; ".join(hard + over))
             next_idx = len(items)
+            new_data = (word >> 16) & 0xFFFF
+            note = f"{dev_desc} ({which_label}) — {vbios_note}"
+            if blk == 37 and old_b37 is None:
+                note += "; c2/b37 bit 0 (chain-2 bit 592) not in FF prefix, written as 0"
             items.append(
                 {
                     "row": card.next_free_row + 1 + next_idx,
                     "chain": 2,
                     "block": blk,
                     "old": old_val,
-                    "new": block_data,
+                    "new": new_data,
                     "word": word,
                     "kind": "devid",
                     "fields": [which_field],
-                    "note": f"{dev_desc} ({which_label}) — {vbios_note}",
+                    "note": note,
                     "source_label": f"derived_devid[{which_label}]",
                 }
             )
-            desired_blocks.setdefault(2, {})[blk] = block_data
+            desired_blocks.setdefault(2, {})[blk] = new_data
 
     final_decoded = decode_all_fields(desired_blocks)
     coherence_issues = evaluate_fuse_combinations(final_decoded)

@@ -181,11 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--devid",
         "--a100-devid",
         dest="a100_devid",
-        choices=("20f1", "20b5", "20b0", "20b2", "20c2", "2082"),
+        choices=("20f1", "20b5", "20c2", "2082"),
         default=None,
         help=(
             "non-interactive: set PCIe Device ID (DEVIDA+DEVIDB) to A100 "
-            "(20f1=PCIe 40GB, 20b5=PCIe 80GB, 20b0=SXM4 40GB, 20b2=SXM4 80GB; requires A100 VBIOS + 128 GB BAR1) "
+            "(20f1=PCIe 40GB, 20b5=PCIe 80GB; requires A100 VBIOS + 128 GB BAR1) "
             "or revert to CMP 170HX (20c2=8GB, 2082=10GB; requires matching CMP VBIOS)"
         ),
     )

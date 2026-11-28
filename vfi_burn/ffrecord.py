@@ -2,11 +2,13 @@
 
 Format verified across Kate's GA100VFI writeup and sayhellotojungle/cmp170hx-ffcalc
 (live-burned on CMP 170HX 8 GB):
-  - Physical FF region : rows 222..486 (rows 0..221 are regular/control/FPF; 487..511 are IFF)
+  - Physical FF region : rows 222..486 used (rows 0..221 are regular/control/FPF). The factory
+                         IFF window is rows 488..507 (IFF_RECORD 0x01FB01E8), so row 487 is
+                         also FF; vfi_burn stops one row early, deliberately.
   - Empty row marker   : 0x00000000
   - Bits [4:0]         : chain (0..31)
   - Bit  [5]           : 0 for FF record (1 = IFF; must NEVER be set for FF burns)
-  - Bits [15:6]        : 16-bit block index within chain (0..1023)
+  - Bits [15:6]        : 10-bit index (0..1023) of a 16-bit block within the chain
   - Bits [31:16]       : replacement 16-bit block value (0x0000..0xFFFF)
   - Replay semantics   : rows 222..486 replayed in ascending order; later record wins per (chain, block).
 """
@@ -372,9 +374,14 @@ def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
     (either an A100 target or a CMP 170HX 8 GB / 10 GB revert target), return
     ``(which, devid)`` (e.g. ``("DEVIDA", 0x20F1)``); otherwise return ``None``.
 
+    Layout (chain 2): DEVIDA = bits 593..608 (c2/b37 bits 1..15 + c2/b38 bit 0),
+    DEVIDB = bits 609..624 (c2/b38 bits 1..15 + c2/b39 bit 0). c2/b37 bit 0 (chain-2
+    bit 592) is NOT part of DEVIDA and must be preserved as read (see
+    ``ff_word_safety_audit``), so it may be 0 or 1 here.
+
     Enforces:
       - Valid non-IFF FF record targeting ``(2, 37)`` (DEVIDA) or ``(2, 38)`` (DEVIDB)
-      - Bit 0 of block data is 0 (preserves chain2 bit 592 / ``DEVIDA[15]=0``)
+      - For c2/b38, bit 0 (``DEVIDA[15]``) is 0 (true for every supported target ID)
       - ``data >> 1`` is in ``BURNABLE_TARGET_DEVICE_IDS``
         (A100 ``0x20F1``/``0x20B5``/``0x20B0``/``0x20B2`` or CMP 170HX ``0x20C2``/``0x2082``)
     """
@@ -384,7 +391,7 @@ def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
         return None
     if rec.chain != 2 or rec.block not in (37, 38):
         return None
-    if (rec.data & 1) != 0:
+    if rec.block == 38 and (rec.data & 1) != 0:
         return None
     devid = rec.data >> 1
     if devid not in BURNABLE_TARGET_DEVICE_IDS:
@@ -392,15 +399,22 @@ def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
     return ("DEVIDA" if rec.block == 37 else "DEVIDB", devid)
 
 
-def encode_a100_devid_ff_words(target_devid: int) -> tuple[int, int]:
-    """Encode paired ``(devida_word, devidb_word)`` FF records for a supported A100 or CMP 170HX Device ID."""
+def encode_a100_devid_ff_words(target_devid: int, *, b37_bit0: int = 0) -> tuple[int, int]:
+    """Encode paired ``(devida_word, devidb_word)`` FF records for a supported A100 or CMP 170HX Device ID.
+
+    ``b37_bit0`` is the current value of c2/b37 bit 0 (chain-2 bit 592, not part of
+    DEVIDA). Callers that know it (c2/b37 present in the FF prefix) must pass it so the
+    record preserves it; 0 is the community-observed value when it is unknown.
+    """
     if target_devid not in BURNABLE_TARGET_DEVICE_IDS:
         supported = ", ".join(f"0x{d:04x}" for d in sorted(BURNABLE_TARGET_DEVICE_IDS))
         raise BurnError(
             f"unsupported target device ID 0x{target_devid:04x}; supported: {supported}"
         )
+    if b37_bit0 not in (0, 1) or isinstance(b37_bit0, bool):
+        raise BurnError(f"b37_bit0 must be 0 or 1, got {b37_bit0!r}")
     block_data = (target_devid << 1) & 0xFFFF
-    return encode_ff(2, 37, block_data), encode_ff(2, 38, block_data)
+    return encode_ff(2, 37, block_data | b37_bit0), encode_ff(2, 38, block_data)
 
 
 def ff_word_safety_audit(
@@ -427,6 +441,13 @@ def ff_word_safety_audit(
 
     if (rec.chain, rec.block) in DEVICE_ID_DENIED_BLOCKS:
         if allow_a100_devid and decode_a100_devid_ff_word(word) is not None:
+            # c2/b37 bit 0 (chain-2 bit 592) is not part of DEVIDA: when the current
+            # block is known it must be preserved exactly.
+            if rec.block == 37 and old_block is not None and (rec.data & 1) != (old_block & 1):
+                hard_denials.append(
+                    f"FF c2/b37 (0x{old_block:04x}->0x{rec.data:04x}) changes chain-2 bit 592 "
+                    "(c2/b37 bit 0), which is not part of DEVIDA and must be kept as read"
+                )
             return hard_denials, overridable
         hard_denials.append(
             f"FF c{rec.chain}/b{rec.block}=0x{rec.data:04x} targets unconditionally denied "

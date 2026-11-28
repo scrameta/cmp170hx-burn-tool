@@ -26,6 +26,7 @@ from vfi_burn.ga100 import (
     REG_FUSEDATA,
     REG_FUSEWDATA,
     REG_IFF_RECORD,
+    REG_PLM_F4,
     read_ga100_card_state,
 )
 from vfi_burn.interfaces import Host
@@ -47,18 +48,21 @@ class TestBurnInterlocks(unittest.TestCase):
         ctl.sense_ctrl()
         return mmio, ctl
 
-    def test_ignored_clear_quarantines_without_restoring_address(self):
+    def test_closed_plm_f4_at_relatch_quarantines_without_restoring_address(self):
+        # FUSEWDATA is write-only, so a dropped zero latch cannot be read back. What CAN
+        # be checked is PLM_f4: if it closed, the FUSEWDATA=0 write would be dropped, so
+        # the controller must quarantine and leave FUSEADDR on the burned row.
         mmio, ctl = self.make_controller()
         mmio.regs[REG_FUSEADDR] = 77
         write = mmio.write32
 
-        def drop_clear(offset, value, **kwargs):
-            if offset == REG_FUSEWDATA and value == 0 and mmio.program_calls:
-                return
-            return write(offset, value, **kwargs)
+        def close_plm_after_program(offset, value, **kwargs):
+            write(offset, value, **kwargs)
+            if offset == REG_FUSECTRL and value == CMD_PROGRAM:
+                mmio.regs[REG_PLM_F4] = 0
 
-        mmio.write32 = drop_clear
-        with self.assertRaisesRegex(BurnError, "zero latch did not stick"):
+        mmio.write32 = close_plm_after_program
+        with self.assertRaisesRegex(BurnError, "FUSEWDATA zero latch would be dropped"):
             ctl.program_row(223, encode_ff(1, 19, 0x4200))
         self.assertEqual(mmio.program_calls, 1)
         self.assertEqual(mmio.regs[REG_FUSEADDR], 223)

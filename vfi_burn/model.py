@@ -38,8 +38,10 @@ def sku_display_name(pci_id: str) -> str:
 DEBUGCTRL_ADDR = 0x00820060
 POISON_PREFIXES = (0xBADF0000, 0xBAD00000)  # most common; is_poison() matches all 0xBADxxxxx
 
-# Physical GA100 FF (fuseless-fuse) region. Rows 0..221 are control/regular/FPF,
-# 487..511 are IFF. Defined here (not ffrecord) so Plan.load can enforce it.
+# Physical GA100 FF (fuseless-fuse) region. Rows 0..221 are control/regular/FPF; the
+# factory IFF window is rows 488..507 (IFF_RECORD 0x01FB01E8). Row 487 is also FF but is
+# deliberately left unused (one row conservative). Defined here (not ffrecord) so
+# Plan.load can enforce it.
 FF_ROW_MIN = 222
 FF_ROW_MAX = 486
 
@@ -276,7 +278,7 @@ class Plan:
         if not (FF_ROW_MIN <= first < last <= FF_ROW_MAX):
             raise BurnError(
                 f"fpf.first_row/last_row ({first}..{last}) must lie inside the GA100 FF region "
-                f"{FF_ROW_MIN}..{FF_ROW_MAX} (rows 0..221 control/FPF, 487..511 IFF)"
+                f"{FF_ROW_MIN}..{FF_ROW_MAX} (rows 0..221 control/FPF; 487 deliberately unused; factory IFF window 488..507)"
             )
         empty_word = u32(_req(fpf, "empty_word", "fpf"), "fpf.empty_word")
 
