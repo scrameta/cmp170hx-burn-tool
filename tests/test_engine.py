@@ -61,7 +61,8 @@ class Harness(unittest.TestCase):
         self.assertEqual(self.controller.rows[224],0)
         self.assertEqual(len([e for e in self.controller.events if e[0]=='write']),1)
         self.assertEqual(len([e for e in self.logged() if e['event']=='verified_readback_only']),1)
-        self.assertFalse(self.logged()[-2]['cold_boot_verified'])
+        self.assertEqual(self.logged()[-1]['event'], 'session_complete_readback_only')
+        self.assertFalse(self.logged()[-1]['cold_boot_verified'])
 
     def test_no_confirmation_no_writes(self):
         with self.assertRaisesRegex(BurnError, 'declined'):

@@ -74,6 +74,7 @@ from .model import (
     PreTriggerRefusal,
     SKU_CMP170HX_8GB,
     SUPPORTED_CMP170HX_SKUS,
+    UnsafePreTriggerRefusal,
     is_poison,
 )
 
@@ -149,11 +150,18 @@ class GA100FuseController(FuseControllerHAL):
         self.read_only = read_only
         self._sleep = sleep
         self._clock = clock
+        self._halt_reason: str | None = None
+
+    def _require_access(self) -> None:
+        if self._halt_reason is not None:
+            raise BurnError(f"controller quarantined: {self._halt_reason}; no further MMIO")
 
     def rd(self, offset: int) -> int:
+        self._require_access()
         return self.mmio.read32(offset)
 
     def _wr(self, offset: int, value: int) -> None:
+        self._require_access()
         if offset == REG_DEBUGCTRL:
             raise BurnError("REFUSED write to DEBUGCTRL (0x00820060)")
         if offset == REG_FUSEDATA:
@@ -177,11 +185,13 @@ class GA100FuseController(FuseControllerHAL):
         """Read FUSECTRL first and halt immediately on poison without touching any other register."""
         ctrl = self.rd(REG_FUSECTRL)
         if ctrl == 0xFFFFFFFF:
-            raise BurnError("FUSECTRL reads 0xFFFFFFFF (BAR0 dead / memory decode off / link lost)")
+            self._halt_reason = "FUSECTRL reads 0xFFFFFFFF (BAR0 dead / memory decode off / link lost)"
+            raise BurnError(self._halt_reason)
         if is_poison(ctrl):
-            raise BurnError(
+            self._halt_reason = (
                 f"FUSECTRL poisoned ({ctrl:#010x}): STOP all BAR0 reads and cold-boot the card"
             )
+            raise BurnError(self._halt_reason)
         return ctrl
 
     def _confirm_bad_prefixed_row_data(self, row: int, val: int) -> None:
@@ -211,7 +221,8 @@ class GA100FuseController(FuseControllerHAL):
         self._check_fusectrl_first()
         pmc = self.rd(REG_PMC_BOOT_0)
         if pmc in (0, 0xFFFFFFFF) or is_poison(pmc):
-            raise BurnError(f"PMC_BOOT_0 reads {pmc:#010x}: BAR0 inaccessible / GPU off")
+            self._halt_reason = f"PMC_BOOT_0 reads {pmc:#010x}: BAR0 inaccessible / GPU off"
+            raise BurnError(self._halt_reason)
 
     def poll_idle(self, timeout_s: float = 0.2) -> int:
         deadline = self._clock() + timeout_s
@@ -230,6 +241,7 @@ class GA100FuseController(FuseControllerHAL):
         ctrl = self._check_fusectrl_first()
         dsov = self.rd(REG_DSOV_STATUS)
         if is_poison(dsov):
+            self._halt_reason = f"DSOV_STATUS poisoned ({dsov:#010x}): STOP all BAR0 reads and cold-boot"
             return Health(ctrl, dsov, 0, 0, 0, 0)
         crc = self.rd(REG_CRC_STATUS)
         plm_fc = self.rd(REG_PLM_FC)
@@ -274,8 +286,15 @@ class GA100FuseController(FuseControllerHAL):
             if self.rd(REG_FUSEADDR) != row:
                 raise BurnError(f"FUSEADDR did not latch row {row}")
             self._wr(REG_FUSECTRL, CMD_READ)
+            # Guard against observing the old IDLE state before command acceptance.
+            # This delay is conservative, NOT proof of command acceptance.
+            self._sleep(0.001)
             self.poll_idle(timeout_s)
+            if self.rd(REG_FUSEADDR) != row:
+                raise BurnError(f"FUSEADDR drifted during CMD_READ row {row}")
             val = self.rd(REG_FUSEDATA)
+            if self.rd(REG_FUSEDATA) != val:
+                raise BurnError(f"FUSEDATA unstable reading row {row}")
             if is_poison(val):
                 self._confirm_bad_prefixed_row_data(row, val)
             return val
@@ -364,8 +383,9 @@ class GA100FuseController(FuseControllerHAL):
     def armed_problems(self) -> list[str]:
         """Return [] when all GA100 FF programming prerequisites hold; else list every failure."""
         ctrl = self.rd(REG_FUSECTRL)
-        if is_poison(ctrl):
-            return [f"FUSECTRL poisoned ({ctrl:#010x}): STOP reads and cold-boot"]
+        if ctrl == 0xFFFFFFFF or is_poison(ctrl):
+            self._halt_reason = f"FUSECTRL poisoned/dead ({ctrl:#010x}): STOP reads and cold-boot"
+            return [self._halt_reason]
         problems: list[str] = []
         if not is_fusectrl_idle(ctrl):
             problems.append(f"FUSECTRL non-idle (0x{ctrl:08x})")
@@ -440,18 +460,35 @@ class GA100FuseController(FuseControllerHAL):
             raise BurnError("controller not armed: " + "; ".join(problems))
 
     def _relatch_no_burn(self, orig_addr: int | None) -> None:
-        """Best effort, only when FUSECTRL is idle (never after poison): put the
-        FUSEWDATA=0 no-burn latch back BEFORE restoring FUSEADDR, so a stray
-        CMD_PROGRAM (other tool, operator typo, firmware) cannot re-burn the staged
-        word into whatever row FUSEADDR selects."""
+        """Verify FUSEWDATA=0 sticks before restoring FUSEADDR; quarantine on any failure.
+
+        Put the FUSEWDATA=0 no-burn latch back BEFORE restoring FUSEADDR so a stray
+        CMD_PROGRAM cannot re-burn the staged word into whatever row FUSEADDR selects.
+        """
         try:
-            if not is_fusectrl_idle(self.rd(REG_FUSECTRL)):
-                return
+            if not is_fusectrl_idle(self._check_fusectrl_first()):
+                raise BurnError("cannot clear staged payload while FUSECTRL is busy")
             self._wr(REG_FUSEWDATA, 0)
+            if self.rd(REG_FUSEWDATA) != 0:
+                raise BurnError("FUSEWDATA zero latch did not stick; address NOT restored")
             if orig_addr is not None:
                 self._wr(REG_FUSEADDR, orig_addr)
-        except Exception:
-            pass
+                if self.rd(REG_FUSEADDR) != orig_addr:
+                    raise BurnError("FUSEADDR restoration failed")
+        except BaseException as exc:
+            self._halt_reason = f"no-burn latch cleanup failed: {exc}"
+            raise
+
+    def _cleanup_before_trigger(
+        self, orig_addr: int | None, cause: BaseException | None = None
+    ) -> None:
+        try:
+            self._relatch_no_burn(orig_addr)
+        except Exception as exc:
+            prefix = f"NO program command issued ({cause}), but" if cause is not None else "NO program command issued, but"
+            raise UnsafePreTriggerRefusal(
+                f"{prefix} controller cleanup failed: {exc}"
+            ) from exc
 
     def program_row(
         self,
@@ -461,11 +498,14 @@ class GA100FuseController(FuseControllerHAL):
         timeout_s: float = 10.0,
         pre_trigger_check=None,
         allow_a100_devid: bool = False,
+        blank_witness: tuple[int, int] | None = None,
     ) -> int:
         """Burn ONE 32-bit FF record into blank row [222..486] with full hardware assertions.
 
-        Every failure before CMD_PROGRAM is raised as ``PreTriggerRefusal`` (nothing burned).
-        Failures after CMD_PROGRAM are plain ``BurnError`` (row may be partially programmed).
+        Every failure before CMD_PROGRAM is raised as ``PreTriggerRefusal`` (nothing burned),
+        or ``UnsafePreTriggerRefusal`` if volatile cleanup failed afterward.
+        Failures after CMD_PROGRAM are plain ``BurnError`` (row may be partially programmed)
+        and quarantine the controller instance against further MMIO.
         """
         orig_addr: int | None = None
         staged = False
@@ -492,6 +532,14 @@ class GA100FuseController(FuseControllerHAL):
 
             self.arm()
 
+            # A known nonzero row immediately before the blank-row read detects
+            # a single dropped CMD_READ that would otherwise return stale zero.
+            if blank_witness is not None:
+                witness_row, witness_word = blank_witness
+                if witness_row == row or witness_word == 0:
+                    raise BurnError("invalid blank-row read witness")
+                if self.read_row(witness_row) != witness_word:
+                    raise BurnError("blank-row read witness mismatch")
             current = self.read_row(row)
             if current != FF_EMPTY_WORD:
                 raise BurnError(
@@ -528,17 +576,19 @@ class GA100FuseController(FuseControllerHAL):
                 )
             if pre_trigger_check is not None:
                 pre_trigger_check()
-        except PreTriggerRefusal:
+                if self.armed_problems() or self.rd(REG_FUSEADDR) != row or self.rd(REG_FUSEWDATA) != word:
+                    raise BurnError("controller or staged data changed during pre-trigger callback")
+        except PreTriggerRefusal as exc:
             if staged:
-                self._relatch_no_burn(orig_addr)
+                self._cleanup_before_trigger(orig_addr, cause=exc)
             raise
         except BurnError as exc:
             if staged:
-                self._relatch_no_burn(orig_addr)
+                self._cleanup_before_trigger(orig_addr, cause=exc)
             raise PreTriggerRefusal(str(exc)) from exc
-        except BaseException:
+        except BaseException as exc:
             if staged:
-                self._relatch_no_burn(orig_addr)
+                self._cleanup_before_trigger(orig_addr, cause=exc)
             raise
 
         # ---- point of no return: CMD_PROGRAM ----
@@ -548,15 +598,23 @@ class GA100FuseController(FuseControllerHAL):
             # so _relatch_no_burn can never race with an active program cycle.
             self._sleep(0.005)
             self.poll_idle(timeout_s)
-        finally:
             self._relatch_no_burn(orig_addr)
-
-        got = self.read_row(row)
-        if got != word:
-            raise BurnError(
-                f"row {row} program readback mismatch: wrote 0x{word:08x}, got 0x{got:08x}"
-            )
-        return got
+            # A different known value makes a dropped readback less likely to
+            # masquerade as a successful write. Native adapter supplies it.
+            if blank_witness is not None and blank_witness[1] != word:
+                if self.read_row(blank_witness[0]) != blank_witness[1]:
+                    raise BurnError("post-program read witness mismatch")
+            got = self.read_row(row)
+            if got != word:
+                raise BurnError(
+                    f"row {row} program readback mismatch: wrote 0x{word:08x}, got 0x{got:08x}"
+                )
+            return got
+        except BaseException as exc:
+            # Never attempt cleanup after an uncertain command or failed wait:
+            # the macro may still be active. Do not issue diagnostic reads either.
+            self._halt_reason = f"uncertain program/verification state: {exc}"
+            raise
 
 
 def _default_bdf_lock_dir() -> Path:
@@ -778,12 +836,72 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
     def active_sense_readonly(self) -> None:
         self.controller.sense_ctrl()
 
+    def validate_burn_baseline(self, plan) -> None:
+        """Recheck the cold plan against the sensed native controller before a burn."""
+        self._burn_bounds: tuple[int, int] | None = None
+        self._blank_witness: tuple[int, int] | None = None
+        if plan.first_row != FF_ROW_MIN or plan.empty_word != FF_EMPTY_WORD:
+            raise BurnError("native burn requires the physical FF start and zero empty word")
+        if plan.baseline_ff_rows is None:
+            raise BurnError("native burn requires a complete cold FF prefix")
+        health = self.health()
+        if health.efp != 1:
+            raise BurnError("native burn requires sensed defect registers (EFP=1)")
+        actual: dict[str, int] = {}
+        for ff_key, field in FFCALC_KEY_TO_FIELD.items():
+            addr = FUSES_BY_KEY[ff_key].defect_addr
+            if addr is None:
+                continue
+            value = self.register(addr)
+            if value == 0xFFFFFFFF or is_poison(value):
+                raise BurnError(f"untrusted live defect register {field}: {value:#010x}")
+            if plan.defect_masks.get(field) != value:
+                raise BurnError(
+                    f"live defect mask {field} differs from or is missing in plan: {value:#010x}"
+                )
+            actual[field] = value
+        tpc = [f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC)]
+        if "GPC_DISABLE" not in actual or any(k not in actual for k in tpc):
+            raise BurnError("cannot derive native healthy SM ceiling")
+        ceiling = compute_sm_count(actual["GPC_DISABLE"], [actual[k] for k in tpc])
+        if plan.base_sm_ceiling > ceiling or (plan.override_sm_ceiling or 0) > ceiling:
+            raise BurnError(f"plan SM ceiling exceeds live healthy ceiling {ceiling}")
+        # IFF_RECORD may have been cleared by SENSE_CTRL; the cold plan's
+        # last_row remains authoritative. A visible tighter boundary also wins.
+        iff = self.register(REG_IFF_RECORD)
+        last = _ff_last_row_from_iff(iff)
+        if plan.last_row > last:
+            raise BurnError(f"plan FF boundary exceeds visible IFF boundary {last}")
+        witness = next(((r, v) for r, v in plan.die_rows.items() if v != 0), None)
+        if witness is None:
+            raise BurnError("no nonzero die row available as CMD_READ witness")
+        if self.die_row(witness[0]) != witness[1]:
+            raise BurnError("die-row witness mismatch")
+        self._blank_witness = witness
+        self._burn_bounds = (plan.first_row, plan.last_row)
+
     def write_one_record(
         self, row: int, word: int, *, allow_a100_devid: bool = False
     ) -> None:
         if not self.writable:
             raise PreTriggerRefusal("GA100LiveAdapter opened read-only; pass --execute to enable writes")
-        self.controller.program_row(row, word, allow_a100_devid=allow_a100_devid)
+        bounds = getattr(self, "_burn_bounds", None)
+        if bounds is None or not bounds[0] <= row <= bounds[1]:
+            raise PreTriggerRefusal(
+                "native burn baseline not validated or row outside validated bounds"
+            )
+        self.controller.program_row(
+            row,
+            word,
+            allow_a100_devid=allow_a100_devid,
+            blank_witness=getattr(self, "_blank_witness", None),
+            pre_trigger_check=self._check_program_host,
+        )
+
+    def _check_program_host(self) -> None:
+        from .engine import check_host
+
+        check_host(self.host())
 
     def capture_cold_snapshot(
         self,
@@ -849,6 +967,17 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         }
 
 
+def _ff_last_row_from_iff(iff_record: int) -> int:
+    if iff_record == 0xFFFFFFFF or is_poison(iff_record):
+        raise BurnError(f"untrusted IFF_RECORD {iff_record:#010x}")
+    if iff_record == 0:
+        return FF_ROW_MAX
+    start = iff_record & 0xFFFF
+    if not FF_ROW_MIN < start <= TOTAL_FUSE_ROWS:
+        raise BurnError(f"invalid IFF_RECORD start row {start}")
+    return min(FF_ROW_MAX, start - 1)
+
+
 def read_ga100_card_state(
     backend,
     *,
@@ -888,23 +1017,11 @@ def read_ga100_card_state(
             "[4] Active Sense (SENSE_CTRL) first so EFP=1."
         )
 
-    iff_record = 0
     try:
-        raw_iff = backend.register(REG_IFF_RECORD)
-        if raw_iff == 0xFFFFFFFF or is_poison(raw_iff):
-            raise BurnError(
-                f"{label}: poisoned/dead read 0x{raw_iff:08x} from IFF_RECORD (0x{REG_IFF_RECORD:08x})"
-            )
-        iff_record = raw_iff
-    except BurnError:
-        raise
-    except Exception:
-        iff_record = 0
-
-    ff_last_row = FF_ROW_MAX
-    iff_start = iff_record & 0xFFFF
-    if iff_record != 0 and FF_ROW_MIN < iff_start <= 512:
-        ff_last_row = min(FF_ROW_MAX, iff_start - 1)
+        iff_record = backend.register(REG_IFF_RECORD)
+        ff_last_row = _ff_last_row_from_iff(iff_record)
+    except Exception as exc:
+        raise BurnError(f"{label}: cannot establish IFF boundary: {exc}") from exc
 
     die_rows = {r: backend.die_row(r) for r in DIE_ID_ROWS}
     ff_rows = {r: backend.fuse_row(r) for r in range(FF_ROW_MIN, ff_last_row + 1)}

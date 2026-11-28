@@ -32,7 +32,10 @@ class MissingWriter(FuseWriter):
     write_enabled = False
     writer_verified = False
 
-    def write_one_record(self, row: int, word: int) -> None:
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
+        del row, word, allow_a100_devid
         raise PreTriggerRefusal(
             "REAL FUSE WRITES DISABLED: write mode not armed (pass --execute on an interactive TTY)"
         )
@@ -136,7 +139,10 @@ class FakeController(FuseReader, FuseWriter):
         if self.after_sense:
             self.after_sense(self)
 
-    def write_one_record(self, row: int, word: int) -> None:
+    def write_one_record(
+        self, row: int, word: int, *, allow_a100_devid: bool = False
+    ) -> None:
+        del allow_a100_devid
         self.events.append(("write", row, word))
         if self.fail_write:
             raise BurnError("injected write interruption")

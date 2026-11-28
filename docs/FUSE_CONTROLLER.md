@@ -272,8 +272,9 @@ sequenceDiagram
     Ctl->>FUSE: write FUSEADDR = row
     Ctl->>FUSE: read FUSEADDR (verify latched == row)
     Ctl->>FUSE: write FUSECTRL = 1 (CMD_READ)
-    Ctl->>FUSE: poll FUSECTRL until idle
-    FUSE-->>Ctl: read FUSEDATA
+    Note over Ctl,FUSE: sleep 1 ms, then poll FUSECTRL until idle
+    Ctl->>FUSE: verify FUSEADDR == row (no drift)
+    FUSE-->>Ctl: read FUSEDATA twice (must be stable)
     Ctl->>FUSE: if FUSEDATA is 0xBADxxxxx: re-check FUSECTRL (idle, not poisoned),\nPMC_BOOT_0, and re-read FUSEDATA (must be equal); else error
     Ctl->>FUSE: if idle, write FUSEADDR = original
 ```
@@ -353,26 +354,33 @@ sequenceDiagram
     participant Ctl as GA100FuseController
     participant FUSE as Fuse block (BAR0)
 
-    Note over Ctl: validate row in 222..486, word nonzero, bit 5 (IFF) = 0, not 0xBADxxxxx
+    Note over Ctl: validate row in validated FF bounds, word nonzero, bit 5 (IFF) = 0, not 0xBADxxxxx
     Ctl->>Ctl: arm() (section 5.3)
+    opt nonzero die-row witness supplied (native live adapter)
+        Ctl->>FUSE: read_row(witness_row) == witness_word (primes FUSEDATA nonzero)
+    end
     Ctl->>FUSE: read_row(row) via CMD_READ, must be 0x00000000
     Ctl->>FUSE: read FUSEADDR (save original)
     Ctl->>FUSE: write FUSECTRL = 0 (IDLE)
     Ctl->>FUSE: write FUSEADDR = row, verify latched
     Ctl->>FUSE: write FUSEWDATA = word, verify read-back == word
-    Note over Ctl,FUSE: everything above failing raises PreTriggerRefusal and relatches FUSEWDATA = 0
+    Ctl->>FUSE: final pre-trigger gate (armed_problems, FUSEADDR, FUSEWDATA, host callback + recheck)
+    Note over Ctl,FUSE: failures above relatch FUSEWDATA = 0 (verified before FUSEADDR restore); cleanup failure raises UnsafePreTriggerRefusal + quarantines controller
     rect rgb(255, 225, 225)
         Note over Ctl,FUSE: POINT OF NO RETURN
         Ctl->>FUSE: write FUSECTRL = 2 (CMD_PROGRAM)
         FUSE-->>FUSE: row |= FUSEWDATA (busy, about 1 ms)
-        Note over Ctl,FUSE: sleep 5 ms, then poll FUSECTRL until idle (up to 10 s, halt on poison)
+        Note over Ctl,FUSE: sleep 5 ms, then poll FUSECTRL until idle (up to 10 s, halt + quarantine on fault)
     end
-    Ctl->>FUSE: if idle, write FUSEWDATA = 0 then restore FUSEADDR = original (always, via finally)
+    Ctl->>FUSE: verify idle, write FUSEWDATA = 0 (verify 0), then restore FUSEADDR = original (verify)
+    opt witness_word != word
+        Ctl->>FUSE: read_row(witness_row) == witness_word (primes FUSEDATA != word)
+    end
     Ctl->>FUSE: read_row(row) via CMD_READ
     alt read-back == word
         Ctl-->>Ctl: return word
-    else mismatch
-        Ctl-->>Ctl: raise BurnError (row may be partially programmed)
+    else any post-trigger fault or mismatch
+        Ctl-->>Ctl: quarantine controller (no further MMIO) and raise BurnError
     end
 ```
 
@@ -390,9 +398,12 @@ sequenceDiagram
     participant Ctl as GA100FuseController
     participant FUSE as Fuse block (BAR0)
 
+    Note over Eng: live burn gate: refuse unresolved attempt / HALT_UNVERIFIED in journal; pre-check devid writer signature
     Note over Eng: once per session: preflight (host, PCI ID, health, die ID, masks)
     Eng->>Ctl: sense_ctrl() after operator types SENSE (section 5.2)
-    Eng->>Ctl: scan FF rows 222..486 once, verify prefix & prove trailing rows empty
+    Eng->>Ctl: native validate_burn_baseline() (re-read all 16 OPT_*_DEFECTIVE regs, SM ceiling, IFF bound, die witness)
+    Eng->>Ctl: scan FF rows 222..last_row (2 passes on live burn, 1 pass on dry-run/sim), verify prefix & trailing empties
+    Note over Eng: verify pending records fit in remaining FF rows; preview native prefixes and veto unsafe final boundary
     loop each record in the reviewed plan
         Eng->>Eng: reconcile record against defect masks and SM ceiling
         opt not the first record
@@ -406,13 +417,15 @@ sequenceDiagram
         Eng->>Eng: journal "attempt" (fsynced before touching hardware)
         Eng->>Ctl: write_one_record(pointer, word)
         Ctl->>FUSE: program_row() (section 5.4)
-        alt PreTriggerRefusal
+        alt UnsafePreTriggerRefusal
+            Eng->>Eng: journal HALT_UNVERIFIED (write_issued = false), stop
+        else PreTriggerRefusal
             Eng->>Eng: journal aborted_pre_trigger (write_issued = false), stop
         else BurnError after CMD_PROGRAM
-            Eng->>Eng: journal HALT_UNVERIFIED, stop, never retry
+            Eng->>Eng: journal HALT_UNVERIFIED (no speculative MMIO), stop, never retry
         else programmed
             Eng->>Ctl: read_row(pointer) == word
-            Eng->>Ctl: full health gate (FUSECTRL first, DSOV, CRC, PLMs)
+            Eng->>Ctl: full health gate (FUSECTRL first, DSOV, CRC, EFP = 1, PLMs)
             Eng->>Ctl: host gate, then second read_row(pointer) == word
             Eng->>Eng: journal verified_readback_only, update verified rows, advance pointer
         end
@@ -421,7 +434,7 @@ sequenceDiagram
             Eng->>Op: type CONTINUE SAME WINDOW (or Enter to stop and cold-verify)
         end
     end
-    Note over Eng: pre-power-off sanity check computed from initial scan + read-back-verified rows (0 reads)
+    Note over Eng: pre-power-off sanity check (0 reads); live unsafe/unknown verdict raises BurnError before session_complete_readback_only
     Note over Op,FUSE: only a cold boot plus verify-cold proves the burn took effect
 ```
 
