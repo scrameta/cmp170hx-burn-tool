@@ -39,6 +39,9 @@ A100_TARGET_DEVICE_IDS: dict[int, str] = {
     0x20B0: "A100 SXM4 40 GB (10de:20b0)",
     0x20B2: "A100 SXM4 80 GB (10de:20b2)",
 }
+# SXM4 IDs stay decodable (so existing plans/cards can be read), but the planner and
+# engine refuse to burn them on a CMP 170HX: it is a PCIe board with no SXM4 VBIOS.
+A100_SXM4_DEVICE_IDS: frozenset[int] = frozenset({0x20B0, 0x20B2})
 CMP170HX_TARGET_DEVICE_IDS: dict[int, str] = {
     0x20C2: "CMP 170HX 8 GB (10de:20c2)",
     0x2082: "CMP 170HX 10 GB (10de:2082)",
@@ -54,9 +57,9 @@ REG_GFW_BOOT = 0x00118234
 REG_FUSECTRL = 0x00820000
 REG_FUSEADDR = 0x00820004
 REG_FUSEDATA = 0x00820008        # READ-ONLY data port (CMD_READ output)
-REG_FUSEWDATA = 0x0082000C       # WRITE data port (CMD_PROGRAM input)
+REG_FUSEWDATA = 0x0082000C       # WRITE-ONLY data port (CMD_PROGRAM input); reads do not reflect it
 REG_EN_SW_OVERRIDE = 0x00820040  # write 1 while DSOV=0 to enable shadow writes
-REG_IFF_RECORD = 0x00820050      # must be 0 before CMD_SENSE_CTRL
+REG_IFF_RECORD = 0x00820050      # IFF window: start=v&0x1FF, last=(v>>16)&0x1FF (factory 0x01FB01E8 = rows 488..507); never written
 REG_DEBUGCTRL = 0x00820060       # RWL bit 1 (0 = main array, 1 = RIR macro; NEVER write)
 REG_CRC_STATUS = 0x00820070      # 0x55 = healthy CRC
 REG_EFP_STATUS = 0x00820078      # OPT_ENABLE_FUSE_PROGRAM (0 -> 1 after SENSE_CTRL)

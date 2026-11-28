@@ -123,7 +123,8 @@ class SimulatedGA100PCIe(MMIOBus):
       - 4-byte alignment, unsigned 32-bit value checks, and DEBUGCTRL write guard
       - EN_SW_OVERRIDE sticks only when DSOV == 0
       - WDATA_WR_SECURE opens/closes PLM_F4 only when DSOV == 0 and EN_SW_OVERRIDE == 1
-      - FUSEWDATA latches only when PLM_F4 == 0xFFFFFFFF
+      - FUSEWDATA latches only when PLM_F4 == 0xFFFFFFFF, and is WRITE-ONLY: reads
+        return 0 (darkmaniac7 Allspark notes); the latched value lives in ``regs``
       - CMD_READ latches rows[FUSEADDR] into FUSEDATA
       - CMD_SENSE_CTRL sets EFP=1, SBFE=1, RESENSE_DISABLE=1 while preserving DSOV=0
       - option shadows listed in ``unsensed_option_regs`` read 0 until a successful
@@ -188,6 +189,8 @@ class SimulatedGA100PCIe(MMIOBus):
         self.reads.append(offset)
         if offset in self.unsensed:
             return 0
+        if offset == REG_FUSEWDATA:
+            return 0  # write-only data port: never reflects the staged word
         return self.regs.get(offset, 0)
 
     def write32(self, offset: int, value: int, *, allow_debugctrl: bool = False) -> None:

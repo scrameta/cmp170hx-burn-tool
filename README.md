@@ -39,15 +39,15 @@ The register map, FF binary format, and Goldilocks arming/programming sequences 
 
 Key protocol details implemented:
 - **FF Record Encoding**: `word = (data16 << 16) | (block10 << 6) | chain5`, with **bit 5 (`IFF`) strictly `0`**. Later records for the same `(chain, block)` override earlier records.
-- **FF Row Bounds & Empty Marker**: rows **`222..486`** only (rows `0..221` control/regular/FPF and `487..511` IFF are hard-refused). Blank rows read **`0x00000000`** via `CMD_READ`.
+- **FF Row Bounds & Empty Marker**: rows **`222..486`** only (rows `0..221` control/regular/FPF are hard-refused; the factory IFF window is rows `488..507` per `IFF_RECORD = 0x01FB01E8`, and row `487` is deliberately left unused). Blank rows read **`0x00000000`** via `CMD_READ`.
 - **Single Aligned 32-Bit MMIO Stores**: [`AlignedMMIO`](vfi_burn/mmio.py) uses `memoryview(mm)[off:off+4].cast("I")[0] = value` (patch 0012 — never `struct.pack_into`, which zeroes the register first). `DEBUGCTRL (0x00820060)` is never written (must read `0`, `RWL=0`).
 - **Goldilocks Arming (`SENSE_CTRL`)**:
   1. `EN_SW_OVERRIDE (0x820040) = 1` (sticks only while `DSOV = 0`) and `WDATA_WR_SECURE (0x82048C) = 0` (`PLM_f4` opens to `0xFFFFFFFF`).
-  2. Verify `RESENSE_DISABLE (0x821058) == 0`, clear `IFF_RECORD (0x820050)` if nonzero, and latch **no-burn safety guard** `FUSEWDATA (0x82000C) = 0` (readback verified).
+  2. Verify `RESENSE_DISABLE (0x821058) == 0` and write the **no-burn safety guard** `FUSEWDATA (0x82000C) = 0`. `FUSEWDATA` is write-only on silicon, so it is not read back; `PLM_f4` open is the gate. `IFF_RECORD (0x820050)` (the IFF window pointer) is never written.
   3. Write `FUSECTRL = 0 (IDLE)` → `FUSECTRL = 3 (SENSE_CTRL)`, poll `IDLE` (state=4). Verify `EFP (0x820078) == 1`, `DSOV == 0`, `CRC == 0x55`, `DFP (0x82007C) == 0`, `PLM_f8` bit 0 open. Idempotent when `EFP == 1` already (only one `SENSE_CTRL` per glitch window because `RESENSE_DISABLE` becomes `1`).
   4. Shadow-clear `SBFE_SHADOW (0x821108) = 0` and assert all 12 armed invariants (`FUSECTRL` idle, `DEBUGCTRL == 0`, `CRC == 0x55`, `DSOV == 0`, `EFP == 1`, `DFP == 0`, `EN_SW_OVERRIDE == 1`, `SBFE == 0`, `WDATA_WR_SECURE == 0`, `PLM_f4 == PLM_f8 == PLM_fc == 0xFFFFFFFF`).
 - **Single-Record Program (`CMD_PROGRAM = 2`)**:
-  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (verify readback; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/host gate → second `CMD_READ`.
+  - Assert all 12 armed invariants + target row reads `0x00000000` → save `FUSEADDR` → `FUSECTRL = 0` → `FUSEADDR = row` (verify latch) → `FUSEWDATA = word` (write-only, not read back; never `FUSEDATA` `0x820008`) → `FUSECTRL = 2` → poll `IDLE` (immediate halt without further BAR0 reads on `0xBADxxxxx` poison) → restore `FUSEADDR` & `FUSEWDATA = 0` → `CMD_READ` verify `== word` → full post-write health/host gate → second `CMD_READ`.
 
 For a full walkthrough of the fuse controller (register map, `FUSECTRL` command state machine, the locked → Goldilocks → sensed → armed security state machine, and sequence diagrams for read / sense / arm / program), see [`docs/FUSE_CONTROLLER.md`](docs/FUSE_CONTROLLER.md).
 

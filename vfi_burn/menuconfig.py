@@ -206,7 +206,7 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
                 label=f"    PCIe Device ID (A100 / CMP 170HX): {config.target_devid_label()}  --->",
                 help_text=(
                     "WARNING: Sets fused DEVIDA (c2/b37) + DEVIDB (c2/b38) to an A100 ID "
-                    "(20F1/20B5/20B0/20B2) or reverts back to CMP 170HX (20C2 8 GB / 2082 10 GB). "
+                    "(20F1/20B5, PCIe) or reverts back to CMP 170HX (20C2 8 GB / 2082 10 GB). "
                     "Requires matching VBIOS after cold boot (A100 also needs 128 GB BAR1)."
                 ),
                 submenu="devid",
@@ -466,16 +466,6 @@ def _build_entries(screen: str, card: CardSnapshot, config: UnlockConfig) -> tup
             (
                 0x20B5,
                 f"A100 PCIe 80 GB  (10de:20b5) — DEVIDA+DEVIDB (2 FF rows){rec_8g}",
-                a100_warning,
-            ),
-            (
-                0x20B0,
-                "A100 SXM4 40 GB  (10de:20b0) — DEVIDA+DEVIDB (2 FF rows)",
-                a100_warning,
-            ),
-            (
-                0x20B2,
-                "A100 SXM4 80 GB  (10de:20b2) — DEVIDA+DEVIDB (2 FF rows)",
                 a100_warning,
             ),
             (

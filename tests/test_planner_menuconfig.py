@@ -846,9 +846,21 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
             hard_ok, over_ok = ff_word_safety_audit(wa, allow_a100_devid=True)
             self.assertEqual((hard_ok, over_ok), ([], []))
 
-        # Reject invalid IDs or corrupted bit 0
-        self.assertIsNone(decode_a100_devid_ff_word(encode_ff(2, 37, (0x20B5 << 1) | 1)))
+        # c2/b37 bit 0 (chain-2 bit 592) is not part of DEVIDA: either value decodes,
+        # and the encoder carries it through when supplied.
+        self.assertEqual(
+            decode_a100_devid_ff_word(encode_ff(2, 37, (0x20B5 << 1) | 1)), ("DEVIDA", 0x20B5)
+        )
+        self.assertEqual(encode_a100_devid_ff_words(0x20B5, b37_bit0=1)[0], 0x416B0942)
+        # c2/b38 bit 0 is DEVIDA[15] (0 for every supported ID): set -> rejected
+        self.assertIsNone(decode_a100_devid_ff_word(encode_ff(2, 38, (0x20B5 << 1) | 1)))
+        # Reject invalid IDs
         self.assertIsNone(decode_a100_devid_ff_word(encode_ff(2, 37, 0x1234 << 1)))
+        # With c2/b37 known, changing bit 592 is a hard denial even for a valid DEVIDA word
+        hard_592, _ = ff_word_safety_audit(0x416A0942, 0x41E3, allow_a100_devid=True)
+        self.assertTrue(any("bit 592" in h for h in hard_592))
+        hard_keep, _ = ff_word_safety_audit(0x416B0942, 0x41E3, allow_a100_devid=True)
+        self.assertEqual(hard_keep, [])
 
         # 2. Interactive menuconfig flow: open PCIe Device ID submenu [6], pick 0x20F1 [2],
         #    go back [b], open Preview [8] (must handle old=None FPF cleanly), back [b], save [s]
@@ -971,8 +983,9 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         card_a100 = capture_card_snapshot(ad_a100)
         self.assertEqual(card_a100.pci_id, "10de:20f1")
 
-        # Open PCIe Device ID [6], pick CMP 170HX 10 GB [7], back [b], preview [8], back [b], save [s]
-        rev_inputs = iter(["6", "7", "b", "8", "b", "s"])
+        # Open PCIe Device ID [6], pick CMP 170HX 10 GB [5], back [b], preview [8], back [b], save [s]
+        # (SXM4 IDs are no longer offered, so the CMP revert entries moved up two places)
+        rev_inputs = iter(["6", "5", "b", "8", "b", "s"])
         rev_shown: list[str] = []
         rev_cfg = run_menuconfig(
             card_a100,

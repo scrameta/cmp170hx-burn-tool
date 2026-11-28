@@ -32,9 +32,9 @@ All registers live in BAR0 and are accessed **only** as single aligned 32-bit lo
 | `FUSECTRL` | `0x00820000` | RW | Command (`[4:0]`) + state (`[20:16]`). Idle reads `0xE0040000` (state `4`, cmd `0`). |
 | `FUSEADDR` | `0x00820004` | RW | Physical fuse row index (`0..511`) for `CMD_READ` / `CMD_PROGRAM`. |
 | `FUSEDATA` | `0x00820008` | RO | Output of `CMD_READ`. **Writes are refused** by the controller wrapper. |
-| `FUSEWDATA` | `0x0082000C` | RW | Input word for `CMD_PROGRAM`. Only sticks while `PLM_f4` is open. |
+| `FUSEWDATA` | `0x0082000C` | WO | Input word for `CMD_PROGRAM`. Only sticks while `PLM_f4` is open. **Write-only**: reads do not reflect it, so it is never read back as proof. |
 | `EN_SW_OVERRIDE` | `0x00820040` | RW | Write `1` to enable shadow-register writes. Sticks only while `DSOV == 0`. |
-| `IFF_RECORD` | `0x00820050` | RW | Must be `0` before `SENSE_CTRL`. |
+| `IFF_RECORD` | `0x00820050` | RW | IFF window pointer: start = `v & 0x1FF`, last = `(v >> 16) & 0x1FF`. Factory `0x01FB01E8` = rows 488..507. **Never written** by `vfi_burn`. |
 | `DEBUGCTRL` | `0x00820060` | RW | **Never written.** Must read `0`; bit 1 (`RWL`) = 1 would select the RIR macro instead of the main array. |
 | `CRC_STATUS` | `0x00820070` | RO | `0x55` = healthy fuse CRC. |
 | `EFP_STATUS` | `0x00820078` | RO | `OPT_ENABLE_FUSE_PROGRAM`. `0` in a fresh Goldilocks frame; `SENSE_CTRL` restores it to `1`. |
@@ -59,7 +59,7 @@ All registers live in BAR0 and are accessed **only** as single aligned 32-bit lo
 | `0x3` | `CMD_SENSE_CTRL` | Re-senses the control fuses: `EFP 0→1` while keeping `DSOV = 0`. |
 
 Fuse array layout (512 rows × 32 bits): rows `0..221` regular/control/FPF, **rows `222..486` FF records**
-(the only rows `vfi_burn` will program), rows `487..511` IFF. Die ID is rows `8..15`. A blank FF row
+(the only rows `vfi_burn` will program; row 487 is also FF but deliberately left unused), factory IFF window rows `488..507`. Die ID is rows `8..15`. A blank FF row
 reads `0x00000000`. See [`vfi_burn/ffrecord.py`](../vfi_burn/ffrecord.py) for the FF record encoding.
 
 ---
@@ -142,7 +142,7 @@ stateDiagram-v2
 
     Staged : STAGED (pre-sense, volatile only)
     Staged : EN_SW_OVERRIDE=1, WDATA_WR_SECURE=0, PLM_f4 = 0xFFFFFFFF
-    Staged : IFF_RECORD=0, FUSEWDATA=0 (no-burn latch)
+    Staged : FUSEWDATA=0 written (no-burn latch; write-only, not read back)
 
     Sensed : SENSED
     Sensed : EFP=1, DSOV=0 (kept), SBFE=1, RESENSE_DISABLE=1
@@ -234,7 +234,8 @@ row[FUSEADDR] = row[FUSEADDR] | FUSEWDATA
 Two consequences shape the protocol:
 
 1. **`FUSEWDATA = 0` is a guaranteed no-op program.** Before `SENSE_CTRL` and after every
-   `CMD_PROGRAM`, the controller writes `FUSEWDATA = 0` and verifies it (`_relatch_no_burn()`). If a
+   `CMD_PROGRAM`, the controller writes `FUSEWDATA = 0` with `PLM_f4` checked open (`_relatch_no_burn()`;
+   `FUSEWDATA` is write-only, so the zero cannot be read back). If a
    stray `CMD_PROGRAM` happens later (another tool, a typo, firmware), it ORs zero into whatever row
    `FUSEADDR` selects and nothing changes.
 2. **Only blank rows are targeted.** `program_row()` refuses unless the target row reads
@@ -306,10 +307,7 @@ sequenceDiagram
         Ctl->>FUSE: write EN_SW_OVERRIDE = 1, verify bit 0 = 1
         Ctl->>FUSE: write WDATA_WR_SECURE = 0
         Ctl->>FUSE: read PLM_f4 (must now be 0xFFFFFFFF)
-        opt IFF_RECORD nonzero
-            Ctl->>FUSE: write IFF_RECORD = 0, verify 0
-        end
-        Ctl->>FUSE: write FUSEWDATA = 0, verify 0 (no-burn latch)
+        Ctl->>FUSE: write FUSEWDATA = 0 (no-burn latch; write-only, not read back)
         Ctl->>FUSE: write FUSECTRL = 0 then FUSECTRL = 3
         Note over Ctl,FUSE: sleep 200 ms, poll idle up to 2 s
         Ctl->>FUSE: verify PLM_f8 bit 0, DSOV = 0, CRC = 0x55
@@ -363,16 +361,16 @@ sequenceDiagram
     Ctl->>FUSE: read FUSEADDR (save original)
     Ctl->>FUSE: write FUSECTRL = 0 (IDLE)
     Ctl->>FUSE: write FUSEADDR = row, verify latched
-    Ctl->>FUSE: write FUSEWDATA = word, verify read-back == word
-    Ctl->>FUSE: final pre-trigger gate (armed_problems, FUSEADDR, FUSEWDATA, host callback + recheck)
-    Note over Ctl,FUSE: failures above relatch FUSEWDATA = 0 (verified before FUSEADDR restore); cleanup failure raises UnsafePreTriggerRefusal + quarantines controller
+    Ctl->>FUSE: write FUSEWDATA = word (write-only: not read back)
+    Ctl->>FUSE: final pre-trigger gate (armed_problems incl. PLM_f4, FUSEADDR, host callback + recheck)
+    Note over Ctl,FUSE: failures above (including non-BurnError exceptions) relatch FUSEWDATA = 0 before FUSEADDR restore and raise PreTriggerRefusal; cleanup failure raises UnsafePreTriggerRefusal + quarantines controller
     rect rgb(255, 225, 225)
         Note over Ctl,FUSE: POINT OF NO RETURN
         Ctl->>FUSE: write FUSECTRL = 2 (CMD_PROGRAM)
         FUSE-->>FUSE: row |= FUSEWDATA (busy, about 1 ms)
         Note over Ctl,FUSE: sleep 5 ms, then poll FUSECTRL until idle (up to 10 s, halt + quarantine on fault)
     end
-    Ctl->>FUSE: verify idle, write FUSEWDATA = 0 (verify 0), then restore FUSEADDR = original (verify)
+    Ctl->>FUSE: verify idle and PLM_f4 open, write FUSEWDATA = 0, then restore FUSEADDR = original (verify)
     opt witness_word != word
         Ctl->>FUSE: read_row(witness_row) == witness_word (primes FUSEDATA != word)
     end
@@ -458,7 +456,7 @@ stateDiagram-v2
     BlankCheck : BLANK CHECK
     BlankCheck : CMD_READ row == 0x00000000
     Stage : STAGE
-    Stage : save FUSEADDR, FUSECTRL=0, FUSEADDR=row, FUSEWDATA=word, all verified
+    Stage : save FUSEADDR, FUSECTRL=0, FUSEADDR=row (verified), FUSEWDATA=word (write-only)
     Trigger : TRIGGER
     Trigger : FUSECTRL=2, poll idle
     Relatch : RELATCH
@@ -508,7 +506,6 @@ stateDiagram-v2
 | `FUSEADDR` | any |
 | `FUSECTRL` | `0` (IDLE), `1` (READ), `3` (SENSE_CTRL). **`2` (PROGRAM) blocked.** |
 | `FUSEWDATA` | `0` only |
-| `IFF_RECORD` | `0` only |
 | `EN_SW_OVERRIDE` | `0`, `1` |
 | `WDATA_WR_SECURE` | `0` only |
 

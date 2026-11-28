@@ -171,7 +171,6 @@ class GA100FuseController(FuseControllerHAL):
                 offset == REG_FUSEADDR
                 or (offset == REG_FUSECTRL and value in (CMD_IDLE, CMD_READ, CMD_SENSE_CTRL))
                 or (offset == REG_FUSEWDATA and value == 0)
-                or (offset == REG_IFF_RECORD and value == 0)
                 or (offset == REG_EN_SW_OVERRIDE and value in (0, 1))
                 or (offset == REG_WDATA_WR_SECURE and value == 0)
             )
@@ -311,7 +310,13 @@ class GA100FuseController(FuseControllerHAL):
 
         Idempotent if EFP==1 and DSOV==0 already (only one SENSE_CTRL is permitted per
         glitch window because RESENSE_DISABLE becomes 1 afterwards).
-        Uses the kprinssu/ga100-ff-tools no-burn safety latch (FUSEWDATA=0 verified before cmd 3).
+        Uses the kprinssu/ga100-ff-tools no-burn safety latch (FUSEWDATA=0 written before cmd 3).
+
+        IFF_RECORD (0x820050) is deliberately NOT written: it is the IFF window pointer
+        (factory 0x01FB01E8 = rows 488..507), and none of the live-proven sequences
+        (kprinssu arm_sense_ctrl.py, ffcalc ffmacro.sense) touch it.
+        FUSEWDATA is treated as write-only (darkmaniac7 Allspark notes; ffcalc and
+        kprinssu ff_burn.py never read it back), so its readback is not used as proof.
         """
         self._check_bar0_alive()
         self.poll_idle(0.2)
@@ -349,17 +354,10 @@ class GA100FuseController(FuseControllerHAL):
             raise BurnError(
                 f"FUSEWDATA_PLM (0x8200F4) stayed 0x{self.rd(REG_PLM_F4):08x} after WDATA_WR_SECURE=0"
             )
-        if self.rd(REG_IFF_RECORD) != 0:
-            self._wr(REG_IFF_RECORD, 0)
-            if self.rd(REG_IFF_RECORD) != 0:
-                raise BurnError("IFF_RECORD (0x820050) did not clear to 0 before SENSE_CTRL")
-
         # No-burn safety latch: OTP is 0->1 only, so FUSEWDATA=0 can never blow any bit.
+        # FUSEWDATA is write-only on silicon, so the latch is written (PLM_f4 verified open
+        # above) but not read back: a readback of 0 would prove nothing.
         self._wr(REG_FUSEWDATA, 0)
-        if self.rd(REG_FUSEWDATA) != 0:
-            raise BurnError(
-                f"FUSEWDATA did not read back 0 (got 0x{self.rd(REG_FUSEWDATA):08x}); aborting SENSE_CTRL"
-            )
 
         self._wr(REG_FUSECTRL, CMD_IDLE)
         self._wr(REG_FUSECTRL, CMD_SENSE_CTRL)
@@ -460,17 +458,23 @@ class GA100FuseController(FuseControllerHAL):
             raise BurnError("controller not armed: " + "; ".join(problems))
 
     def _relatch_no_burn(self, orig_addr: int | None) -> None:
-        """Verify FUSEWDATA=0 sticks before restoring FUSEADDR; quarantine on any failure.
+        """Write FUSEWDATA=0 before restoring FUSEADDR; quarantine on any failure.
 
         Put the FUSEWDATA=0 no-burn latch back BEFORE restoring FUSEADDR so a stray
         CMD_PROGRAM cannot re-burn the staged word into whatever row FUSEADDR selects.
+        FUSEWDATA is write-only, so the latch cannot be verified by readback; PLM_f4 is
+        checked open instead (a closed PLM_f4 would silently drop the zero write).
         """
         try:
             if not is_fusectrl_idle(self._check_fusectrl_first()):
                 raise BurnError("cannot clear staged payload while FUSECTRL is busy")
+            plm_f4 = self.rd(REG_PLM_F4)
+            if plm_f4 != 0xFFFFFFFF:
+                raise BurnError(
+                    f"PLM_f4=0x{plm_f4:08x} closed: FUSEWDATA zero latch would be dropped; "
+                    "address NOT restored"
+                )
             self._wr(REG_FUSEWDATA, 0)
-            if self.rd(REG_FUSEWDATA) != 0:
-                raise BurnError("FUSEWDATA zero latch did not stick; address NOT restored")
             if orig_addr is not None:
                 self._wr(REG_FUSEADDR, orig_addr)
                 if self.rd(REG_FUSEADDR) != orig_addr:
@@ -515,7 +519,7 @@ class GA100FuseController(FuseControllerHAL):
             if isinstance(row, bool) or not (FF_ROW_MIN <= row <= FF_ROW_MAX):
                 raise BurnError(
                     f"REFUSED: row {row} is outside the FF region {FF_ROW_MIN}..{FF_ROW_MAX} "
-                    "(rows 0..221 are regular/control/FPF; 487..511 are IFF)"
+                    "(rows 0..221 are regular/control/FPF; 487 is deliberately unused; factory IFF window is 488..507)"
                 )
             ff = decode_ff(word)  # Enforces nonzero, 32-bit, and bit 5 (IFF) == 0.
             if (ff.chain, ff.block) in DEVICE_ID_DENIED_BLOCKS:
@@ -552,13 +556,12 @@ class GA100FuseController(FuseControllerHAL):
             self._wr(REG_FUSEADDR, row)
             if self.rd(REG_FUSEADDR) != row:
                 raise BurnError(f"FUSEADDR did not latch row {row} before CMD_PROGRAM")
+            # FUSEWDATA is write-only on silicon (darkmaniac7 Allspark notes); the
+            # live-proven burners (ffcalc ffmacro.program_row, kprinssu ff_burn.py) never
+            # read it back. Its delivery is gated by PLM_f4 / WDATA_WR_SECURE /
+            # EN_SW_OVERRIDE / DSOV (all asserted by armed_problems() below), and the
+            # result is proven by the post-program CMD_READ verification.
             self._wr(REG_FUSEWDATA, word)
-            rb_wdata = self.rd(REG_FUSEWDATA)
-            if rb_wdata != word:
-                raise BurnError(
-                    f"FUSEWDATA readback mismatch before CMD_PROGRAM: "
-                    f"wrote 0x{word:08x}, read 0x{rb_wdata:08x} (PLM_f4 blocked?)"
-                )
 
             # Final pre-trigger gate: closes TOCTOU between arm/staging and CMD_PROGRAM.
             final_problems = self.armed_problems()
@@ -570,14 +573,10 @@ class GA100FuseController(FuseControllerHAL):
                 raise BurnError(
                     f"FUSEADDR drifted before CMD_PROGRAM (reads 0x{self.rd(REG_FUSEADDR):08x}, want {row})"
                 )
-            if self.rd(REG_FUSEWDATA) != word:
-                raise BurnError(
-                    f"FUSEWDATA drifted before CMD_PROGRAM (reads 0x{self.rd(REG_FUSEWDATA):08x}, want 0x{word:08x})"
-                )
             if pre_trigger_check is not None:
                 pre_trigger_check()
-                if self.armed_problems() or self.rd(REG_FUSEADDR) != row or self.rd(REG_FUSEWDATA) != word:
-                    raise BurnError("controller or staged data changed during pre-trigger callback")
+                if self.armed_problems() or self.rd(REG_FUSEADDR) != row:
+                    raise BurnError("controller or staged address changed during pre-trigger callback")
         except PreTriggerRefusal as exc:
             if staged:
                 self._cleanup_before_trigger(orig_addr, cause=exc)
@@ -586,6 +585,13 @@ class GA100FuseController(FuseControllerHAL):
             if staged:
                 self._cleanup_before_trigger(orig_addr, cause=exc)
             raise PreTriggerRefusal(str(exc)) from exc
+        except Exception as exc:
+            # Any ordinary error before CMD_PROGRAM (e.g. an OSError reading sysfs or
+            # boot_id in the host callback) provably issued no program command: report
+            # it as a pre-trigger refusal so it is not journaled as HALT_UNVERIFIED.
+            if staged:
+                self._cleanup_before_trigger(orig_addr, cause=exc)
+            raise PreTriggerRefusal(f"{type(exc).__name__}: {exc}") from exc
         except BaseException as exc:
             if staged:
                 self._cleanup_before_trigger(orig_addr, cause=exc)
@@ -866,8 +872,8 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         ceiling = compute_sm_count(actual["GPC_DISABLE"], [actual[k] for k in tpc])
         if plan.base_sm_ceiling > ceiling or (plan.override_sm_ceiling or 0) > ceiling:
             raise BurnError(f"plan SM ceiling exceeds live healthy ceiling {ceiling}")
-        # IFF_RECORD may have been cleared by SENSE_CTRL; the cold plan's
-        # last_row remains authoritative. A visible tighter boundary also wins.
+        # The cold plan's last_row remains authoritative; a visible tighter IFF
+        # boundary also wins. (vfi_burn never writes IFF_RECORD; 0 means no window.)
         iff = self.register(REG_IFF_RECORD)
         last = _ff_last_row_from_iff(iff)
         if plan.last_row > last:
@@ -972,7 +978,9 @@ def _ff_last_row_from_iff(iff_record: int) -> int:
         raise BurnError(f"untrusted IFF_RECORD {iff_record:#010x}")
     if iff_record == 0:
         return FF_ROW_MAX
-    start = iff_record & 0xFFFF
+    # IFF_RECORD: start = v & 0x1FF, last = (v >> 16) & 0x1FF (9-bit row fields;
+    # factory 0x01FB01E8 -> rows 488..507).
+    start = iff_record & 0x1FF
     if not FF_ROW_MIN < start <= TOTAL_FUSE_ROWS:
         raise BurnError(f"invalid IFF_RECORD start row {start}")
     return min(FF_ROW_MAX, start - 1)

@@ -25,7 +25,7 @@ from .ffrecord import (
     verify_noop_test_record,
 )
 from .fuse_rules import poweroff_domains_for_groups
-from .fuses import A100_TARGET_DEVICE_IDS, BURNABLE_TARGET_DEVICE_IDS
+from .fuses import A100_SXM4_DEVICE_IDS, A100_TARGET_DEVICE_IDS, BURNABLE_TARGET_DEVICE_IDS
 from .journal import Journal, deferred_signals
 from .model import (
     BurnError,
@@ -535,10 +535,16 @@ def reconcile(
     # DEVIDA (c2/b37) or DEVIDB (c2/b38) payload (further gated at burn time by BIOS/BAR1 confirm).
     is_valid_a100_devid = False
     if record.kind == "devid":
-        if decode_a100_devid_ff_word(record.word) is None:
+        devid_info = decode_a100_devid_ff_word(record.word)
+        if devid_info is None:
             raise BurnError(
                 f"{record.name}: REFUSED; kind='devid' word {hex32(record.word)} is not a "
                 "validated A100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record"
+            )
+        if devid_info[1] in A100_SXM4_DEVICE_IDS:
+            raise BurnError(
+                f"{record.name}: REFUSED; 10de:{devid_info[1]:04x} is an A100 SXM4 ID and the "
+                "CMP 170HX is a PCIe board with no matching VBIOS"
             )
         is_valid_a100_devid = True
     hard_denials, overridable_ff = ff_word_safety_audit(
