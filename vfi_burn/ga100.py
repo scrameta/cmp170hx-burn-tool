@@ -950,6 +950,10 @@ class GA100LiveAdapter(FuseReader, FuseWriter):
         ):
             val = self.field(fname)
             fields[fname] = val if fname == "SM_COUNT" else f"0x{val:08x}"
+        # Every floorsweep mask a plan record can declare in expected_cold (TPC_GPC*,
+        # PES, FBPA/FBIO/ROP_L2, NVLink, SYS_PIPE), so real-stage verify can compare them.
+        for fname in sorted(set(FFCALC_KEY_TO_FIELD.values()) - set(fields)):
+            fields[fname] = f"0x{self.field(fname):08x}"
         experimental_registers: dict[str, str] = {}
         controller_state: dict[str, str] = {}
         ctrl_now = self.controller.rd(REG_FUSECTRL)
