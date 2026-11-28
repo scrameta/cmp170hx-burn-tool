@@ -281,12 +281,106 @@ class TestCLIAndConsole(unittest.TestCase):
         self.assertEqual(entries[-1]["status"], "FAIL")
 
     def test_dump_fake_is_atomic_0600_and_refuses_overwrite(self):
+        from vfi_burn.backend import write_private_json
+        from vfi_burn.model import BurnError
+
         ctl = FakeController()
         out_file = self.work / "dumped.json"
         dump_fake(ctl, out_file)
         self.assertEqual(out_file.stat().st_mode & 0o777, 0o600)
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(BurnError, r"pass --overwrite to replace"):
             dump_fake(ctl, out_file)
+
+        # Even if an existing file had looser permissions, atomic overwrite tightens to 0600.
+        out_file.chmod(0o644)
+        write_private_json(out_file, {"replaced": True}, overwrite=True)
+        self.assertEqual(out_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(out_file.read_text(encoding="utf-8")), {"replaced": True})
+
+        # Failed serialization during overwrite preserves the original file intact and leaves no temp files.
+        with self.assertRaises(TypeError):
+            write_private_json(out_file, {"bad": object()}, overwrite=True)
+        self.assertEqual(json.loads(out_file.read_text(encoding="utf-8")), {"replaced": True})
+        self.assertEqual([p.name for p in self.work.glob("*.tmp")], [])
+
+        # Symlinks and directories are always refused even with overwrite=True.
+        link = self.work / "link.json"
+        link.symlink_to(out_file)
+        with self.assertRaisesRegex(BurnError, r"symlink"):
+            write_private_json(link, {"x": 1}, overwrite=True)
+        subdir = self.work / "adir"
+        subdir.mkdir(mode=0o700)
+        with self.assertRaisesRegex(BurnError, r"directory"):
+            write_private_json(subdir, {"x": 1}, overwrite=True)
+
+    def test_cli_overwrite_flag_for_simulate_and_verify_cold(self):
+        from unittest import mock
+
+        saved_fake = self.work / "saved_fake.json"
+        saved_fake.write_text('{"old": true}\n', encoding="utf-8")
+        saved_fake.chmod(0o600)
+
+        # Without --overwrite, simulate --save-fake refuses to clobber existing file.
+        err = io.StringIO()
+        with mock.patch("builtins.input", return_value="YES"), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = main([
+                "simulate",
+                "--plan", str(self.plan_path),
+                "--fake", str(self.fake_path),
+                "--stage", "test",
+                "--journal", str(self.journal_path),
+                "--save-fake", str(saved_fake),
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("--overwrite", err.getvalue())
+        self.assertEqual(json.loads(saved_fake.read_text(encoding="utf-8")), {"old": True})
+
+        # With --overwrite, simulate --save-fake atomically replaces the file (mode 0600).
+        with mock.patch("builtins.input", return_value="YES"), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code2 = main([
+                "simulate",
+                "--plan", str(self.plan_path),
+                "--fake", str(self.fake_path),
+                "--stage", "test",
+                "--journal", str(self.journal_path),
+                "--save-fake", str(saved_fake),
+                "--overwrite",
+            ])
+        self.assertEqual(code2, 0)
+        self.assertEqual(saved_fake.stat().st_mode & 0o777, 0o600)
+        self.assertIn("rows", json.loads(saved_fake.read_text(encoding="utf-8")))
+
+        # verify-cold --receipt-out also refuses without --overwrite and succeeds with --overwrite.
+        cold_path = self.work / "cold.json"
+        cold_path.write_text((ROOT / "examples/cold.example.json").read_text(encoding="utf-8"), encoding="utf-8")
+        cold_path.chmod(0o600)
+        receipt_out = self.work / "existing.receipt"
+        receipt_out.write_text('{"stale": true}\n', encoding="utf-8")
+        receipt_out.chmod(0o600)
+        code3, _out3, err3 = self._run_cli([
+            "verify-cold",
+            "--plan", str(self.plan_path),
+            "--cold", str(cold_path),
+            "--stage", "test",
+            "--journal", str(self.journal_path),
+            "--receipt-out", str(receipt_out),
+        ])
+        self.assertEqual(code3, 2)
+        self.assertIn("--overwrite", err3)
+        self.assertEqual(json.loads(receipt_out.read_text(encoding="utf-8")), {"stale": True})
+
+        code4, _out4, err4 = self._run_cli([
+            "verify-cold",
+            "--plan", str(self.plan_path),
+            "--cold", str(cold_path),
+            "--stage", "test",
+            "--journal", str(self.journal_path),
+            "--receipt-out", str(receipt_out),
+            "--overwrite",
+        ])
+        self.assertEqual(code4, 0, err4)
+        self.assertEqual(receipt_out.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(receipt_out.read_text(encoding="utf-8"))["stage"], "test")
 
     def test_burn_dry_run_and_execute_guards(self):
         from vfi_burn.ffrecord import encode_ff

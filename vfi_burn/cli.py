@@ -199,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use plain-text numbered menuconfig instead of full-screen curses TUI",
     )
+    cfg_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace --out if it already exists",
+    )
 
     snap_p = sub.add_parser(
         "snapshot",
@@ -208,6 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
     snap_p.add_argument("--previous-boot-id", required=True, help="boot_id from the burn session journal")
     snap_p.add_argument("--out", required=True, help="output path for new mode-0600 cold snapshot JSON")
     snap_p.add_argument("--no-rows", action="store_true", help="skip reading FF rows 222..486 (options + die ID only)")
+    snap_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace --out if it already exists",
+    )
 
     inspect_p = sub.add_parser("inspect", help="read-only preflight, health report, and free-slot proof")
     add_plan(inspect_p)
@@ -275,7 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim_p.add_argument("--receipt", help="cold-verified test receipt (required for --stage real)")
     sim_p.add_argument("--max-records", type=int, default=None, help="stop cleanly after N records")
     sim_p.add_argument("--dry-run", action="store_true", help="preview only; do not update fake rows")
-    sim_p.add_argument("--save-fake", help="write updated fake snapshot to a NEW mode-0600 file")
+    sim_p.add_argument("--save-fake", help="write updated fake snapshot to a mode-0600 file (refuses overwrite unless --overwrite)")
+    sim_p.add_argument("--overwrite", action="store_true", help="atomically replace --save-fake if it already exists")
     _add_override_args(sim_p, allow_debugctrl=False)
 
     manual_p = sub.add_parser(
@@ -326,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
     mw.add_argument("--receipt", help="cold-verified test row receipt")
     mw.add_argument("--execute", action="store_true", help="execute on live verified adapter")
     mw.add_argument("--dry-run", action="store_true", help="preview only without writing")
-    mw.add_argument("--save-fake", help="write updated fake snapshot to a NEW mode-0600 file")
+    mw.add_argument("--save-fake", help="write updated fake snapshot to a mode-0600 file (refuses overwrite unless --overwrite)")
+    mw.add_argument("--overwrite", action="store_true", help="atomically replace --save-fake if it already exists")
     _add_override_args(mw, allow_debugctrl=True)
 
     msw = man_sub.add_parser(
@@ -335,7 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     msw.add_argument("--record", required=True, help="private mode-0600 JSON record object")
     msw.add_argument("--receipt", help="cold-verified test row receipt")
-    msw.add_argument("--save-fake", help="write updated fake snapshot to a NEW mode-0600 file")
+    msw.add_argument("--save-fake", help="write updated fake snapshot to a mode-0600 file (refuses overwrite unless --overwrite)")
+    msw.add_argument("--overwrite", action="store_true", help="atomically replace --save-fake if it already exists")
     _add_override_args(msw, allow_debugctrl=True)
 
     verify_p = sub.add_parser("verify-cold", help="compare user-supplied cold snapshot with expected fields")
@@ -343,7 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("--cold", required=True, help="private mode-0600 cold snapshot JSON")
     verify_p.add_argument("--stage", required=True, choices=("test", "real"))
     verify_p.add_argument("--journal", required=True, help="private mode-0600 audit JSONL")
-    verify_p.add_argument("--receipt-out", help="create new mode-0600 PASS receipt")
+    verify_p.add_argument("--receipt-out", help="create mode-0600 PASS receipt (refuses overwrite unless --overwrite)")
+    verify_p.add_argument("--overwrite", action="store_true", help="atomically replace --receipt-out if it already exists")
 
     return ap
 
@@ -383,6 +397,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             a100_devid=int(args.a100_devid, 16) if args.a100_devid else None,
             enable_mig_sys_pipe=bool(args.enable_mig_sys_pipe),
             use_curses=False if args.no_curses else None,
+            overwrite=bool(args.overwrite),
             io=io,
         )
 
@@ -392,6 +407,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             previous_boot_id=args.previous_boot_id,
             out=args.out,
             read_rows=not args.no_rows,
+            overwrite=bool(args.overwrite),
             io=io,
         )
 
@@ -436,6 +452,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             max_records=args.max_records,
             dry_run=bool(args.dry_run),
             save_fake=args.save_fake,
+            overwrite=bool(args.overwrite),
             overrides=_overrides_from_args(args),
             io=io,
         )
@@ -456,6 +473,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             execute=bool(getattr(args, "execute", False)),
             dry_run=bool(getattr(args, "dry_run", False)),
             save_fake=getattr(args, "save_fake", None),
+            overwrite=bool(getattr(args, "overwrite", False)),
             overrides=_overrides_from_args(args),
             io=io,
         )
@@ -467,6 +485,7 @@ def dispatch_args(args: argparse.Namespace, *, io: CommandIO | None = None) -> i
             stage=args.stage,
             journal_path=args.journal,
             receipt_out=args.receipt_out,
+            overwrite=bool(args.overwrite),
             io=io,
         )
 

@@ -649,6 +649,129 @@ class TestCLIConfigureMenuAndEndToEndSimulate(unittest.TestCase):
         self.assertIn("Saved & loaded", output)
         self.assertIn("NOOP_TEST", output)
 
+    def test_menu_and_cli_configure_existing_plan_overwrite_new_path_and_cancel(self):
+        from vfi_burn.cli import main as cli_main
+
+        plan_path = self.work / "plan_2082.json"
+        # First save creates plan_2082.json (NVLink ON -> 2 records: test + nvlink)
+        card = capture_card_snapshot(self.cold_adapter)
+        cfg1 = UnlockConfig.from_card(card)
+        cfg1.set_nvlink(True)
+        write_private_json(plan_path, build_plan_from_config(card, cfg1))
+        orig_hash = Plan.load(plan_path).content_hash
+
+        # 1) Menu [1] -> [a] colliding with existing same-card plan:
+        #    invalid key 'z' re-prompts (doesn't discard work), then 'o' overwrites atomically.
+        answers_overwrite = iter([
+            "1", "a",
+            "1", "s",             # unlock all healthy SM/HBM -> different hash & more records
+            str(plan_path),
+            "z",                  # typo -> re-prompts
+            "o",                  # overwrite!
+            "q",
+        ])
+        shown_o: list[str] = []
+        menu_o = BurnMenu(
+            MenuSession(fake_path=str(self.cold_snap)),
+            input_fn=lambda _p="": next(answers_overwrite),
+            show=shown_o.append,
+        )
+        self.assertEqual(menu_o.run(), 0)
+        out_o = "\n".join(shown_o)
+        self.assertIn("earlier plan for this same card", out_o)
+        self.assertIn("Please enter 'o' (overwrite)", out_o)
+        self.assertIn("Saved & loaded", out_o)
+        self.assertEqual(plan_path.stat().st_mode & 0o777, 0o600)
+        new_hash = Plan.load(plan_path).content_hash
+        self.assertNotEqual(new_hash, orig_hash)
+
+        # 2) Menu [1] -> [a] colliding with a DIFFERENT card's plan -> warns, 'n' + Enter saves to plan_2082_2.json
+        other_snap = json.loads(self.cold_snap.read_text(encoding="utf-8"))
+        other_snap["pci_id"] = "10de:2082"
+        other_snap["rows"]["8"] = "0x99999999"
+        other_snap_path = self.work / "other_card.json"
+        write_private_json(other_snap_path, other_snap)
+        answers_new = iter([
+            "1", "a",
+            "5", "s",
+            str(plan_path),
+            "n", "",              # choose new path -> accept suggested plan_2082_2.json
+            "q",
+        ])
+        shown_n: list[str] = []
+        menu_n = BurnMenu(
+            MenuSession(fake_path=str(other_snap_path)),
+            input_fn=lambda _p="": next(answers_new),
+            show=shown_n.append,
+        )
+        self.assertEqual(menu_n.run(), 0)
+        out_n = "\n".join(shown_n)
+        self.assertIn("WARNING: existing file", out_n)
+        self.assertIn("DIFFERENT card", out_n)
+        alt_path = self.work / "plan_2082_2.json"
+        self.assertTrue(alt_path.exists())
+        self.assertEqual(menu_n.s.plan_path, str(alt_path))
+        # Original file must be untouched!
+        self.assertEqual(Plan.load(plan_path).content_hash, new_hash)
+
+        # 3) Menu [1] -> [a] cancelling at collision prompt (Enter -> default 'c') preserves existing file
+        answers_cancel = iter([
+            "1", "a",
+            "5", "s",
+            str(plan_path),
+            "",                   # cancel
+            "0",                  # back from Setup
+            "q",
+        ])
+        shown_c: list[str] = []
+        menu_c = BurnMenu(
+            MenuSession(fake_path=str(self.cold_snap)),
+            input_fn=lambda _p="": next(answers_cancel),
+            show=shown_c.append,
+        )
+        self.assertEqual(menu_c.run(), 0)
+        self.assertIn("Plan not saved.", "\n".join(shown_c))
+        self.assertEqual(Plan.load(plan_path).content_hash, new_hash)
+
+        # 4) CLI non-interactive configure refuses without --overwrite and succeeds with --overwrite
+        import io as _io
+        from contextlib import redirect_stderr as _rerr, redirect_stdout as _rout
+
+        err_buf = _io.StringIO()
+        with _rout(_io.StringIO()), _rerr(err_buf):
+            rc_refused = cli_main([
+                "configure",
+                "--sim-pcie", str(self.cold_snap),
+                "--nvlink",
+                "--out", str(plan_path),
+            ])
+        self.assertEqual(rc_refused, 2)
+        self.assertIn("--overwrite", err_buf.getvalue())
+        self.assertEqual(Plan.load(plan_path).content_hash, new_hash)
+
+        with _rout(_io.StringIO()), _rerr(_io.StringIO()):
+            rc_ok = cli_main([
+                "configure",
+                "--sim-pcie", str(self.cold_snap),
+                "--nvlink",
+                "--out", str(plan_path),
+                "--overwrite",
+            ])
+        self.assertEqual(rc_ok, 0)
+        self.assertEqual(Plan.load(plan_path).content_hash, orig_hash)
+
+        # 5) CLI interactive execute_configure (no --overwrite) prompts on collision and allows overwrite
+        cli_answers = iter(["1", "s", "o"])
+        cli_shown: list[str] = []
+        rc_int = execute_configure(
+            target=TargetSpec(sim_pcie=str(self.cold_snap)),
+            out=str(plan_path),
+            use_curses=False,
+            io=CommandIO(show=cli_shown.append, input_fn=lambda _p: next(cli_answers)),
+        )
+        self.assertEqual(rc_int, 0)
+        self.assertEqual(Plan.load(plan_path).content_hash, new_hash)
+
     def test_plan_review_flags_sku_and_die_mismatch_without_mixing_live_ff(self):
         from vfi_burn.console import format_plan_review
         from vfi_burn.sim_pcie import sim_pcie_from_file

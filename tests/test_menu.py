@@ -497,6 +497,31 @@ class TestBurnMenu(unittest.TestCase):
         self.assertIn("Resuming real stage: 1 record(s) already committed", out)
         self.assertEqual(menu._cached_fake.fuse_row(225), w_real_2)
 
+    def test_cold_verify_receipt_collision_overwrite_and_new_path(self):
+        receipt_out = self.work / "test.receipt"
+        receipt_out.write_text('{"stale": true}\n', encoding="utf-8")
+        receipt_out.chmod(0o600)
+
+        session = MenuSession(
+            plan_path=str(self.plan_path),
+            fake_path=str(self.fake_path),
+            journal_path=str(self.journal_path),
+        )
+        rc, out, _menu = self._run_menu(
+            session,
+            [
+                "6", "YES", "",                                                 # burn test row
+                "10", "2", str(self.cold_path), "test", str(receipt_out), "o",  # overwrite existing receipt
+                "10", "2", str(self.cold_path), "test", str(receipt_out), "n", "",  # save new path -> test_2.receipt
+                "0",
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(receipt_out.read_text(encoding="utf-8"))["stage"], "test")
+        alt_receipt = self.work / "test_2.receipt"
+        self.assertTrue(alt_receipt.exists())
+        self.assertEqual(session.receipt_path, str(alt_receipt))
+
 
 if __name__ == "__main__":
     unittest.main()
