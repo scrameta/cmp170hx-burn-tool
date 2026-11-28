@@ -193,13 +193,22 @@ Key properties of this machine:
   If `EFP == 0` but `RESENSE_DISABLE == 1`, the window is unusable: cold boot and re-glitch.
 - **`SENSE_CTRL` sets `SBFE = 1` as a side effect**, which blocks FF programming. That is why `arm()`
   must run *after* sense and write `SBFE_SHADOW = 0`.
-- **Option shadows are unsensed until `SENSE_CTRL`.** The glitch mis-senses the row 0/1 control
-  fuses (giving `DSOV = 0`, `EFP = 0`) and leaves the option shadows (`OPT_*_DISABLE`, their status
-  aliases and the `*_DEFECTIVE` registers) unsensed: they read `0`. `SENSE_CTRL` senses them
-  (`EFP` 0→1, `DSOV` stays 0). Fuse *rows* read with `CMD_READ` are unaffected. vfi_burn therefore
-  compares identity masks only after sense; before it, the exact signature `DSOV = 0`, `EFP = 0`,
-  every compared shadow `0` defers the comparison in read-only/dry-run paths and refuses `--execute`.
-  Anything else (a partly sensed frame, `EFP = 1`) is compared and must match.
+- **Option shadows before and after `SENSE_CTRL`.** Depending on the glitch frame, pre-`SENSE_CTRL`
+  option shadows (`DSOV = 0`, `EFP = 0`) either read `0` (unsensed) or already hold their cold-boot
+  values. Fuse *rows* read with `CMD_READ` are unaffected. Before `SENSE_CTRL`, the exact signature
+  `DSOV = 0`, `EFP = 0`, every compared shadow `0` defers the comparison in read-only/dry-run paths
+  and refuses `--execute`; if shadows are already sensed, `vfi_burn` verifies all of them (including
+  `TPC_GPC0..7_DISABLE`) before issuing `SENSE_CTRL`.
+- **Post-`SENSE_CTRL` `OPT_TPC_GPC0..7_DISABLE` zeroing quirk.** Observed on live CMP 170HX 8 GB
+  silicon: `CMD_SENSE_CTRL` (with `EN_SW_OVERRIDE = 1`) restores `EFP` 0→1 and sets
+  `RESENSE_DISABLE = 1` while clearing the volatile `OPT_TPC_GPC0..7_DISABLE` (`0x820760..0x82077C`)
+  and `STATUS_OPT_TPC_GPC0..7` (`0x820C38..0x820C54`) shadows to `0`, leaving all other
+  `OPT_*_DISABLE` shadows (`FBIO`, `FBPA`, `FBP`, `GPC`, `NVLink`, `PES`, `ROP_L2`, `SYS_PIPE`),
+  all `*_DEFECTIVE` registers, Die IDs, and FF rows intact. `vfi_burn` accepts this only when the
+  exact post-`SENSE_CTRL` signature holds (`DSOV = 0`, `EFP = 1`, `EN_SW = 1`, `RESENSE_DIS = 1`,
+  every compared `TPC_GPC*_DISABLE` reads `0`, and every non-TPC shadow matches with at least one
+  nonzero) and journals `post_sense_tpc_shadows_cleared`. Partial TPC mismatches, non-TPC mismatches,
+  and cold boots (`EN_SW = 0`) remain refused.
 - **A closed `PLM_f8` is never re-opened in software.** `CTRL_WR_SECURE` exists, but writing it would
   hide the "frame too deep" signal, so `arm()` refuses instead.
 - **The armed state persists across records in the same window.** Multiple records (test row, then
