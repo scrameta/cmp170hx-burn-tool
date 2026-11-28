@@ -14,12 +14,14 @@ from .backend import MissingWriter
 from .engine import (
     Journal,
     Overrides,
+    TPC_DISABLE_FIELDS,
     check_host_readonly_safe,
     check_plan,
     evaluate_health,
     evaluate_host,
     hex32,
     option_shadows_unsensed,
+    post_sense_tpc_shadows_cleared,
     process_records,
     resolve_fpf_pointer,
     scan_fpf_rows,
@@ -247,20 +249,29 @@ def format_status_report(plan: Plan, reader) -> list[str]:
         except Exception as exc:
             mask_errors[field] = str(exc)
     unsensed_masks = not mask_errors and option_shadows_unsensed(health, mask_readings)
+    post_sense_tpc_cleared = not mask_errors and post_sense_tpc_shadows_cleared(
+        health, plan.expected_masks, mask_readings
+    )
     mask_parts: list[str] = []
+    mask_bad: list[str] = []
     for field, expected in sorted(plan.expected_masks.items()):
         if field in mask_errors:
             mask_parts.append(f"{field}=ERR({mask_errors[field]})")
+            mask_bad.append(f"mask {field} read error: {mask_errors[field]}")
             continue
         actual = mask_readings[field]
         if is_poison(actual):
             tag = "POISON!"
+            mask_bad.append(f"mask {field} poisoned: {hex32(actual)}")
         elif unsensed_masks:
             tag = f"unsensed pre-SENSE; cold exp {hex32(expected)}"
         elif actual == expected:
             tag = "OK"
+        elif post_sense_tpc_cleared and field in TPC_DISABLE_FIELDS:
+            tag = f"cleared post-SENSE; cold exp {hex32(expected)}"
         else:
             tag = f"exp {hex32(expected)}"
+            mask_bad.append(f"mask {field}={hex32(actual)}!=exp({hex32(expected)})")
         mask_parts.append(f"{field}={hex32(actual)} ({tag})")
     if mask_parts:
         lines.append("  Masks        : " + "; ".join(mask_parts))
@@ -269,7 +280,7 @@ def format_status_report(plan: Plan, reader) -> list[str]:
     if exp_readings:
         lines.extend(_format_experimental_compact_lines(exp_readings))
 
-    all_issues = host_issues + health_issues + die_bad
+    all_issues = host_issues + health_issues + die_bad + mask_bad
     if not all_issues:
         lines.append("  GATE SUMMARY : PASS (passive goldilocks & identity clean)")
     else:

@@ -215,6 +215,14 @@ UNSENSED_SHADOWS_NOTE = (
     "a Goldilocks frame before SENSE_CTRL. Identity masks are compared after SENSE_CTRL."
 )
 
+TPC_DISABLE_FIELDS: frozenset[str] = frozenset(f"TPC_GPC{i}_DISABLE" for i in range(TOTAL_GPC))
+
+POST_SENSE_TPC_CLEARED_NOTE = (
+    "Post-SENSE_CTRL GA100 shadow quirk: OPT_TPC_GPC0..7_DISABLE read 0 after SENSE_CTRL "
+    "(DSOV=0, EFP=1, EN_SW=1, RESENSE_DIS=1), while all other option shadows match and "
+    "defect/FF/Die-ID checks remain enforced."
+)
+
 
 def option_shadows_unsensed(health: Health | None, readings: dict[str, int]) -> bool:
     """True only for the documented pre-SENSE Goldilocks signature.
@@ -230,6 +238,52 @@ def option_shadows_unsensed(health: Health | None, readings: dict[str, int]) -> 
     return all(v == 0 for v in readings.values())
 
 
+def post_sense_tpc_shadows_cleared(
+    health: Health | None,
+    expected_masks: dict[str, int],
+    readings: dict[str, int],
+) -> bool:
+    """True only for the observed GA100 post-SENSE_CTRL cleared-TPC-shadow signature.
+
+    On real CMP 170HX 8 GB silicon, issuing CMD_SENSE_CTRL (with EN_SW_OVERRIDE=1)
+    restores EFP 0->1 and RESENSE_DISABLE 0->1 while clearing the volatile
+    OPT_TPC_GPC0..7_DISABLE (0x820760..0x82077C) and STATUS_OPT_TPC_GPC0..7 shadows
+    to 0. All other OPT_*_DISABLE shadows (FBIO, FBPA, FBP, GPC, NVLink, PES,
+    ROP_L2, SYS_PIPE), all *_DEFECTIVE registers, Die IDs, and FF rows stay intact.
+
+    Fail-closed requirements for this signature:
+      - In a post-SENSE_CTRL Goldilocks window: DSOV=0, EFP=1, EN_SW=1, RESENSE_DIS=1
+        (never matches a locked boot DSOV=1 or a cold-boot permanently-clear-DSOV card
+        where EN_SW=0).
+      - Both TPC_GPC*_DISABLE and non-TPC masks are present in expected_masks.
+      - Every compared TPC_GPC*_DISABLE shadow reads 0, with at least one expected nonzero.
+      - Every non-TPC shadow matches its expected value AND at least one is nonzero.
+    """
+    if (
+        health is None
+        or health.dsov != 0
+        or health.efp != 1
+        or (health.en_sw & 1) != 1
+        or health.resense_disable != 1
+        or not expected_masks
+        or not readings
+    ):
+        return False
+    tpc_fields = [f for f in expected_masks if f in TPC_DISABLE_FIELDS]
+    non_tpc_fields = [f for f in expected_masks if f not in TPC_DISABLE_FIELDS]
+    if not tpc_fields or not non_tpc_fields:
+        return False
+    if any(f not in readings for f in expected_masks):
+        return False
+    if not all(readings[f] == 0 for f in tpc_fields):
+        return False
+    if not any(expected_masks[f] != 0 for f in tpc_fields):
+        return False
+    if not all(readings[f] == expected_masks[f] for f in non_tpc_fields):
+        return False
+    return any(readings[f] != 0 for f in non_tpc_fields)
+
+
 def check_masks(
     expected_masks: dict[str, int],
     reader,
@@ -237,6 +291,7 @@ def check_masks(
     health: Health | None = None,
     allow_unsensed: bool = False,
     show: Callable[[str], None] | None = None,
+    on_post_sense_tpc_cleared: Callable[[list[str]], None] | None = None,
 ) -> bool:
     """Compare live option shadows with the plan's cold-boot masks.
 
@@ -244,6 +299,8 @@ def check_masks(
     unsensed (only when ``allow_unsensed``; read-only/dry-run paths). With
     ``health`` given and the unsensed signature present but not allowed, refuses
     with an explicit "run SENSE_CTRL first" error instead of a misleading mismatch.
+    After SENSE_CTRL, accepts the exact GA100 cleared-TPC-shadow signature when all
+    non-TPC shadows match (and notifies ``show`` / ``on_post_sense_tpc_cleared``).
     """
     readings: dict[str, int] = {}
     for field in expected_masks:
@@ -259,6 +316,13 @@ def check_masks(
         if show is not None:
             show(UNSENSED_SHADOWS_NOTE)
         return False
+    if post_sense_tpc_shadows_cleared(health, expected_masks, readings):
+        cleared = sorted(f for f in expected_masks if f in TPC_DISABLE_FIELDS and expected_masks[f] != 0)
+        if show is not None:
+            show(POST_SENSE_TPC_CLEARED_NOTE)
+        if on_post_sense_tpc_cleared is not None:
+            on_post_sense_tpc_cleared(cleared)
+        return True
     for field, expected in expected_masks.items():
         actual = readings[field]
         if actual != expected:
@@ -276,15 +340,16 @@ def preflight(
     match_masks: bool = True,
     check_die: bool = True,
     expected_masks: dict[str, int] | None = None,
+    pre_sense_masks: dict[str, int] | None = None,
     overrides: Overrides | None = None,
     show: Callable[[str], None] | None = None,
 ) -> str:
     """Run fresh hardware/simulator preflight checks and return current boot_id.
 
-    Option-shadow masks are compared AFTER the active sense when one is requested:
-    in a Goldilocks frame they are unsensed (read 0) until SENSE_CTRL. Without an
-    active sense, the documented unsensed signature skips the comparison with a
-    note (read-only preflight); everything else is compared as before.
+    Option-shadow masks are compared before SENSE_CTRL when already sensed (unsensed
+    pre-SENSE frames defer cleanly) and again after SENSE_CTRL when ``active_sense``
+    is requested. Without an active sense, the documented unsensed signature skips
+    the comparison with a note (read-only preflight); everything else is compared.
     """
     ov = overrides or Overrides()
     host = reader.host()
@@ -300,6 +365,11 @@ def preflight(
     if compare_masks and not active_sense:
         check_masks(masks, reader, health=h, allow_unsensed=True, show=show)
     if active_sense:
+        pre_masks = masks if compare_masks else (pre_sense_masks if not ov.mask_mismatch else None)
+        if pre_masks is not None:
+            # Verify all masks (including TPC_GPC0..7_DISABLE) before SENSE_CTRL if already
+            # sensed; unsensed pre-SENSE frames (DSOV=0, EFP=0, all zero) defer quietly.
+            check_masks(pre_masks, reader, health=h, allow_unsensed=True, show=None)
         reader.active_sense_readonly()
         # The sense itself may have destroyed this frame: read everything AGAIN and require EFP=1.
         h_after = reader.health()
@@ -315,8 +385,9 @@ def preflight(
                 if actual != value:
                     raise BurnError(f"die ID changed after active sense: row {i}")
         if compare_masks:
-            # EFP=1 now, so the unsensed exemption can no longer apply: shadows must match.
-            check_masks(masks, reader, health=h_after)
+            # EFP=1 now, so the unsensed exemption can no longer apply: shadows must match
+            # (or match the documented post-SENSE_CTRL cleared-TPC-shadow signature).
+            check_masks(masks, reader, health=h_after, show=show)
     return host.boot_id
 
 
@@ -1326,12 +1397,16 @@ def process_records(
 
     # Initial live preflight (passive + optional active sense); masks verified below
     # after determining already-committed prefix rows on resumed real sessions.
+    # On fresh test/all runs with active sense, also check pre-sense masks before
+    # SENSE_CTRL if already sensed (so TPC_GPC0..7_DISABLE are verified before
+    # SENSE_CTRL can zero them; unsensed pre-SENSE frames defer quietly).
     try:
         boot_id = preflight(
             plan,
             reader,
             active_sense=use_active_sense,
             match_masks=False,
+            pre_sense_masks=plan.expected_masks if (stage in ("test", "all") and use_active_sense) else None,
             overrides=ov,
         )
     except Exception as exc:
@@ -1554,12 +1629,16 @@ def process_records(
             # A passive dry-run in a Goldilocks frame sees unsensed (zero) shadows: skip the
             # comparison with a journaled note. Real burns never skip it: --execute refuses
             # unsensed shadows, and after active sense EFP=1 so the exemption cannot apply.
+            # On real GA100 silicon, CMD_SENSE_CTRL clears OPT_TPC_GPC0..7_DISABLE to 0 while
+            # leaving all other OPT_*_DISABLE and *_DEFECTIVE registers intact; audit that.
+            cleared_tpc_fields: list[str] = []
             masks_compared = check_masks(
                 assumed,
                 reader,
                 health=reader.health(),
                 allow_unsensed=dry_run,
                 show=show,
+                on_post_sense_tpc_cleared=cleared_tpc_fields.extend,
             )
             if not masks_compared:
                 journal.append(
@@ -1568,6 +1647,18 @@ def process_records(
                     plan_sha256=plan.content_hash,
                     reason="option shadows unsensed (DSOV=0, EFP=0, all compared fields read 0)",
                     dry_run=True,
+                )
+            elif cleared_tpc_fields:
+                journal.append(
+                    event="post_sense_tpc_shadows_cleared",
+                    stage=stage,
+                    plan_sha256=plan.content_hash,
+                    cleared_fields=cleared_tpc_fields,
+                    reason=(
+                        "GA100 post-SENSE_CTRL quirk (DSOV=0, EFP=1, EN_SW=1, RESENSE_DIS=1): "
+                        "OPT_TPC_GPC0..7_DISABLE read 0 while all non-TPC masks matched"
+                    ),
+                    dry_run=dry_run,
                 )
         except Exception as exc:
             h_snap, host_snap = _capture_snapshot(reader)

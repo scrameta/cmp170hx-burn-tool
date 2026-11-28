@@ -142,10 +142,12 @@ class SimulatedGA100PCIe(MMIOBus):
         goldilocks: bool = True,
         lnkcap2: int = 0x06,
         unsensed_option_regs: Iterable[int] = (),
+        clear_tpc_shadows_on_sense: bool = False,
     ) -> None:
         self.rows: dict[int, int] = {i: 0 for i in range(TOTAL_FUSE_ROWS)}
         # Stored values are the cold-boot truth; reads return 0 until SENSE_CTRL senses them.
         self.unsensed: set[int] = {int(a) for a in unsensed_option_regs}
+        self.clear_tpc_shadows_on_sense: bool = bool(clear_tpc_shadows_on_sense)
         if rows:
             self.rows.update({int(k): int(v) & 0xFFFFFFFF for k, v in rows.items()})
         self.regs: dict[int, int] = {
@@ -244,6 +246,13 @@ class SimulatedGA100PCIe(MMIOBus):
                 self.regs[REG_SBFE_SHADOW] = 1
                 self.regs[REG_RESENSE_DISABLE] = 1
                 self.unsensed.clear()  # SENSE_CTRL senses the option shadows (DSOV stays 0)
+                if self.clear_tpc_shadows_on_sense:
+                    # Observed CMP 170HX 8 GB quirk: CMD_SENSE_CTRL clears OPT_TPC_GPC0..7_DISABLE
+                    # and STATUS_OPT_TPC_GPC0..7 to 0 while leaving all other option shadows and
+                    # all *_DEFECTIVE registers intact.
+                    for i in range(TOTAL_GPC):
+                        self.regs[OPTION_REGS[f"TPC_GPC{i}_DISABLE"]] = 0
+                        self.regs[OPTION_REGS[f"TPC_GPC{i}_STATUS"]] = 0
                 return
             if cmd == CMD_PROGRAM:
                 self.program_calls += 1
@@ -282,6 +291,8 @@ class SimulatedGA100Adapter(FuseReader, FuseWriter):
         host: Host | None = None,
         registers: dict[int, int] | None = None,
         lnkcap2: int = 0x06,
+        unsensed_option_regs: Iterable[int] | None = None,
+        clear_tpc_shadows_on_sense: bool = False,
     ) -> None:
         self._pci_id = pci_id
         die_map = dict(die) if die is not None else {i: 0x1000 + i for i in DIE_ID_ROWS}
@@ -316,14 +327,20 @@ class SimulatedGA100Adapter(FuseReader, FuseWriter):
         goldilocks = health is None or health.dsov == 0
         dsov = merged_regs.get(REG_DSOV_STATUS, 0 if goldilocks else 1)
         efp = merged_regs.get(REG_EFP_STATUS, 0 if goldilocks else 1)
-        # A pre-SENSE Goldilocks frame (DSOV=0, EFP=0) has unsensed option shadows.
-        unsensed = set(OPTION_REGS.values()) if dsov == 0 and efp == 0 else set()
+        # A pre-SENSE Goldilocks frame (DSOV=0, EFP=0) defaults to unsensed option shadows
+        # unless the caller explicitly supplies unsensed_option_regs (e.g. () for a frame
+        # where option shadows were already sensed before SENSE_CTRL).
+        if unsensed_option_regs is None:
+            unsensed = set(OPTION_REGS.values()) if dsov == 0 and efp == 0 else set()
+        else:
+            unsensed = {int(a) for a in unsensed_option_regs}
         self.pcie = SimulatedGA100PCIe(
             rows=merged_rows,
             registers=merged_regs,
             goldilocks=goldilocks,
             lnkcap2=eff_lnkcap2,
             unsensed_option_regs=unsensed,
+            clear_tpc_shadows_on_sense=clear_tpc_shadows_on_sense,
         )
         self.bus = TracingMMIOBus(self.pcie)
         self.controller = GA100FuseController(self.bus, read_only=False, sleep=lambda _: None)
