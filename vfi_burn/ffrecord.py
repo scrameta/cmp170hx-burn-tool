@@ -369,6 +369,65 @@ def compute_sm_count(gpc_disable: int, tpc_disables: list[int]) -> int:
     return total
 
 
+FBP_PAIR_DEFECT_FIELDS: tuple[str, ...] = ("FBPA_DISABLE", "FBIO_DISABLE", "ROP_L2_DISABLE")
+
+
+def fold_fbp_pairs(value: int) -> int:
+    """Fold a 24-bit two-bits-per-FBP defect word into the 12-bit set of dead FBPs.
+
+    An FBP counts as dead only when BOTH bits of its pair are set (the encoding the
+    factory uses on every die measured by sayhellotojungle/cmp170hx-ffcalc).
+    """
+    mask = 0
+    for fbp in range(TOTAL_FBP):
+        if (value >> (2 * fbp)) & 0x3 == 0x3:
+            mask |= 1 << fbp
+    return mask
+
+
+def fbp_defect_consistency_issues(defect_masks: dict[str, int]) -> list[str]:
+    """Cross-check OPT_FBP_DEFECTIVE against the FBPA/FBIO/ROP_L2 defect pairs.
+
+    The factory writes one dead-FBP judgement into four independent registers:
+    FBP_DEFECTIVE (one bit per FBP) and FBPA/FBIO/ROP_L2_DEFECTIVE (two bits per FBP).
+    On every die ffcalc has read, each 24-bit word folds to exactly FBP_DEFECTIVE.
+    A disagreement means the readout mixed two cards, a register is mis-mapped, or a
+    read was corrupted, and a plan derived from it would be incoherent. Returns []
+    when consistent, or when none of the four masks is present (nothing to check).
+    """
+    keys = ("FBP_DISABLE", *FBP_PAIR_DEFECT_FIELDS)
+    present = [k for k in keys if k in defect_masks]
+    if not present:
+        return []
+    missing = [k for k in keys if k not in defect_masks]
+    if missing:
+        return [f"FBP defect cross-check incomplete: missing defect mask(s) {', '.join(missing)}"]
+    issues: list[str] = []
+    fbp = defect_masks["FBP_DISABLE"]
+    if fbp >> TOTAL_FBP:
+        issues.append(
+            f"FBP_DEFECTIVE=0x{fbp:x} has bits above the {TOTAL_FBP} FBPs (0x{fbp >> TOTAL_FBP << TOTAL_FBP:x})"
+        )
+    fbp &= (1 << TOTAL_FBP) - 1
+    for key in FBP_PAIR_DEFECT_FIELDS:
+        value = defect_masks[key]
+        if value >> (2 * TOTAL_FBP):
+            issues.append(f"{key} defect mask 0x{value:x} has bits above the {2 * TOTAL_FBP}-bit field")
+        half = [i for i in range(TOTAL_FBP) if (value >> (2 * i)) & 0x3 in (0x1, 0x2)]
+        if half:
+            issues.append(
+                f"{key} defect mask 0x{value:06x} has half-set FBP pair(s) {half} "
+                "(not a factory encoding)"
+            )
+        folded = fold_fbp_pairs(value)
+        if folded != fbp:
+            issues.append(
+                f"{key} defect mask 0x{value:06x} folds to dead FBPs 0x{folded:03x}, "
+                f"but FBP_DEFECTIVE reads 0x{fbp:03x}"
+            )
+    return issues
+
+
 def decode_a100_devid_ff_word(word: int) -> tuple[str, int] | None:
     """If ``word`` is a validated GA100 DEVIDA (c2/b37) or DEVIDB (c2/b38) FF record
     (either an A100 target or a CMP 170HX 8 GB / 10 GB revert target), return
